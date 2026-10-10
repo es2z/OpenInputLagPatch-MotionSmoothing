@@ -7,6 +7,63 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-10
+
+### Added
+
+- **Touhou 13 (Ten Desires) gets frame interpolation too** (`43f9c66`, `94c39f1`, `740dd7d`)
+
+  Ten Desires is the next one the requirements point at, and it runs on the same engine as th14, so
+  this is the same mechanism with th13's own addresses - every one of them read out of the game
+  itself. The frame function has the same **three render blocks and three present sites** (renders
+  at `0x45CFFF`/`0x45D452`/`0x45D637`, presents at `0x45D207`/`0x45D4B6`/`0x45D709`), and those six
+  are what the extra presentations take over. Two things are th13's own: two of the helpers the
+  render block calls take their object in a register (`0x43B080` wants it in EDI, `0x4679A0` in
+  ESI), which a function pointer cannot do, so naked trampolines put the object there and then
+  call; and the middle present site zeroes esi among the arguments it pushes, so that site is
+  hooked through a trampoline that does the same.
+
+  The bullets are the bullet manager `[0x4C2174]` (built at a stage start, loading `bullet.anm`)
+  and its own list of the ones in play (head at `+0x84`, node at bullet `+0x10`), with the position
+  at `+0xB70`, the velocity at `+0xB7C` and the state at `+0xBBE`, moved exactly the way the game's
+  own update `0x40DB10` moves them (including the half step a starting bullet gets and the global
+  slowdown `[0x4C0A28]`). The player is `[0x4C22C4]`: its own position at `+0x5B8`, its options as
+  8 slots of `0xE4` bytes at `+0xA2B8` (live dword at `+0x00`, sprite ids at `+0xB0/+0xB4`) and its
+  shots as 256 slots of `0x9C` bytes at `+0x6A0` (live countdown at `+0x70`, sprite id at `+0x14`,
+  position at `+0x2C`). The straight lasers are the manager `[0x4C22A0]` (head at `+0x18`,
+  `obj+0x08` for the next one), and a vtable whitelist keeps only `LaserLineInf 0x4AB0CC`,
+  `LaserInfiniteInf 0x4AB19C` and `LaserBeamInf 0x4AB204`; the curve `LaserCurveInf 0x4AB134` is
+  left out. A line laser's own draw builds its picture out of the position at `+0x50`, the angle at
+  `+0x68` and the length at `+0x6C`. The player, its options and its shots have no readable
+  velocity and a laser turns and grows as it goes, so as in th14 and th15 these are measured: every
+  game frame the fields are compared with the ones of the frame before, and the extra presentations
+  move them by that difference times the fraction of a frame they stand for, putting them back
+  right after the render.
+
+  What took the work this time is which field has to move, because the game finishes its drawing at
+  render time: `FUN_0046A700` bakes an animation object into the sprite manager's vertex queue as
+  it draws (`0x467960` empties the queue, `0x4679A0` draws it in one call), so what matters is the
+  field the bake reads. The bullets are copied from their position into their own animation objects
+  by the draw pass (moving the position is what works); the options and the shots have their
+  position written into the sprite's `+0x574` by the update, and the render only bakes the sprite
+  (moving `+0x574` is what works); the player is the other way around - its draw callback
+  `0x443D90` copies `player+0x5B8` into the body animation object's drawn position `+0x588` at
+  render time, so the position itself is what moves it.
+
+  Two leads the handover notes had were wrong, both of them things that were guessed from the shape
+  of the code instead of read out of it, and both are corrected here: the "array of 0x44 byte shot
+  objects" is the player's **bomb** (`BombReimuInf`, vtable `[0x4AA5BC]`, 8 objects of `0xD0`
+  bytes that `0x40B4B0` builds) and has nothing to do with the player's shots, and the option slots
+  start at `+0xA2B8`, not at `+0xA380` (that is `+0xC8` into each of them). The diagnostics now
+  count the player's body, option and shot sprites apart and report the lasers, so a stage can be
+  told apart from a menu at a glance.
+
+  Confirmed in-game: the extra frames land evenly at 180.6 presentations per second on the 180hz
+  display, no sprite is left without a movement record, and the player, its options, its shots and
+  the straight lasers all follow the extra frames. The enemies are deliberately not interpolated
+  (their animation scripts place them and there is no velocity to read) and the curve lasers are
+  out of scope. Stage 1 of th13 is done with this.
+
 ## 2026-10-09
 
 ### Added
