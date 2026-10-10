@@ -633,175 +633,119 @@ static const size_t th13_laser_position = 0x50;  // where it starts, 3 floats
 static const size_t th13_laser_angle = 0x68;     // the direction it points in, radians
 static const size_t th13_laser_length = 0x6C;    // how far it reaches
 
-static const void* const th13_straight_lasers[] = {
-	(void*)0x004AB0CC, // LaserLineInf
-	(void*)0x004AB19C, // LaserInfiniteInf
-	(void*)0x004AB204, // LaserBeamInf
+// One class of straight laser: where it keeps what it moves by, and what it grows towards. The beam
+// class is deliberately not in here: its own update (vtable+0x10, 0x437FF0) is a stub that just
+// returns 0, so it never moves and there is nothing to project for it. The curve class is left out
+// as the requirements ask.
+struct Th13LaserLayout {
+	const void* vtable;
+	size_t velocity;            // 3 floats
+	size_t angle_speed;         // 0 for a class that doesn't turn
+	size_t length_speed;
+	size_t length_limit;
+	size_t length_limit_subtract;
+};
+
+static const Th13LaserLayout th13_laser_layouts[] = {
+	// LaserLineInf: it doesn't turn on its own - its update (0x4315D0) never writes the angle - and
+	// its length stops at what is left of 0x176 once the grown 0x78 is taken off it
+	{ (const void*)0x004AB0CC, 0x5C,  0,     0x74, 0x176, 0x78 },
+	// LaserInfiniteInf: turns by 0x5DC and its length stops at 0x5E0
+	{ (const void*)0x004AB19C, 0x5CC, 0x5DC, 0x74, 0x5E0, 0    },
 };
 
 static const size_t th13_lasers_max = 0x200 + 1; // the manager's own limit, plus its root entry
 
 // What one laser moved by, kept across frames (the list is walked again every frame, and a laser
 // that is gone must not take its record with it - a slot that comes back later is another laser)
-struct Th13LaserMotion {
-	void* laser;
-	unsigned int frame;
-	float last_x, last_y, last_angle, last_length;
-	float delta_x, delta_y, delta_angle, delta_length;
-};
-
 struct Th13LaserMoved {
 	void* laser;
 	float position[3];
 	float angle, length;
 };
 
-static Th13LaserMotion th13_laser_motions[th13_lasers_max];
 static Th13LaserMoved th13_lasers_moved[th13_lasers_max];
 static size_t th13_lasers_moved_count;
-static unsigned int th13_laser_frame = 1;
 
-// Whether this is one of the straight lasers (the curve one is deliberately not one of them)
-static bool th13_is_straight_laser(const void* laser) {
+// The layout of the class this laser is, or null if it isn't one of the straight ones
+static const Th13LaserLayout* th13_laser_layout(const void* laser) {
 	const void* vtable = *(const void* const*)laser;
-	for (size_t i = 0; i < sizeof(th13_straight_lasers) / sizeof(th13_straight_lasers[0]); ++i) {
-		if (vtable == th13_straight_lasers[i])
-			return true;
+	for (size_t i = 0; i < sizeof(th13_laser_layouts) / sizeof(th13_laser_layouts[0]); ++i) {
+		if (vtable == th13_laser_layouts[i].vtable)
+			return &th13_laser_layouts[i];
 	}
-	return false;
+	return nullptr;
 }
 
-// The lasers are handed out and freed one at a time, so their records have to be recycled the same
-// way the sprites' are (see th13_sprite_motion)
-static Th13LaserMotion* th13_laser_motion(void* laser) {
-	for (size_t i = 0; i < th13_lasers_max; ++i) {
-		if (th13_laser_motions[i].laser == laser)
-			return &th13_laser_motions[i];
-	}
-
-	Th13LaserMotion* empty = nullptr;
-	Th13LaserMotion* oldest = nullptr;
-	for (size_t i = 0; i < th13_lasers_max; ++i) {
-		Th13LaserMotion& motion = th13_laser_motions[i];
-		if (motion.laser == nullptr) {
-			if (empty == nullptr)
-				empty = &motion;
-			continue;
-		}
-		if (motion.frame == th13_laser_frame)
-			continue;
-		if (oldest == nullptr || motion.frame < oldest->frame)
-			oldest = &motion;
-	}
-
-	Th13LaserMotion* motion = empty != nullptr ? empty : oldest;
-	if (motion == nullptr)
-		return nullptr;
-	motion->laser = laser;
-	motion->frame = 0;
-	motion->last_x = motion->last_y = 0.0f;
-	motion->last_angle = motion->last_length = 0.0f;
-	motion->delta_x = motion->delta_y = 0.0f;
-	motion->delta_angle = motion->delta_length = 0.0f;
-	return motion;
-}
-
-// Looks at every straight laser in play and works out what it moved by since the frame before.
-// This runs once per game frame, from the game's own present (see th13_present_hook).
-static void th13_lasers_measure() {
-	++th13_laser_frame;
+// Moves the straight lasers t frames ahead of the state the game is in, and remembers what it
+// changed. Each laser is put where the velocity it carries right now would have it t frames from
+// here: the game's own update adds velocity * the global scale to the position once per frame, and
+// this is that same step for the fraction of a frame this presentation stands for.
+static void th13_lasers_advance(float t) {
+	th13_lasers_moved_count = 0;
 	th13_lasers_seen = 0;
+	th13_lasers_projected = 0;
 
 	void* manager = *th13_laser_manager;
-	if (manager == nullptr)
+	if (manager == nullptr || th13_bullets_held())
 		return;
+
+	unsigned int frames_per_render = *th13_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	float scale = *th13_time_scale;
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
 
 	void* laser = *(void**)((char*)manager + th13_laser_list);
 	// The list is the game's own and this runs where nothing can change it; the bound is only so a
 	// list that got broken some other way can't run away with the frame
 	for (size_t guard = 0; laser != nullptr && guard < th13_lasers_max * 4; ++guard) {
 		void* next = *(void**)((char*)laser + th13_laser_next);
-		if (th13_is_straight_laser(laser)) {
+		const Th13LaserLayout* layout = th13_laser_layout(laser);
+		if (layout != nullptr && th13_lasers_moved_count < th13_lasers_max) {
 			++th13_lasers_seen;
-			Th13LaserMotion* motion = th13_laser_motion(laser);
-			if (motion != nullptr) {
-				const float x = *(const float*)((char*)laser + th13_laser_position);
-				const float y = *(const float*)((char*)laser + th13_laser_position + 4);
-				const float angle = *(const float*)((char*)laser + th13_laser_angle);
-				const float length = *(const float*)((char*)laser + th13_laser_length);
+			Th13LaserMoved& moved = th13_lasers_moved[th13_lasers_moved_count++];
+			moved.laser = laser;
 
-				// Only a laser that was measured in the frame right before this one has something
-				// to compare against - one that just appeared has not moved as far as this can tell
-				if (motion->frame + 1 == th13_laser_frame) {
-					float dx = x - motion->last_x;
-					float dy = y - motion->last_y;
-					float dangle = angle - motion->last_angle;
-					float dlength = length - motion->last_length;
+			float* position = (float*)((char*)laser + th13_laser_position);
+			float* angle = (float*)((char*)laser + th13_laser_angle);
+			float* length = (float*)((char*)laser + th13_laser_length);
+			for (int axis = 0; axis < 3; ++axis)
+				moved.position[axis] = position[axis];
+			moved.angle = *angle;
+			moved.length = *length;
 
-					// The angle is an angle: a difference of nearly a full turn is the same
-					// angle, and neither that nor a jump across the screen is a movement
-					while (dangle > 3.14159265f)
-						dangle -= 6.28318531f;
-					while (dangle < -3.14159265f)
-						dangle += 6.28318531f;
-					if (dx <= -th13_max_step || dx >= th13_max_step ||
-						dy <= -th13_max_step || dy >= th13_max_step ||
-						dangle <= -1.0f || dangle >= 1.0f || dlength <= -256.0f || dlength >= 256.0f) {
-						dx = dy = dangle = dlength = 0.0f;
-					}
+			const float* velocity = (const float*)((char*)laser + layout->velocity);
+			for (int axis = 0; axis < 3; ++axis)
+				position[axis] += velocity[axis] * step;
 
-					motion->delta_x = dx;
-					motion->delta_y = dy;
-					motion->delta_angle = dangle;
-					motion->delta_length = dlength;
-				} else {
-					motion->delta_x = motion->delta_y = 0.0f;
-					motion->delta_angle = motion->delta_length = 0.0f;
-				}
-				motion->frame = th13_laser_frame;
-				motion->last_x = x;
-				motion->last_y = y;
-				motion->last_angle = angle;
-				motion->last_length = length;
+			if (layout->angle_speed != 0) {
+				*angle += *(const float*)((char*)laser + layout->angle_speed) * step;
+				// the game keeps the angle in [0, 2 pi) and hands it out from there
+				while (*angle < 0.0f)
+					*angle += 6.28318531f;
+				while (*angle >= 6.28318531f)
+					*angle -= 6.28318531f;
 			}
+
+			if (layout->length_speed != 0) {
+				// Both classes stop growing at the length their own update clamps them to (the Line
+				// one at what is left of 0x176 once the grown 0x78 is taken off it, the infinite one
+				// at 0x5E0)
+				float limit = *(const float*)((char*)laser + layout->length_limit);
+				if (layout->length_limit_subtract != 0)
+					limit -= *(const float*)((char*)laser + layout->length_limit_subtract);
+				*length += *(const float*)((char*)laser + layout->length_speed) * step;
+				if (limit > 0.0f && *length > limit)
+					*length = limit;
+			}
+			++th13_lasers_projected;
 		}
 		laser = next;
-	}
-}
-
-// Moves the straight lasers t frames ahead of the state the game is in, and remembers what it
-// changed
-static void th13_lasers_advance(float t) {
-	th13_lasers_moved_count = 0;
-	th13_lasers_projected = 0;
-
-	if (th13_bullets_held())
-		return;
-
-	for (size_t i = 0; i < th13_lasers_max; ++i) {
-		const Th13LaserMotion& motion = th13_laser_motions[i];
-		if (motion.laser == nullptr || motion.frame != th13_laser_frame)
-			continue;
-		if (th13_lasers_moved_count >= th13_lasers_max)
-			break;
-
-		void* laser = motion.laser;
-		Th13LaserMoved& moved = th13_lasers_moved[th13_lasers_moved_count++];
-		moved.laser = laser;
-
-		float* position = (float*)((char*)laser + th13_laser_position);
-		float* angle = (float*)((char*)laser + th13_laser_angle);
-		float* length = (float*)((char*)laser + th13_laser_length);
-		for (int axis = 0; axis < 3; ++axis)
-			moved.position[axis] = position[axis];
-		moved.angle = *angle;
-		moved.length = *length;
-
-		position[0] += motion.delta_x * t;
-		position[1] += motion.delta_y * t;
-		*angle += motion.delta_angle * t;
-		*length += motion.delta_length * t;
-		++th13_lasers_projected;
 	}
 }
 
@@ -870,7 +814,6 @@ static HRESULT th13_present_hook() {
 	// The game's own update has run and it is about to put that frame on screen: this is the one
 	// point per frame where the movement of the player, its options and its shots can be measured
 	th13_player_measure();
-	th13_lasers_measure();
 
 	HRESULT result = device->Present(nullptr, nullptr, nullptr, nullptr);
 	overlay_mark_presentation();

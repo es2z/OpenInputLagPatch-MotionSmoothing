@@ -140,6 +140,8 @@ static unsigned int th12_sprites_untracked;
 static unsigned int th12_body_sprites;
 static unsigned int th12_option_sprites;
 static unsigned int th12_shot_sprites;
+static unsigned int th12_lasers_seen;
+static unsigned int th12_lasers_projected;
 
 static const unsigned int th12_diag_frames_max = 300;
 static const unsigned int th12_diag_presents_max = 8;
@@ -186,6 +188,8 @@ static void th12_diag_dump() {
 		th12_sprites_untracked);
 	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n", th12_player_movement);
 	th12_player_movement = 0.0f;
+	fprintf(file, "lasers: %u in play, %u projected forward (last game frame)\n",
+		th12_lasers_seen, th12_lasers_projected);
 	th12_options_dump(file);
 
 	double presents = 0.0;
@@ -653,6 +657,181 @@ static void th12_player_advance(float t) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the straight lasers
+// ---------------------------------------------------------------------------
+//
+// The lasers of a stage live in a manager of their own - [0x4B44F4], 0x490 bytes, allocated by
+// FUN_004281C0 and filled in by FUN_00427FD0 - and the manager's two tasks both walk one list: the
+// update task (0x4283D0) and the draw task (0x428430), which starts from the root node's next at
+// manager+0x18 and follows each laser's own next at +0x08. The links are the object's own, exactly
+// like th13's lasers (+0x04 previous, +0x08 next), and the draw skips a laser whose state at +0x0C
+// is 1 - that is what the spawner 0x428450 threads new lasers in with and what the update's switch
+// at 0x42AEEE reads.
+//
+// A laser's draw is what fixes which of its fields has to move. The Line laser's (FUN_00429AF0,
+// vtable+0x0C) and the infinite one's (FUN_0042B100, the same function one class over) both copy
+// the position at +0x50/+0x54/+0x58 into the sprites they queue and turn the angle at +0x68 into
+// the value they hand those sprites (into +0x668 and +0x68C respectively), so the position and the
+// angle are what the renderer reads. The length at +0x6C is what their updates grow: the Line one
+// by the rate at +0x74, clamped to what is left of +0x464, and the infinite one by the same +0x74
+// up to +0x474.
+//
+// Which lasers are straight is a whitelist of their vtables, taken from the RTTI the game carries:
+// LaserLineInf (0x4A0654) and LaserInfiniteInf (0x4A0704) are in it, LaserCurveInf (0x4A06AC) is
+// left out as the requirements ask, and the manager's root node has no vtable of its own so it
+// never matches.
+//
+// What each of them moves by is read straight out of the laser, but the two classes keep it in
+// different places, so the layout is picked by vtable along with which classes are straight at all:
+//
+//   LaserLineInf      velocity +0x5C/+0x60/+0x64, length grows by the rate at +0x74 up to what is
+//                     left of +0x46C (the update subtracts the grown +0x78 from it), and it does
+//                     not turn on its own - its update (FUN_00429610) never writes the angle.
+//   LaserInfiniteInf  velocity +0x460/+0x464/+0x468, the angle turns by +0x470 and the length grows
+//                     by the same +0x74 up to +0x474.
+//
+// Reading the velocity rather than measuring what the last frame moved by is what this does now,
+// and the difference matters: a measured step is only the previous frame's step of *whatever laser
+// was at that address*, and these are short-lived objects the game recycles (a stage with a few
+// hundred lasers in play allocates and frees them constantly), so a fresh laser that took a dead
+// one's slot would be drawn offset by the difference of two unrelated positions. A velocity read
+// off the laser that is there now cannot do that, and a laser whose velocity really is zero - the
+// warning lines are exactly that - is left where it is instead of inheriting anyone's movement.
+
+// One class of straight laser: where it keeps what it moves by, and what it grows towards
+struct Th12LaserLayout {
+	const void* vtable;
+	size_t velocity;            // 3 floats
+	size_t angle_speed;         // 0 for a class that doesn't turn
+	size_t length_speed;
+	size_t length_limit;
+	size_t length_limit_subtract;
+};
+
+static void** const th12_laser_manager = (void**)0x004B44F4;
+static const size_t th12_laser_list = 0x18;      // in the manager: the first laser of the list
+static const size_t th12_laser_next = 0x08;      // in a laser: the next one
+static const size_t th12_laser_state = 0x0C;     // in a laser: 1 while it isn't drawn
+static const size_t th12_laser_position = 0x50;  // where it starts, 3 floats
+static const size_t th12_laser_angle = 0x68;     // the direction it points in, radians
+static const size_t th12_laser_length = 0x6C;    // how far it reaches
+
+static const size_t th12_lasers_max = 0x100 + 1; // the manager's own limit, plus its root entry
+static const Th12LaserLayout th12_laser_layouts[] = {
+	// LaserLineInf: it doesn't turn on its own, and its length stops at what is left of +0x46C
+	{ (const void*)0x004A0654, 0x5C,  0,    0x74, 0x46C, 0x78 },
+	// LaserInfiniteInf: turns by +0x470, and its length stops at +0x474
+	{ (const void*)0x004A0704, 0x460, 0x470, 0x74, 0x474, 0    },
+};
+
+// The layout of the class this laser is, or null if it isn't one of the straight ones (the curve
+// laser is deliberately not one of them)
+static const Th12LaserLayout* th12_laser_layout(const void* laser) {
+	const void* vtable = *(const void* const*)laser;
+	for (size_t i = 0; i < sizeof(th12_laser_layouts) / sizeof(th12_laser_layouts[0]); ++i) {
+		if (vtable == th12_laser_layouts[i].vtable)
+			return &th12_laser_layouts[i];
+	}
+	return nullptr;
+}
+
+struct Th12LaserMoved {
+	void* laser;
+	float position[3];
+	float angle, length;
+};
+
+static Th12LaserMoved th12_lasers_moved[th12_lasers_max];
+static size_t th12_lasers_moved_count;
+
+// Moves the straight lasers t frames ahead of the state the game is in, and remembers what it
+// changed. Each laser is put where the velocity it carries right now would have it t frames from
+// here: the game's own update adds velocity * the global scale to the position once per frame, so
+// this is that same step, taken for the fraction of a frame this presentation stands for.
+static void th12_lasers_advance(float t) {
+	th12_lasers_moved_count = 0;
+	th12_lasers_seen = 0;
+	th12_lasers_projected = 0;
+
+	void* manager = *th12_laser_manager;
+	if (manager == nullptr || th12_bullets_held())
+		return;
+
+	unsigned int frames_per_render = *th12_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	float scale = *th12_time_scale;
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
+
+	void* laser = *(void**)((char*)manager + th12_laser_list);
+	// The list is the game's own and this runs where nothing can change it; the bound is only so a
+	// list that got broken some other way can't run away with the frame
+	for (size_t guard = 0; laser != nullptr && guard < th12_lasers_max * 4; ++guard) {
+		void* next = *(void**)((char*)laser + th12_laser_next);
+		const Th12LaserLayout* layout = th12_laser_layout(laser);
+		// One whose state is 1 isn't drawn yet (the draw walk skips those)
+		if (layout != nullptr && *(const int*)((char*)laser + th12_laser_state) != 1) {
+			++th12_lasers_seen;
+			if (th12_lasers_moved_count < th12_lasers_max) {
+				Th12LaserMoved& moved = th12_lasers_moved[th12_lasers_moved_count++];
+				moved.laser = laser;
+
+				float* position = (float*)((char*)laser + th12_laser_position);
+				float* angle = (float*)((char*)laser + th12_laser_angle);
+				float* length = (float*)((char*)laser + th12_laser_length);
+				for (int axis = 0; axis < 3; ++axis)
+					moved.position[axis] = position[axis];
+				moved.angle = *angle;
+				moved.length = *length;
+
+				const float* velocity = (const float*)((char*)laser + layout->velocity);
+				for (int axis = 0; axis < 3; ++axis)
+					position[axis] += velocity[axis] * step;
+
+				if (layout->angle_speed != 0) {
+					*angle += *(const float*)((char*)laser + layout->angle_speed) * step;
+					// The game keeps the angle in [0, 2 pi) and hands it out from there
+					while (*angle < 0.0f)
+						*angle += 6.28318531f;
+					while (*angle >= 6.28318531f)
+						*angle -= 6.28318531f;
+				}
+
+				if (layout->length_speed != 0) {
+					// Both classes stop growing at the length the game's own update clamps them to
+					// (the Line one at what is left of +0x46C once the grown +0x78 is taken off it,
+					// the infinite one at +0x474)
+					float limit = *(const float*)((char*)laser + layout->length_limit);
+					if (layout->length_limit_subtract != 0)
+						limit -= *(const float*)((char*)laser + layout->length_limit_subtract);
+					*length += *(const float*)((char*)laser + layout->length_speed) * step;
+					if (limit > 0.0f && *length > limit)
+						*length = limit;
+				}
+				++th12_lasers_projected;
+			}
+		}
+		laser = next;
+	}
+}
+
+static void th12_lasers_undo() {
+	for (size_t i = 0; i < th12_lasers_moved_count; ++i) {
+		const Th12LaserMoved& moved = th12_lasers_moved[i];
+		float* position = (float*)((char*)moved.laser + th12_laser_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = moved.position[axis];
+		*(float*)((char*)moved.laser + th12_laser_angle) = moved.angle;
+		*(float*)((char*)moved.laser + th12_laser_length) = moved.length;
+	}
+	th12_lasers_moved_count = 0;
+}
+
 // One extra presentation of the frame: the same render block the game runs, once more, so the state
 // the game is in is drawn and presented again. The tool's frame is readied again, so the object
 // render below draws its overlay into this presentation the same way it does in the game's own one.
@@ -668,7 +847,9 @@ static void th12_extra_presentation(IDirect3DDevice9* device, float t) {
 	// what it draws, so they can all go back right after it
 	th12_bullets_advance(t);
 	th12_player_advance(t);
+	th12_lasers_advance(t);
 	th12_render_objects();
+	th12_lasers_undo();
 	th12_undo_shifts();
 	th12_bullets_undo();
 	th12_draw_sprite_queue();
