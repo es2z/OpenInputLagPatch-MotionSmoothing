@@ -134,6 +134,10 @@ static double th13_present_rate() {
 }
 
 // Diagnostics: press U to write the presentation timing of the last frames to oilp_diag.txt
+// (what the last presentation projected, see the bullets below)
+static unsigned int th13_bullets_in_play;
+static unsigned int th13_bullets_moved;
+
 static const unsigned int th13_diag_frames_max = 300;
 static const unsigned int th13_diag_presents_max = 8;
 struct Th13DiagFrame {
@@ -167,6 +171,8 @@ static void th13_diag_dump() {
 	fprintf(file, "logic frame rate: %.2f, configured presentation rate: %.2f\n",
 		Limiter::game_fps, th13_present_rate());
 	fprintf(file, "frames recorded: %u\n", count);
+	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
+		th13_bullets_in_play, th13_bullets_moved);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -191,11 +197,143 @@ static void th13_diag_dump() {
 	printf("Wrote oilp_diag.txt\n");
 }
 
-// One extra presentation of the frame: the same render block the game runs, once more, so the state
-// the game is in is drawn and presented again. The tool's frame is readied again, so the object
-// render below draws its overlay into this presentation the same way it does in the game's own one.
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: project the bullets forward
+// ---------------------------------------------------------------------------
 //
-static void th13_extra_presentation(IDirect3DDevice9* device) {
+// The bullets of a stage live in the bullet manager, which is created when a stage starts (0x40D920
+// allocates it and 0x40D170 fills it in, loading bullet.anm for it) and released when it ends;
+// 0x4C2174 holds it and is zero while no stage is running. The manager is the same object th14 has,
+// one engine generation older: a pool of 2001 bullets of 0x135C bytes each, allocated up front and
+// threaded onto a free list, plus a second list of the bullets that are in play.
+//
+// A bullet that is in play is entered into the second list (whose head is at manager+0x84) with a
+// node that is part of the bullet itself, and the game's own update walks it that way (0x40E360):
+// the node is at bullet+0x10, the node's first word is the bullet, and the node's +4 is the next
+// node.
+//
+// A bullet keeps three floats of position (+0xB70) and three floats of velocity (+0xB7C). The
+// game's own update of one bullet (0x40DB10) moves the position by the velocity once per frame,
+// through the slowdown factor it applies to everything while the screen is full (0x4C0A28), and it
+// moves a bullet that is waiting for its sub-pattern to start by half of that: the state at
+// +0xBBE is 1 for a bullet in play, 2/3/5 for one that is starting or finishing - where the game
+// itself multiplies by the double at 0x4AE8B8, which is 0.5 - and 4 or anything else doesn't move.
+//
+// The drawn sprites follow on their own: the bullet draw pass (0x40E4D0) copies this position into
+// the animation objects the bullet carries before handing them to the sprite queue (0x46A700), so
+// moving the position is enough.
+
+static void** const th13_bullet_manager = (void**)0x004C2174;
+static const size_t th13_bullet_list_head = 0x84; // in it: the first node of the bullets in play
+static const size_t th13_bullet_list_next = 0x04; // in a node: the next node
+static const size_t th13_bullet_position = 0xB70; // in a bullet: its position, 3 floats
+static const size_t th13_bullet_velocity = 0xB7C; // in a bullet: what it moves by, 3 floats
+static const size_t th13_bullet_state = 0xBBE;    // in a bullet: what it's doing, 16 bits
+// The factor the game scales every movement with (1 unless the screen is full enough for it to
+// slow down)
+static float* const th13_time_scale = (float*)0x004C0A28;
+// How many of the game's updates it runs per rendered frame, minus one
+static unsigned char* const th13_frames_per_render = (unsigned char*)0x004DC890;
+// The object of the pause screen while it is up, and the flags of it the bullet tasks look at
+static void** const th13_pause_object = (void**)0x004C2194;
+static const size_t th13_pause_flags = 0x60;
+
+// The pool holds 2001 bullets, so the list of the ones in play can't be longer
+static const size_t th13_bullets_saved_max = 2001;
+struct Th13SavedBullet {
+	void* bullet;
+	float position[3];
+};
+static Th13SavedBullet th13_saved_bullets[th13_bullets_saved_max];
+static size_t th13_saved_bullets_count;
+
+// Whether the pause screen has the picture held. A picture the game isn't updating (or isn't
+// drawing) must not be moved forward either. 0x40E780 and 0x40E7B0 are the game's two bullet tasks.
+static bool th13_bullets_held() {
+	void* pause = *th13_pause_object;
+	if (pause == nullptr)
+		return false;
+	const unsigned int flags = *(unsigned int*)((char*)pause + th13_pause_flags);
+	return ((flags | (flags >> 2)) & 1) != 0 || (flags & 4) != 0;
+}
+
+// How much of a frame's movement a bullet in this state gets (0x40DB10)
+static float th13_bullet_step_factor(unsigned short state) {
+	switch (state) {
+	case 1:
+		return 1.0f;
+	case 2:
+	case 3:
+	case 5:
+		return 0.5f;
+	default:
+		return 0.0f;
+	}
+}
+
+// Moves every bullet in play forward by t frames and remembers what it changed
+static void th13_bullets_advance(float t) {
+	th13_saved_bullets_count = 0;
+	th13_bullets_in_play = 0;
+	th13_bullets_moved = 0;
+
+	void* manager = *th13_bullet_manager;
+	if (manager == nullptr || th13_bullets_held())
+		return;
+
+	unsigned int frames_per_render = *th13_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	float scale = *th13_time_scale;
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
+
+	void* node = *(void**)((char*)manager + th13_bullet_list_head);
+	for (size_t guard = 0; node != nullptr && guard < th13_bullets_saved_max * 4; ++guard) {
+		void* bullet = *(void**)node;
+		void* next = *(void**)((char*)node + th13_bullet_list_next);
+		if (bullet == nullptr)
+			break;
+
+		++th13_bullets_in_play;
+		const float factor = th13_bullet_step_factor(*(unsigned short*)((char*)bullet + th13_bullet_state));
+		if (factor != 0.0f && th13_saved_bullets_count < th13_bullets_saved_max) {
+			float* position = (float*)((char*)bullet + th13_bullet_position);
+			const float* velocity = (const float*)((char*)bullet + th13_bullet_velocity);
+			Th13SavedBullet& saved = th13_saved_bullets[th13_saved_bullets_count++];
+			saved.bullet = bullet;
+
+			const float bullet_step = step * factor;
+			for (int axis = 0; axis < 3; ++axis) {
+				saved.position[axis] = position[axis];
+				position[axis] += velocity[axis] * bullet_step;
+			}
+			++th13_bullets_moved;
+		}
+
+		node = next;
+	}
+}
+
+// Puts the positions of every bullet th13_bullets_advance moved back
+static void th13_bullets_undo() {
+	for (size_t i = 0; i < th13_saved_bullets_count; ++i) {
+		const Th13SavedBullet& saved = th13_saved_bullets[i];
+		float* position = (float*)((char*)saved.bullet + th13_bullet_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = saved.position[axis];
+	}
+	th13_saved_bullets_count = 0;
+}
+
+// One extra presentation of the frame: the same render block the game runs, once more, so the state
+// the game is in is drawn and presented again, with the bullets projected t frames ahead of it. The
+// tool's frame is readied again, so the object render below draws its overlay into this presentation
+// the same way it does in the game's own one.
+static void th13_extra_presentation(IDirect3DDevice9* device, float t) {
 	device->BeginScene();
 	if (th13_scene_viewport.Width != 0)
 		device->SetViewport(&th13_scene_viewport);
@@ -203,7 +341,11 @@ static void th13_extra_presentation(IDirect3DDevice9* device) {
 	*(DWORD*)0x004DCF30 = 0xFF;
 	th13_prepare_render();
 	ToolState::ReadyToDraw();
+	// The bullets are drawn where they will be t frames from now; the render bakes the positions
+	// into the sprite queue, so they can go back right after it
+	th13_bullets_advance(t);
 	th13_render_objects();
+	th13_bullets_undo();
 	th13_draw_sprite_queue();
 	device->SetTexture(0, nullptr);
 	device->EndScene();
@@ -281,7 +423,10 @@ static HRESULT th13_present_hook() {
 						QueryPerformanceCounter(&present_time[presents]);
 					++presents;
 
-					th13_extra_presentation(device);
+					// Where this presentation sits between the game's own one and the next one:
+					// the frames of one game frame are spread evenly over it, so the k-th of
+					// extras + 1 of them draws the state k/(extras + 1) frames along
+					th13_extra_presentation(device, (float)k / (float)(extras + 1));
 				}
 			}
 		}
