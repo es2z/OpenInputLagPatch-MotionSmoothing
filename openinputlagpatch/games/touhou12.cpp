@@ -135,6 +135,11 @@ static double th12_present_rate() {
 // (what the last presentation projected, see the stage 1 sections below)
 static unsigned int th12_bullets_in_play;
 static unsigned int th12_bullets_moved;
+static float th12_player_movement;
+static unsigned int th12_sprites_untracked;
+static unsigned int th12_body_sprites;
+static unsigned int th12_option_sprites;
+static unsigned int th12_shot_sprites;
 
 static const unsigned int th12_diag_frames_max = 300;
 static const unsigned int th12_diag_presents_max = 8;
@@ -148,6 +153,10 @@ static unsigned int th12_diag_count;
 static bool th12_diag_key_down;
 
 static LARGE_INTEGER th12_perf_freq;
+
+// Defined with the player's own state below; the dump reports what each option slot thinks its
+// sprites are
+static void th12_options_dump(FILE* file);
 
 static void th12_diag_dump() {
 	wchar_t path[1024] = {};
@@ -171,6 +180,13 @@ static void th12_diag_dump() {
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th12_bullets_in_play, th12_bullets_moved);
+	fprintf(file, "player: %u body, %u option and %u shot sprite(s) projected (last game frame)\n",
+		th12_body_sprites, th12_option_sprites, th12_shot_sprites);
+	fprintf(file, "player: %u sprite(s) this frame had no movement record (should stay 0)\n",
+		th12_sprites_untracked);
+	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n", th12_player_movement);
+	th12_player_movement = 0.0f;
+	th12_options_dump(file);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -332,6 +348,311 @@ static void th12_bullets_undo() {
 	th12_saved_bullets_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player, its options and its shots
+// ---------------------------------------------------------------------------
+//
+// The player of the stage that is running is at 0x4B4514 (0xC59C bytes, one animation object of its
+// own at +0x14 and another at +0x4C8). Its draw (FUN_00437600, the draw task 0x437670) reads the
+// three floats at +0x97C/+0x980/+0x984, copies them into the body animation object's drawn
+// position - (player+0x14)+0x430 - and hands that object to the sprite queue (0x45C900) in the same
+// breath, so the renderer reads exactly that position: moving it is what moves the player.
+//
+// Everything else the player puts on screen is positioned by the update instead, so those sprites
+// are what has to move:
+//
+//   - the options are 8 slots of 0xE4 bytes at +0x8268. A slot keeps its position as two ints in
+//     1/128 pixel units at +0x54/+0x58 (the shot spawn at 0x4396E8, which puts a shot an option
+//     fires on screen, and the option's own update at 0x43A6C9 both read exactly those two), and
+//     the two sprite objects it wears at +0xA8/+0xAC (0x4615A0 builds them, 0x4381E0 and 0x41D020
+//     release them).
+//   - the shots are 256 slots of 0x78 bytes at +0xA68. A slot that is in use has a non-zero
+//     countdown at +0x38, the position the game moves at +0x04/+0x08/+0x0C, and the sprite object
+//     it wears at +0x3C. The slot walk (0x439B10) copies that position into the sprite's drawn
+//     position every frame, which is why the sprite is what is moved here.
+//
+// A sprite object - the class 0x4615A0 builds - keeps its drawn position at +0x430/+0x434/+0x438.
+// That is what 0x4615A0 itself writes when it spawns one, what 0x439B10 writes for the shot it
+// belongs to, and what the getter at 0x461BCE hands out. A sprite object's first dword is its own
+// address, which is what the manager's two object lists (at 0x4CE8CC + 0x8856B8 and + 0x8856C0)
+// are searched by, so that is how a handle a slot keeps is checked against the objects that are
+// really there.
+//
+// None of the three have a velocity that could be read - the options follow the player and the
+// shots follow whatever pattern they were fired with - so what each of them moves by in a frame is
+// measured, the way th13 measures its options and its shots: every game frame the position is
+// compared with the one of the frame before, and the extra presentations move the sprite by that
+// difference times the fraction of a frame they stand for. The shift is undone after every
+// presentation, so what gets measured is the game's own movement.
+
+static void** const th12_player = (void**)0x004B4514;
+static const size_t th12_player_position = 0x97C;        // the player's own position, 3 floats
+static const size_t th12_player_options = 0x8268;        // 8 slots of 0xE4 bytes
+static const size_t th12_player_option_count = 8;
+static const size_t th12_player_option_size = 0xE4;
+static const size_t th12_player_option_position = 0x54;  // 2 ints, in 1/128 pixels
+static const size_t th12_player_option_sprite = 0xA8;    // 2 sprite objects
+static const size_t th12_player_shots = 0xA68;           // 256 slots of 0x78 bytes
+static const size_t th12_player_shot_count = 256;
+static const size_t th12_player_shot_size = 0x78;
+static const size_t th12_player_shot_live = 0x38;        // non-zero while the slot is in use
+static const size_t th12_player_shot_position = 0x04;    // 3 floats
+static const size_t th12_player_shot_sprite = 0x3C;      // the sprite object it wears
+static const size_t th12_sprite_position = 0x430;        // in a sprite object: 3 floats
+// The option positions are kept in 1/128 pixel units
+static const float th12_units_per_pixel = 128.0f;
+static const float th12_max_step = 48.0f;
+
+// What one thing moved by in a frame, kept per thing the player owns. Every one of them is a fixed
+// slot of the player object (the player itself, one of the 8 options, one of the 256 shots), so a
+// record never has to be recycled: an empty shot slot simply has nothing to move.
+struct Th12Motion {
+	unsigned int frame;
+	float last_x, last_y;
+	float delta_x, delta_y;
+};
+
+static unsigned int th12_motion_frame = 1;
+
+static void th12_measure(Th12Motion& motion, float x, float y) {
+	// Only a thing that was measured in the frame right before this one has something to compare
+	// against - one that just appeared has not moved as far as this can tell
+	if (motion.frame + 1 == th12_motion_frame) {
+		const float dx = x - motion.last_x;
+		const float dy = y - motion.last_y;
+		if (dx > -th12_max_step && dx < th12_max_step && dy > -th12_max_step && dy < th12_max_step) {
+			motion.delta_x = dx;
+			motion.delta_y = dy;
+		} else {
+			motion.delta_x = 0.0f;
+			motion.delta_y = 0.0f;
+		}
+	} else {
+		motion.delta_x = 0.0f;
+		motion.delta_y = 0.0f;
+	}
+	motion.frame = th12_motion_frame;
+	motion.last_x = x;
+	motion.last_y = y;
+}
+
+// The position of the sprite object a handle names, or null if it names none that is live right
+// now. A sprite object keeps its own address in its first dword and is threaded onto one of the
+// manager's two object lists. This asks the game's own lookup (0x461920) instead of trusting the
+// handle to be a pointer - a slot can keep a stale handle for a while after its sprite is gone, and
+// dereferencing that would be a crash. That function is what the game looks its objects up with: it
+// takes the handle on the stack and the manager in EDX, which a plain function pointer call cannot
+// set, so it goes through this, and it cleans the handle off the stack itself (ret 4).
+//
+// This has to be asked *every* frame, not only when a slot's handle changes: the game frees the
+// sprites of an option without always clearing the handle it left behind (0x4381E0 releases
+// [slot+0xA8] and [slot+0xAC] and only zeroes another field of the slot), so a handle that still
+// reads the same can name a sprite that is long gone - and caching a resolved pointer across frames
+// is what crashed the first cut of this code (a read of the sprite's position through a freed
+// pointer, at the top of the option loop).
+static void* const th12_sprite_lookup_address = (void*)0x00461920;
+
+static __declspec(naked) void* th12_sprite_lookup(unsigned int handle) {
+	__asm {
+		push edx
+		mov edx, dword ptr ds:[0x004CE8CC]
+		push dword ptr [esp + 8]
+		call dword ptr [th12_sprite_lookup_address]
+		pop edx
+		ret
+	}
+}
+
+static float* th12_sprite_by_handle(unsigned int handle) {
+	if (handle == 0)
+		return nullptr;
+	void* object = th12_sprite_lookup(handle);
+	if (object == nullptr)
+		return nullptr;
+	return (float*)((char*)object + th12_sprite_position);
+}
+
+// One thing to move for an extra presentation, and what its position was
+struct Th12Shifted {
+	float* position;
+	float saved[3];
+};
+
+static const size_t th12_shifted_max =
+	1 + th12_player_option_count * 2 + th12_player_shot_count;
+static Th12Shifted th12_shifted[th12_shifted_max];
+static size_t th12_shifted_count;
+
+static void th12_shift(float* position, const Th12Motion& motion, float t) {
+	if (position == nullptr || th12_shifted_count >= th12_shifted_max)
+		return;
+	Th12Shifted& shifted = th12_shifted[th12_shifted_count++];
+	shifted.position = position;
+	for (int axis = 0; axis < 3; ++axis)
+		shifted.saved[axis] = position[axis];
+	position[0] += motion.delta_x * t;
+	position[1] += motion.delta_y * t;
+}
+
+static void th12_undo_shifts() {
+	for (size_t i = 0; i < th12_shifted_count; ++i) {
+		const Th12Shifted& shifted = th12_shifted[i];
+		for (int axis = 0; axis < 3; ++axis)
+			shifted.position[axis] = shifted.saved[axis];
+	}
+	th12_shifted_count = 0;
+}
+
+// The player itself: a motion record of its own, and nothing else to keep
+static Th12Motion th12_body_motion;
+
+// The options: what each of the 8 slots moved by, and the sprite objects it wears
+static Th12Motion th12_option_motions[th12_player_option_count];
+static unsigned int th12_option_handles[th12_player_option_count][2];
+static float* th12_option_sprite_pos[th12_player_option_count][2];
+
+// The shots: the same, one per slot of the 256
+static Th12Motion th12_shot_motions[th12_player_shot_count];
+static unsigned int th12_shot_handles[th12_player_shot_count];
+static float* th12_shot_sprite_pos[th12_player_shot_count];
+
+// What each option slot says the two sprites it wears are, and whether that still names one that is
+// there. The game leaves the handle behind when it frees a sprite (0x4381E0 releases both and
+// zeroes another field of the slot), so a slot can keep pointing at one that is gone for a while.
+static void th12_options_dump(FILE* file) {
+	fprintf(file, "option slots:");
+	for (unsigned int i = 0; i < th12_player_option_count; ++i) {
+		fprintf(file, " [%u]", i);
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			if (th12_option_handles[i][sprite] == 0)
+				fprintf(file, " -");
+			else if (th12_option_sprite_pos[i][sprite] == nullptr)
+				fprintf(file, " %08x(gone)", th12_option_handles[i][sprite]);
+			else
+				fprintf(file, " %08x(%.1f,%.1f d%.2f,%.2f)", th12_option_handles[i][sprite],
+					th12_option_sprite_pos[i][sprite][0], th12_option_sprite_pos[i][sprite][1],
+					th12_option_motions[i].delta_x, th12_option_motions[i].delta_y);
+		}
+	}
+	fprintf(file, "\n");
+	// The same for the first few shots that are in play, so a shot whose sprite isn't where the
+	// slot says it is shows up as well
+	fprintf(file, "shot slots:");
+	unsigned int shown = 0;
+	for (unsigned int i = 0; i < th12_player_shot_count && shown < 8; ++i) {
+		if (th12_shot_handles[i] == 0)
+			continue;
+		fprintf(file, " [%u]", i);
+		if (th12_shot_sprite_pos[i] == nullptr)
+			fprintf(file, " %08x(gone)", th12_shot_handles[i]);
+		else
+			fprintf(file, " %08x(%.1f,%.1f d%.2f,%.2f)", th12_shot_handles[i],
+				th12_shot_sprite_pos[i][0], th12_shot_sprite_pos[i][1],
+				th12_shot_motions[i].delta_x, th12_shot_motions[i].delta_y);
+		++shown;
+	}
+	if (shown == 0)
+		fprintf(file, " none");
+	fprintf(file, "\n");
+}
+
+// Collects what the player owns this frame and works out what it moved by since the frame before.
+// This runs once per game frame, from the game's own present (see th12_present_hook).
+static void th12_player_measure() {
+	++th12_motion_frame;
+	th12_sprites_untracked = 0;
+	th12_body_sprites = 0;
+	th12_option_sprites = 0;
+	th12_shot_sprites = 0;
+
+	void* player = *th12_player;
+	if (player == nullptr)
+		return;
+
+	for (unsigned int i = 0; i < th12_player_shot_count; ++i) {
+		const char* slot = (const char*)player + th12_player_shots + i * th12_player_shot_size;
+		const unsigned int handle = *(const unsigned int*)(slot + th12_player_shot_sprite);
+		if (*(const int*)(slot + th12_player_shot_live) != 0 && handle != 0) {
+			const float* position = (const float*)(slot + th12_player_shot_position);
+			th12_measure(th12_shot_motions[i], position[0], position[1]);
+			th12_shot_handles[i] = handle;
+			th12_shot_sprite_pos[i] = th12_sprite_by_handle(handle);
+			if (th12_shot_sprite_pos[i] == nullptr)
+				++th12_sprites_untracked;
+		} else {
+			th12_shot_handles[i] = 0;
+			th12_shot_sprite_pos[i] = nullptr;
+			th12_shot_motions[i].frame = 0;
+		}
+	}
+
+	for (unsigned int i = 0; i < th12_player_option_count; ++i) {
+		const char* slot = (const char*)player + th12_player_options + i * th12_player_option_size;
+		const int* position = (const int*)(slot + th12_player_option_position);
+		th12_measure(th12_option_motions[i],
+			(float)position[0] / th12_units_per_pixel, (float)position[1] / th12_units_per_pixel);
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			const unsigned int handle =
+				*(const unsigned int*)(slot + th12_player_option_sprite + sprite * 4);
+			th12_option_handles[i][sprite] = handle;
+			th12_option_sprite_pos[i][sprite] = th12_sprite_by_handle(handle);
+			if (handle != 0 && th12_option_sprite_pos[i][sprite] == nullptr)
+				++th12_sprites_untracked;
+		}
+	}
+
+	// The player itself: its position is what the update moves, and its draw copies it into the
+	// sprite it wears, so that is what is measured
+	{
+		const float* position = (const float*)((const char*)player + th12_player_position);
+		th12_measure(th12_body_motion, position[0], position[1]);
+		const float x = th12_body_motion.delta_x < 0.0f ? -th12_body_motion.delta_x : th12_body_motion.delta_x;
+		const float y = th12_body_motion.delta_y < 0.0f ? -th12_body_motion.delta_y : th12_body_motion.delta_y;
+		const float magnitude = x > y ? x : y;
+		if (magnitude > th12_player_movement)
+			th12_player_movement = magnitude;
+	}
+}
+
+// Moves the player and everything it put on screen t frames ahead of the state the game is in, and
+// remembers what it changed
+static void th12_player_advance(float t) {
+	th12_body_sprites = 0;
+	th12_option_sprites = 0;
+	th12_shot_sprites = 0;
+	th12_shifted_count = 0;
+
+	if (th12_bullets_held())
+		return;
+
+	void* player = *th12_player;
+	if (player == nullptr)
+		return;
+
+	if (th12_motion_frame == th12_body_motion.frame) {
+		th12_shift((float*)((char*)player + th12_player_position), th12_body_motion, t);
+		++th12_body_sprites;
+	}
+
+	for (unsigned int i = 0; i < th12_player_option_count; ++i) {
+		if (th12_motion_frame != th12_option_motions[i].frame)
+			continue;
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			if (th12_option_sprite_pos[i][sprite] == nullptr)
+				continue;
+			th12_shift(th12_option_sprite_pos[i][sprite], th12_option_motions[i], t);
+			++th12_option_sprites;
+		}
+	}
+
+	for (unsigned int i = 0; i < th12_player_shot_count; ++i) {
+		if (th12_shot_sprite_pos[i] == nullptr || th12_motion_frame != th12_shot_motions[i].frame)
+			continue;
+		th12_shift(th12_shot_sprite_pos[i], th12_shot_motions[i], t);
+		++th12_shot_sprites;
+	}
+}
+
 // One extra presentation of the frame: the same render block the game runs, once more, so the state
 // the game is in is drawn and presented again. The tool's frame is readied again, so the object
 // render below draws its overlay into this presentation the same way it does in the game's own one.
@@ -346,7 +667,9 @@ static void th12_extra_presentation(IDirect3DDevice9* device, float t) {
 	// Everything is drawn where it will be t frames from now; the render bakes those positions into
 	// what it draws, so they can all go back right after it
 	th12_bullets_advance(t);
+	th12_player_advance(t);
 	th12_render_objects();
+	th12_undo_shifts();
 	th12_bullets_undo();
 	th12_draw_sprite_queue();
 	device->SetTexture(0, nullptr);
@@ -376,6 +699,10 @@ static HRESULT th12_present_hook() {
 
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
+
+	// The game's own update has run and it is about to put that frame on screen: this is the one
+	// point per frame where the movement of the player, its options and its shots can be measured
+	th12_player_measure();
 
 	HRESULT result = device->Present(nullptr, nullptr, nullptr, nullptr);
 	overlay_mark_presentation();
