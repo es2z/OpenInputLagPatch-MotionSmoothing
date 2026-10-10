@@ -132,6 +132,10 @@ static double th12_present_rate() {
 }
 
 // Diagnostics: press U to write the presentation timing of the last frames to oilp_diag.txt
+// (what the last presentation projected, see the stage 1 sections below)
+static unsigned int th12_bullets_in_play;
+static unsigned int th12_bullets_moved;
+
 static const unsigned int th12_diag_frames_max = 300;
 static const unsigned int th12_diag_presents_max = 8;
 struct Th12DiagFrame {
@@ -165,6 +169,8 @@ static void th12_diag_dump() {
 	fprintf(file, "logic frame rate: %.2f, configured presentation rate: %.2f\n",
 		Limiter::game_fps, th12_present_rate());
 	fprintf(file, "frames recorded: %u\n", count);
+	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
+		th12_bullets_in_play, th12_bullets_moved);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -189,6 +195,143 @@ static void th12_diag_dump() {
 	printf("Wrote oilp_diag.txt\n");
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: project the bullets forward
+// ---------------------------------------------------------------------------
+//
+// The bullets of a stage live in the bullet manager at 0x4B43C8, which the stage build
+// (FUN_004097F0) allocates as a single 0x4DEBE0 byte block and FUN_00409530 then fills in: it loads
+// bullet.anm into manager+0x4DEBDC (the four bytes of the block that aren't part of the pool) and
+// points manager+0x10 at the pool, which starts at manager+0x64 and holds 2001 bullets of 0x9F8
+// bytes each. Every bullet carries an animation object of its own at +0x08.
+//
+// The manager's update task (0x40A1F0) runs the bullets and rebuilds the six in-play lists at
+// manager+0x14 - one head and one tail per column, so manager+0x14..0x28 are the heads and
+// manager+0x2C..0x40 the tails. FUN_0040A020 walks the pool and, for every bullet that is in play
+// (a non-zero 16 bit word at +0x532), runs it through FUN_004099E0 and threads it onto the list of
+// the column the bullet keeps at +0x54C; the bullet's link to the next one of its column is its own
+// +0x538. The manager's draw task (0x40A220) walks those same lists (FUN_0040A150 once per column),
+// which makes them exactly the bullets that are drawn - so that is the list walked here, and it is
+// read after the game's own update ran, which is the case by the time the frame is presented.
+//
+// A bullet moves by its velocity: FUN_004099E0 adds the three floats at +0x4C8/+0x4CC/+0x4D0 to the
+// position at +0x4BC/+0x4C0/+0x4C4, scaled by the global 0x4B2ED0 (the factor the game scales every
+// movement with, 1 unless the screen is full enough for it to slow down), once per frame. It moves
+// at half of that while its state at +0x532 is 2 or 3 (0 is free, 1 is a bullet in flight; the half
+// is the double at 0x4A3CF8, which is 0.5), and not at all in any other state. The states are what
+// 0x409A05 switches on, and the two half-speed paths (0x409AAC for state 2, 0x409A27 for state 3)
+// are the same code as the full speed one (0x409C9A) with that one factor more.
+//
+// The drawn sprites follow on their own: the draw pass copies this position into the sprite fields
+// at +0x42C/+0x430/+0x434 and hands the animation object at +0x08 to the sprite queue (0x45C900), so
+// moving the position is enough - the same rule as in th13 and th14.
+
+static void** const th12_bullet_manager = (void**)0x004B43C8;
+static const size_t th12_bullet_lists = 0x14;      // in the manager: the first column's head
+static const size_t th12_bullet_columns = 6;       // ...and how many columns there are
+static const size_t th12_bullet_next = 0x538;      // in a bullet: the next one of its column
+static const size_t th12_bullet_position = 0x4BC;  // in a bullet: its position, 3 floats
+static const size_t th12_bullet_velocity = 0x4C8;  // in a bullet: what it moves by, 3 floats
+static const size_t th12_bullet_state = 0x532;     // in a bullet: what it's doing, 16 bits
+// The factor the game scales every movement with (1 unless the screen is full enough for it to
+// slow down)
+static float* const th12_time_scale = (float*)0x004B2ED0;
+// How many of the game's updates it runs per rendered frame, minus one
+static unsigned char* const th12_frames_per_render = (unsigned char*)0x004CEACE;
+// The object of the pause screen while it is up, and the flags of it the bullet tasks look at
+static void** const th12_pause_object = (void**)0x004B44E8;
+static const size_t th12_pause_flags = 0x60;
+
+// The pool holds 2001 bullets, so the lists of the ones in play can't be longer
+static const size_t th12_bullets_saved_max = 2001;
+struct Th12SavedBullet {
+	void* bullet;
+	float position[3];
+};
+static Th12SavedBullet th12_saved_bullets[th12_bullets_saved_max];
+static size_t th12_saved_bullets_count;
+
+// Whether the pause screen has the picture held. A picture the game isn't updating (or isn't
+// drawing) must not be moved forward either. 0x40A1F0 and 0x40A220 are the game's two bullet tasks,
+// and this is the same test each of them makes.
+static bool th12_bullets_held() {
+	void* pause = *th12_pause_object;
+	if (pause == nullptr)
+		return false;
+	const unsigned int flags = *(unsigned int*)((char*)pause + th12_pause_flags);
+	return ((flags | (flags >> 2)) & 1) != 0 || (flags & 4) != 0;
+}
+
+// How much of a frame's movement a bullet in this state gets (0x409A05)
+static float th12_bullet_step_factor(unsigned short state) {
+	switch (state) {
+	case 1:
+		return 1.0f;
+	case 2:
+	case 3:
+		return 0.5f;
+	default:
+		return 0.0f;
+	}
+}
+
+// Moves every bullet in play forward by t frames and remembers what it changed
+static void th12_bullets_advance(float t) {
+	th12_saved_bullets_count = 0;
+	th12_bullets_in_play = 0;
+	th12_bullets_moved = 0;
+
+	void* manager = *th12_bullet_manager;
+	if (manager == nullptr || th12_bullets_held())
+		return;
+
+	unsigned int frames_per_render = *th12_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	float scale = *th12_time_scale;
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
+
+	for (size_t column = 0; column < th12_bullet_columns; ++column) {
+		void* bullet = *(void**)((char*)manager + th12_bullet_lists + column * 4);
+		for (size_t guard = 0; bullet != nullptr && guard < th12_bullets_saved_max; ++guard) {
+			void* next = *(void**)((char*)bullet + th12_bullet_next);
+
+			++th12_bullets_in_play;
+			const float factor = th12_bullet_step_factor(*(unsigned short*)((char*)bullet + th12_bullet_state));
+			if (factor != 0.0f && th12_saved_bullets_count < th12_bullets_saved_max) {
+				float* position = (float*)((char*)bullet + th12_bullet_position);
+				const float* velocity = (const float*)((char*)bullet + th12_bullet_velocity);
+				Th12SavedBullet& saved = th12_saved_bullets[th12_saved_bullets_count++];
+				saved.bullet = bullet;
+
+				const float bullet_step = step * factor;
+				for (int axis = 0; axis < 3; ++axis) {
+					saved.position[axis] = position[axis];
+					position[axis] += velocity[axis] * bullet_step;
+				}
+				++th12_bullets_moved;
+			}
+
+			bullet = next;
+		}
+	}
+}
+
+// Puts the positions of every bullet th12_bullets_advance moved back
+static void th12_bullets_undo() {
+	for (size_t i = 0; i < th12_saved_bullets_count; ++i) {
+		const Th12SavedBullet& saved = th12_saved_bullets[i];
+		float* position = (float*)((char*)saved.bullet + th12_bullet_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = saved.position[axis];
+	}
+	th12_saved_bullets_count = 0;
+}
+
 // One extra presentation of the frame: the same render block the game runs, once more, so the state
 // the game is in is drawn and presented again. The tool's frame is readied again, so the object
 // render below draws its overlay into this presentation the same way it does in the game's own one.
@@ -200,7 +343,11 @@ static void th12_extra_presentation(IDirect3DDevice9* device, float t) {
 	*(DWORD*)0x004CF278 = 0xFF;
 	th12_prepare_render();
 	ToolState::ReadyToDraw();
+	// Everything is drawn where it will be t frames from now; the render bakes those positions into
+	// what it draws, so they can all go back right after it
+	th12_bullets_advance(t);
 	th12_render_objects();
+	th12_bullets_undo();
 	th12_draw_sprite_queue();
 	device->SetTexture(0, nullptr);
 	device->EndScene();
