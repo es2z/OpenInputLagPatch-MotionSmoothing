@@ -7,6 +7,101 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-11
+
+### Added
+
+- **Touhou 12 (Undefined Fantastic Object) gets frame interpolation too** (`c4b7811`, `fe9146f`, `fd8eddc`)
+
+  Undefined Fantastic Object is the last of the games the requirements name (the earlier ones already
+  had reverse engineering or notes to work from, and the later three were worked backwards from
+  Double Dealing Character and Legacy of Lunatic Kingdom to here). Its frame function has the same **three render blocks
+  and three present sites** (renders at `0x45017B`/`0x450529`/`0x4506C8`, presents at
+  `0x450355`/`0x450586`/`0x450789`), and those six are what the extra presentations take over.
+  `0x45A380` empties the sprite queue and `0x45A3C0` draws it, and both want their object in `ESI`,
+  so they are called through the same kind of `__declspec(naked)` trampoline th13 needed - putting
+  the object where the routine wants it and putting the caller's register back before returning.
+
+  The bullets are the manager `[0x4B43C8]` and its own list of the ones in play: position at
+  `+0x4BC`, velocity at `+0x4C8`, moved exactly the way the game's own update moves them (the global
+  slowdown and the half step a starting bullet gets included). The player is `[0x4B4514]`, its own
+  position at `+0x97C`. The player, its options and its shots are moved smoothly by the input and by
+  each other with **no velocity to read**, so they are *measured* the way th13, th14 and th15 do it:
+  what each moved by since the frame before is taken at the point the game presents its own frame,
+  written in for the fraction of a frame an extra presentation sits at, and put back right after the
+  render. The straight lasers are the manager `[0x4B44F4]`, position at `+0x50`, and read their
+  velocity from their own class (see the item below).
+
+  Confirmed in-game: the extras land evenly at 180 presents per second, no sprite is left without a
+  movement record, and the bullets, the player, its options and shots and the straight lasers all
+  move with the extra frames; the pause and the save-replay screens are as they should be. The
+  enemies are not interpolated (their animation scripts place them and there is nothing to read),
+  and the curve lasers are left alone.
+
+### Changed
+
+- **The four games' straight lasers read their velocity instead of measuring what they moved**
+  (`7fdd8fd`)
+
+  All four measured the lasers: the position each was at the frame before was kept **per object
+  address**, and an extra presentation wrote in the difference times the fraction of a frame. The
+  problem is not precision but **object recycling** - lasers are short lived, the game frees and
+  allocates them constantly, and a fresh laser that lands in a dead one's slot gets "old position
+  minus new position" as if it were a velocity, which draws that laser offset. A screen with a few
+  hundred of them, which these games reach, runs into it almost every time. Reading the velocity the
+  laser carries cannot do that (a warning line, whose velocity really is zero, is left where it is),
+  and it also gets a laser's first frame right, where a measurement has nothing to compare against.
+
+  Two things fell out of reading the classes: in th13, th14 and th15 a line laser's angle is fixed
+  (their own updates never write it - only the infinite class turns), and their beam class's update
+  function (`0x437FF0`, `0x443C50`, `0x44B7D0`) is a stub that just returns 0, so it never moves and
+  has no layout of its own. The per class layouts of all four games are in the notes under
+  `_analysis`, each read out of that game's own class update rather than copied.
+
+### Fixed
+
+- **The menus' text is no longer drawn twice by the extra presentations** (`d387341`)
+
+  A menu, the pause screen and the save/load replay screens do not draw their text a line at a time:
+  the game's own printf-for-text call **appends a record** to a list inside its text object (0x138
+  bytes each, up to 0x140 of them) and **the drawing then walks the records the frame's count of
+  them covers**. That count **is started over once per frame**, and that happens in the **update
+  walk** - the walk an extra presentation does not run, because it is the game's logic. So an extra
+  frame drew the records the game's own frame had left behind a second time, appended its own behind
+  them, and drew the lot; and the **second** extra presentation of a frame draws into the same back
+  buffer the game's own frame was presented from, so both copies land on one picture.
+
+  The fields and the look of each game (all read out of that game):
+
+  | Game | Text object | Records | **The frame's record count** | Look |
+  |---|---|---|---|---|
+  | th12 | `[0x4B43B8]` | `+0x97C` | `+0x18F7C` | the layout does not move between the two, so the copies sit **exactly on top of each other** and only make the text look a little denser |
+  | th13 | `[0x4C2160]` | `+0xB5C` | `+0x1915C` | two copies of the line, **offset more and more along it** |
+  | th14 | `[0x4DB520]` | `+0xBAC` | `+0x191AC` | as th13 |
+  | th15 | `[0x4E9A58]` | `+0xC20` | `+0x19220` | as th12 |
+
+  > **A note for anyone chasing this**: the symptom **cannot be seen at 120Hz** (one extra
+  > presentation per frame is one step of this, which is too small), it shows from 180Hz on; and
+  > comparing the game's own frame with the *first* extra alone shows almost nothing and looks fine.
+  > Capturing **every presentation of a frame** is what shows it.
+
+  The fix is the same discipline the bullets and lasers have always used - save, draw, put back: the
+  count is saved at the start of the game's own run of the render walk (th13 also saves the twelve
+  fields of its text object that its own walk was measured to change: the pointer the next record is
+  taken from at `+0x040`, the position the text was left off at `+0x050/+0x054`, eight floats at
+  `+0x3CC` and the count) and put back before every extra presentation. Each extra then appends its
+  own records from the start of the list and draws exactly what the game's own frame drew, and the
+  state it leaves behind is what a single run of the game's walk would have left, so the game's next
+  frame starts the list over where it always did.
+
+  What settled it was **writing the back buffer out as a BMP right before every present** (through
+  `GetBackBuffer` and `GetRenderTargetData`, every presentation of a frame, not one of them) and
+  comparing them: the game's own frame against its second extra differed in 2911 pixels with a mean
+  channel delta of **109** (the doubled line, visible to the eye), while against the first extra it
+  differed in 2262 pixels with a mean of **13.75**, which looks right. With this in, all four games
+  come out **pixel for pixel identical**, and the screens' text was confirmed in-game to be back to
+  normal.
+
 ## 2026-10-10
 
 ### Added
