@@ -304,6 +304,281 @@ static void th17_bullets_undo() {
 	th17_saved_bullets_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player, its beast spirits and its shots
+// ---------------------------------------------------------------------------
+//
+// The player of the stage that is running is at 0x4B77D0 (FUN_00446D90 builds it and puts itself
+// there, 0x446F76 releases it; null in the menus and before a stage starts). Its own picture is
+// the animation object at +0x10, and the render pass of the player (0x448CF0, the task the game
+// registers with the draw chain - FUN_004463F0 registers it with the task id 0x1D) copies its
+// position (+0x610) into that object's position (+0x5F4 = the object's +0x5E4) before drawing it,
+// so moving the position moves the player's sprite the same way the bullets' position does.
+//
+// Everything else the player puts on screen keeps a sprite object of its own and is positioned by
+// the update instead, so those sprites have to be moved themselves:
+//
+//   - the shots the player fires are 256 slots of 0xE0 bytes at +0x1110. A live slot (its +0x8C is
+//     set) keeps its sprite object id at +0x08 and a position at +0x48, which the update
+//     (FUN_0044AD70) copies into that sprite (+0x5E4) before moving it.
+//   - the beast spirits the player carries (the "goast": what sits beside the player and what the
+//     roar summons) live in a manager of their own (0x4B7684, built by FUN_0040E420 with
+//     beast.anm). Each of them is a 0x70 byte object threaded onto the manager's list (its first
+//     one at [0x4B7684+0x18], the next at +0x04) which keeps the sprite object ids it is drawn
+//     with at +0x10 (the spirit itself) and at +0x28/+0x2C/+0x30/+0x38/+0x44 (the effects the
+//     roar puts around the player), and its update (FUN_00410AF0) writes its position (+0x18) into
+//     the sprite it is drawn with each frame.
+//   - the sprite the player's own shot is drawn with is kept at +0x19094, and the player's update
+//     puts it right on the player each frame.
+//
+// The sprites those keep are found the way the game finds one from an id (FUN_00476470): the
+// sprite manager at 0x509A20 holds its objects in slots of 0x618 bytes starting at +0x6EC, each of
+// them with the id it belongs to at +0x538 and an "in use" byte at +0x610, and ids whose low 14
+// bits are 0x3FFF are on one of the manager's two lists instead (the player's sprites never are).
+// The lookup is written out here instead of called: it takes its argument on the stack, and a call
+// through a function pointer is not put together with that in mind - the garbage it gets back
+// hands back a pointer that is not a sprite at all (the same mistake th15 made once).
+//
+// The player moves by what the input says rather than by a velocity that could be read back, and
+// the beast spirits and shots move by what comes out of that plus their own motion, so what each
+// sprite moves by in a frame is measured instead of read: every game frame the positions are
+// compared with the ones of the frame before, and the extra presentations move the sprites by that
+// difference times the fraction of a frame they stand for. Something that didn't move - a held
+// picture, a paused game - comes out as zero on its own.
+
+static void** const th17_player = (void**)0x004B77D0;
+static const size_t th17_player_position = 0x610;       // the player's own position, 3 floats
+static const size_t th17_player_shot_sprite = 0x19094;  // the sprite its own shot is drawn with
+static const size_t th17_player_shots = 0x1110;         // 256 slots of 0xE0 bytes
+static const size_t th17_player_shot_count = 256;
+static const size_t th17_player_shot_size = 0xE0;
+static const size_t th17_player_shot_live = 0x8C;       // nonzero while the shot is in use
+static const size_t th17_player_shot_sprite_id = 0x08;  // the sprite's object id
+static void** const th17_beast_manager = (void**)0x004B7684;
+static const size_t th17_beast_list = 0x18;             // in it: the first beast spirit
+static const size_t th17_beast_next = 0x04;             // in one: the next one
+static const size_t th17_beast_sprite_count = 6;        // the sprites it is drawn with
+static const size_t th17_beast_sprites[th17_beast_sprite_count] = {
+	0x10, // the spirit itself
+	0x28, 0x2C, // the two the roar's aura is drawn with
+	0x30, 0x38, // the two it puts on the player
+	0x44, // the one the roar hands the player
+};
+static const size_t th17_object_position = 0x5E4;       // in a sprite object, 3 floats
+// Nothing on screen moves this far in one frame (the player's own speed is a few pixels), so a
+// difference bigger than this is a slot that was handed to another object, not a movement
+static const float th17_max_step = 48.0f;
+
+// One thing to move for an extra presentation: the sprite object whose position is shifted. What
+// the sprite moved by is measured on that same position, so the entry only has to remember it.
+static const size_t th17_tracked_max = 1 + 1
+	+ 40 * th17_beast_sprite_count
+	+ th17_player_shot_count;
+
+struct Th17SpriteMotion {
+	void* sprite;         // the sprite object it is about, null while the entry is free
+	unsigned int frame;   // the frame it was last measured in
+	float last_x, last_y;
+	float delta_x, delta_y;
+};
+
+static Th17SpriteMotion th17_motions[th17_tracked_max];
+static unsigned int th17_motion_frame = 1;
+static float* th17_tracked[th17_tracked_max];
+static size_t th17_tracked_count;
+static float th17_tracked_saved[th17_tracked_max][3];
+
+// Diagnostics: the largest movement the player's own position had since the last dump
+static float th17_player_movement;
+// Diagnostics: how many sprites this frame couldn't be given a movement record (see
+// th17_sprite_motion - it should stay 0)
+static unsigned int th17_sprites_untracked;
+
+// The sprite object an id refers to: the same lookup the game does (0x476470), written out
+// instead of called (see the comment above).
+static void* th17_object_by_id(unsigned int id) {
+	const unsigned int index = id & 0x3FFF;
+	if (id == 0 || index == 0x3FFF)
+		return nullptr;
+
+	void* manager = *(void**)0x00509A20;
+	if (manager == nullptr)
+		return nullptr;
+
+	char* object = (char*)manager + 0x6EC + (size_t)index * 0x618;
+	if (*(unsigned char*)(object + 0x610) == 0)
+		return nullptr;
+	if (*(unsigned int*)(object + 0x538) != id)
+		return nullptr;
+	return object;
+}
+
+// The record of a sprite, made the first time it is seen.
+//
+// Nothing tells a sprite that is gone from a slot that is still up, so a record can't be dropped
+// when its sprite stops being drawn - which means they have to be recycled instead. Without that,
+// everything a stage ever puts on screen keeps a record of its own, the table fills up, and from
+// then on every sprite that isn't in it already quietly stops being moved (the player itself is
+// the first to suffer when a stage is started again, since it is built at another address then).
+//
+// The one that was measured longest ago is the one recycled: a record that wasn't measured in the
+// frame right before this one has nothing to compare against anyway. A record that is in use this
+// frame is never taken, so the sprite it belongs to keeps moving with the others.
+static Th17SpriteMotion* th17_sprite_motion(void* sprite) {
+	Th17SpriteMotion* empty = nullptr;
+	Th17SpriteMotion* oldest = nullptr;
+	for (size_t i = 0; i < th17_tracked_max; ++i) {
+		Th17SpriteMotion& motion = th17_motions[i];
+		if (motion.sprite == sprite)
+			return &motion;
+		if (motion.sprite == nullptr) {
+			if (empty == nullptr)
+				empty = &motion;
+			continue;
+		}
+		if (motion.frame == th17_motion_frame)
+			continue;
+		if (oldest == nullptr || motion.frame < oldest->frame)
+			oldest = &motion;
+	}
+
+	Th17SpriteMotion* motion = empty != nullptr ? empty : oldest;
+	if (motion == nullptr)
+		return nullptr;
+	motion->sprite = sprite;
+	motion->frame = 0;
+	motion->last_x = 0.0f;
+	motion->last_y = 0.0f;
+	motion->delta_x = 0.0f;
+	motion->delta_y = 0.0f;
+	return motion;
+}
+
+// Adds a sprite to what this frame moves, and works out what it moved by since the frame before
+static void th17_track(float* position) {
+	if (th17_tracked_count >= th17_tracked_max)
+		return;
+	// Two ids can name the same sprite (the game doesn't mind), and moving one twice would put it
+	// twice as far out and only be able to put back one of the two
+	for (size_t i = 0; i < th17_tracked_count; ++i) {
+		if (th17_tracked[i] == position)
+			return;
+	}
+	Th17SpriteMotion* motion = th17_sprite_motion(position);
+	if (motion == nullptr) {
+		++th17_sprites_untracked;
+		return;
+	}
+
+	const float x = position[0];
+	const float y = position[1];
+
+	// Only a sprite that was measured in the frame right before this one has something to compare
+	// against (one that just appeared, or that came back after the game didn't draw for a while,
+	// hasn't moved as far as this can tell)
+	if (motion->frame + 1 == th17_motion_frame) {
+		const float dx = x - motion->last_x;
+		const float dy = y - motion->last_y;
+		// The pools hand their slots out again, and the object that used to be there is somewhere
+		// else entirely - that difference is not something to project
+		if (dx > -th17_max_step && dx < th17_max_step && dy > -th17_max_step && dy < th17_max_step) {
+			motion->delta_x = dx;
+			motion->delta_y = dy;
+		} else {
+			motion->delta_x = 0.0f;
+			motion->delta_y = 0.0f;
+		}
+	} else {
+		motion->delta_x = 0.0f;
+		motion->delta_y = 0.0f;
+	}
+	motion->frame = th17_motion_frame;
+	motion->last_x = x;
+	motion->last_y = y;
+
+	th17_tracked[th17_tracked_count++] = position;
+}
+
+// Collects what is on screen this frame and works out what it moved by since the frame before.
+// This runs once per game frame, from the game's own present (see th17_present_hook).
+static void th17_player_measure() {
+	th17_tracked_count = 0;
+	th17_sprites_untracked = 0;
+	++th17_motion_frame;
+
+	void* player = *th17_player;
+	if (player == nullptr)
+		return;
+
+	// The player itself: its own position is what the render pass reads
+	th17_track((float*)((char*)player + th17_player_position));
+	if (th17_tracked_count > 0) {
+		const Th17SpriteMotion* motion = th17_sprite_motion(th17_tracked[0]);
+		if (motion != nullptr) {
+			const float x = motion->delta_x < 0.0f ? -motion->delta_x : motion->delta_x;
+			const float y = motion->delta_y < 0.0f ? -motion->delta_y : motion->delta_y;
+			const float magnitude = x > y ? x : y;
+			if (magnitude > th17_player_movement)
+				th17_player_movement = magnitude;
+		}
+	}
+
+	// The sprite the player's own shot is drawn with: the update puts it on the player
+	{
+		void* object = th17_object_by_id(*(unsigned int*)((char*)player + th17_player_shot_sprite));
+		if (object != nullptr)
+			th17_track((float*)((char*)object + th17_object_position));
+	}
+
+	// The beast spirits and the sprites the roar draws with them, which sit on the player too
+	void* manager = *th17_beast_manager;
+	if (manager != nullptr) {
+		void* beast = *(void**)((char*)manager + th17_beast_list);
+		for (size_t guard = 0; beast != nullptr && guard < 64; ++guard) {
+			for (size_t i = 0; i < th17_beast_sprite_count; ++i) {
+				void* object = th17_object_by_id(*(unsigned int*)((char*)beast + th17_beast_sprites[i]));
+				if (object != nullptr)
+					th17_track((float*)((char*)object + th17_object_position));
+			}
+			beast = *(void**)((char*)beast + th17_beast_next);
+		}
+	}
+
+	// The shots, which are only measured while they are up
+	for (size_t i = 0; i < th17_player_shot_count; ++i) {
+		const char* slot = (const char*)player + th17_player_shots + i * th17_player_shot_size;
+		if (*(const int*)(slot + th17_player_shot_live) == 0)
+			continue;
+		void* object = th17_object_by_id(*(const unsigned int*)(slot + th17_player_shot_sprite_id));
+		if (object == nullptr)
+			continue;
+		th17_track((float*)((char*)object + th17_object_position));
+	}
+}
+
+// Moves the player, its beast spirits and its shots t frames ahead of the state the game is in, and
+// remembers what it changed
+static void th17_player_advance(float t) {
+	for (size_t i = 0; i < th17_tracked_count; ++i) {
+		float* position = th17_tracked[i];
+		for (int axis = 0; axis < 3; ++axis)
+			th17_tracked_saved[i][axis] = position[axis];
+		const Th17SpriteMotion* motion = th17_sprite_motion(position);
+		if (motion != nullptr) {
+			position[0] += motion->delta_x * t;
+			position[1] += motion->delta_y * t;
+		}
+	}
+}
+
+static void th17_player_undo() {
+	for (size_t i = 0; i < th17_tracked_count; ++i) {
+		float* position = th17_tracked[i];
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = th17_tracked_saved[i][axis];
+	}
+}
+
 // The number of presentations per second the config asks for. 0 means interpolation is off.
 //
 // "-1" picks the largest multiple of the game's frame rate that still fits the display refresh
@@ -362,6 +637,13 @@ static void th17_diag_dump() {
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th17_bullets_in_play, th17_bullets_moved);
+	fprintf(file, "player: %u sprite(s) moved (the player, its beast spirits and its shots)\n",
+		(unsigned int)th17_tracked_count);
+	fprintf(file, "player: %u sprite(s) this frame had no movement record (should stay 0)\n",
+		th17_sprites_untracked);
+	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n",
+		th17_player_movement);
+	th17_player_movement = 0.0f;
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -423,7 +705,9 @@ static void th17_extra_presentation(float t) {
 	// The objects are drawn where they will be t frames from now; the render bakes the positions
 	// into the sprite queue, so they can go back right after it
 	th17_bullets_advance(t);
+	th17_player_advance(t);
 	th17_render_objects();
+	th17_player_undo();
 	th17_bullets_undo();
 	th17_draw_sprite_queue(*th17_sprite_manager);
 	device->SetTexture(0, nullptr);
@@ -453,6 +737,11 @@ static HRESULT th17_present_hook() {
 
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
+
+	// The game's own update has run and it is about to put that frame on screen: this is the one
+	// point per frame where the movement of the player, its beast spirits and its shots can be
+	// measured
+	th17_player_measure();
 
 	// The game's own presentation of this frame, through the device it drew with, so that the
 	// hooks the user's tools have on it still see it
