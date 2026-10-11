@@ -114,6 +114,180 @@ static void th16_render_hook() {
 	th16_render_objects();
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: project the bullets forward
+// ---------------------------------------------------------------------------
+//
+// The bullets of a stage live in the bullet manager, which is created when a stage starts
+// (0x411DD0 allocates it and 0x411CA0 releases it) and whose object is kept at 0x4A6DAC; the
+// manager is built by 0x411880, which fills the pools and puts itself in that global.
+//
+// The manager owns two pools of 2001 bullets each (0x1478 bytes each, the first at manager+0x9C
+// and the second at manager+0x9FFE94, the second one being the copy the game keeps for its replay
+// snapshots), and the bullets that are in play are threaded onto a list of their own: its first
+// node is at manager+0x70, the node is part of the bullet itself (bullet+0x10, with the bullet at
+// node[0] and the next node at node[4]), which is how the game's own update walks it (0x412860:
+// `mov esi, [edi+70h]` / `mov esi, [esi]` / `mov eax, [esi+4]`). The manager's own constructor
+// (0x411A30) threads the free list through the same bullets (that one at manager+0x60, with the
+// bullet's +0x04/+0x08 as its links).
+//
+// A bullet keeps three floats of position and three floats of velocity. The game moves the
+// position by the velocity once per frame, scaled by the slowdown factor it applies to everything
+// while the screen is full (0x411E70, the update of one bullet: case 1 of the state switch adds
+// velocity * [0x4A5788] to position, and it is the state switch on the 16 bit state at +0xC72 that
+// decides how much a bullet moves). This is the movement that has to be reproduced for the extra
+// presentations: they draw the state the game is in at the moment of the game's own present, so the
+// state a fraction of a frame later is the same state with every bullet moved by velocity * that
+// fraction. The game's own logic is never given the moved positions - they are put back right after
+// the extra presentation's render.
+//
+// Two things about the game matter here and are reproduced:
+//
+//   - The game only renders every frames_per_render + 1 of its updates (the byte at 0x4C12C4,
+//     which the three frame functions compare their counter against), so the step between two
+//     rendered frames is that many of its update steps. (The byte is never written in this game,
+//     so it stays 0, but the code keeps the general form the other games have.)
+//   - While the pause screen holds the picture the bullets are neither updated nor drawn: the two
+//     bullet tasks of the game (0x412C50 and 0x412C80) test the pause object at 0x4A6DD4 for
+//     that, and its walk skips every bullet on 0x400. A bullet that is waiting for its sub-pattern
+//     to start is moved by half a step (the switch's states 2, 3 and 5, which scale by the 0.5
+//     at 0x49449C), and one whose 0x200 flag is set is held - the game neither moves nor draws it.
+//
+// The drawn sprites follow the position on their own: the bullet draw pass (0x412A60) copies
+// position into the animation objects the bullet carries before handing them to the sprite queue.
+
+// The bullet manager of the stage that is running (null while no stage is)
+static void** const th16_bullet_manager = (void**)0x004A6DAC;
+static const size_t th16_bullet_list_head = 0x70; // in it: the first node of the bullets in play
+static const size_t th16_bullet_list_next = 0x04; // in a node: the next node
+static const size_t th16_bullet_position = 0xC20; // in a bullet: its position, 3 floats
+static const size_t th16_bullet_velocity = 0xC2C; // in a bullet: what it moves by, 3 floats
+static const size_t th16_bullet_state = 0xC72;    // in a bullet: what it's doing, 16 bits
+static const size_t th16_bullet_timer = 0x1450;   // in a bullet: how long it has been doing it
+static const size_t th16_bullet_flags = 0x20;     // in a bullet: 0x200 holds it (and hides it)
+// The factor the game scales every movement with (1 unless the screen is full enough for it to
+// slow down)
+static float* const th16_time_scale = (float*)0x004A5788;
+// How many of the game's updates it runs per rendered frame, minus one
+static unsigned char* const th16_frames_per_render = (unsigned char*)0x004C12C4;
+// The object of the pause screen while it is up, and the flags of it the bullet tasks look at
+static void** const th16_pause_object = (void**)0x004A6DD4;
+static const size_t th16_pause_flags = 0x88;
+
+// The bullets that were moved for the presentation being drawn, and the positions they had. The
+// pool holds 2001 of them, so the list of the ones in play can't be longer; only the bullets that
+// were saved are moved, so a list that somehow grew past the array would only cost the projection
+// of the bullets at its end.
+static const size_t th16_bullets_saved_max = 2001;
+struct Th16SavedBullet {
+	void* bullet;
+	float position[3];
+};
+static Th16SavedBullet th16_saved_bullets[th16_bullets_saved_max];
+static size_t th16_saved_bullets_count;
+
+// What the last presentation projected, for the diagnostics (see th16_diag_dump)
+static unsigned int th16_bullets_in_play;
+static unsigned int th16_bullets_moved;
+
+// Whether the pause screen has the picture held. A picture the game isn't updating (or isn't
+// drawing) must not be moved forward either.
+static bool th16_bullets_held() {
+	void* pause = *th16_pause_object;
+	if (pause == nullptr)
+		return false;
+	const unsigned int flags = *(unsigned int*)((char*)pause + th16_pause_flags);
+	// What the game's two bullet tasks and the walk itself stop for: the update task for the low
+	// bits, the draw task for bit 2, and the walk for bit 0x400 (which skips every bullet's own
+	// update while the picture is held)
+	return ((flags | (flags >> 2)) & 1) != 0 || (flags & 4) != 0 || (flags & 0x400) != 0;
+}
+
+// How much of a frame's movement a bullet in this state gets (0x411E70, the switch on the state at
+// +0xC72). A bullet that is in play moves a whole step, the ones that are still waiting for their
+// sub-pattern to start move half of one, and one that is in neither state doesn't move at all.
+// 0x200 on a bullet holds it - the game neither moves nor draws such a bullet - and a bullet in
+// state 5 doesn't move at all until its timer is past 2.
+static float th16_bullet_step_factor(unsigned short state, unsigned int flags, int timer) {
+	switch (state) {
+	case 1:
+		return (flags & 0x200) != 0 ? 0.0f : 1.0f;
+	case 2:
+	case 3:
+		return 0.5f;
+	case 5:
+		return timer > 2 ? 0.5f : 0.0f;
+	default:
+		return 0.0f;
+	}
+}
+
+// Moves every bullet in play forward by t frames (t = 0 is the state the game is in) and remembers
+// what it changed, so th16_bullets_undo can put it back.
+static void th16_bullets_advance(float t) {
+	th16_saved_bullets_count = 0;
+	th16_bullets_in_play = 0;
+	th16_bullets_moved = 0;
+
+	void* manager = *th16_bullet_manager;
+	if (manager == nullptr || th16_bullets_held())
+		return;
+
+	unsigned int frames_per_render = *th16_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	float scale = *th16_time_scale;
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
+
+	void* node = *(void**)((char*)manager + th16_bullet_list_head);
+	// The list is at most as long as the pool, and this runs with the game paused in its own frame
+	// function, so it can't change under us; the bound is there to keep a list that got corrupted
+	// some other way from running away with the frame.
+	for (size_t guard = 0; node != nullptr && guard < th16_bullets_saved_max * 4; ++guard) {
+		void* bullet = *(void**)node;
+		void* next = *(void**)((char*)node + th16_bullet_list_next);
+		if (bullet == nullptr)
+			break;
+
+		++th16_bullets_in_play;
+		const float factor = th16_bullet_step_factor(
+			*(unsigned short*)((char*)bullet + th16_bullet_state),
+			*(unsigned int*)((char*)bullet + th16_bullet_flags),
+			*(int*)((char*)bullet + th16_bullet_timer));
+		if (factor != 0.0f && th16_saved_bullets_count < th16_bullets_saved_max) {
+			float* position = (float*)((char*)bullet + th16_bullet_position);
+			const float* velocity = (const float*)((char*)bullet + th16_bullet_velocity);
+			Th16SavedBullet& saved = th16_saved_bullets[th16_saved_bullets_count++];
+			saved.bullet = bullet;
+
+			const float bullet_step = step * factor;
+			for (int axis = 0; axis < 3; ++axis) {
+				saved.position[axis] = position[axis];
+				position[axis] += velocity[axis] * bullet_step;
+			}
+			++th16_bullets_moved;
+		}
+
+		node = next;
+	}
+}
+
+// Puts the positions of every bullet th16_bullets_advance moved back, so the game's own logic sees
+// the state it left behind and not the projected one.
+static void th16_bullets_undo() {
+	for (size_t i = 0; i < th16_saved_bullets_count; ++i) {
+		const Th16SavedBullet& saved = th16_saved_bullets[i];
+		float* position = (float*)((char*)saved.bullet + th16_bullet_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = saved.position[axis];
+	}
+	th16_saved_bullets_count = 0;
+}
+
 // The number of presentations per second the config asks for. 0 means interpolation is off.
 //
 // "-1" picks the largest multiple of the game's frame rate that still fits the display refresh
@@ -170,6 +344,8 @@ static void th16_diag_dump() {
 	fprintf(file, "logic frame rate: %.2f, configured presentation rate: %.2f\n",
 		Limiter::game_fps, th16_present_rate());
 	fprintf(file, "frames recorded: %u\n", count);
+	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
+		th16_bullets_in_play, th16_bullets_moved);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -195,11 +371,13 @@ static void th16_diag_dump() {
 }
 
 // One extra presentation of the frame: the same render block the game runs, once more, so the state
-// the game is in is drawn and presented again. The tool's frame is readied again, so the object
-// render below draws its overlay into this presentation the same way it does in the game's own one.
+// the game is in is drawn and presented again, with the bullets projected t frames ahead of it -
+// t = 0 is the state the game's own presentation showed, and the presentations of one frame reach
+// t = 1, which is where the game's next one takes over. The tool's frame is readied again, so the
+// object render below draws its overlay into this presentation the same way it does in the game's
+// own one - and it reads the projected positions, so a tool that draws something on the bullets
+// (thprac's hitbox display, for example) stays on them.
 static void th16_extra_presentation(float t) {
-	(void)t; // stage 1 will project the drawn objects forward by this much
-
 	IDirect3DDevice9* device = d3d9_hooked_device();
 	if (device == nullptr)
 		return;
@@ -227,7 +405,11 @@ static void th16_extra_presentation(float t) {
 	*th16_render_flag = 0xFF;
 	th16_prepare_render(th16_render_context);
 	ToolState::ReadyToDraw();
+	// The bullets are drawn where they will be t frames from now; the render bakes the positions
+	// into the sprite queue, so they can go back right after it
+	th16_bullets_advance(t);
 	th16_render_objects();
+	th16_bullets_undo();
 	th16_draw_sprite_queue(*th16_sprite_manager);
 	device->SetTexture(0, nullptr);
 	device->EndScene();
