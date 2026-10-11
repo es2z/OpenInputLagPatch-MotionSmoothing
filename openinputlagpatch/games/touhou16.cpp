@@ -288,6 +288,269 @@ static void th16_bullets_undo() {
 	th16_saved_bullets_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player, its options and its shots
+// ---------------------------------------------------------------------------
+//
+// The player of the stage that is running is at 0x4A6EF8 (0x441C60 builds it and puts itself
+// there, 0x441A50 releases it; null in the menus and before a stage starts). Its own picture is
+// the animation object at +0x14, and the render pass of the player (0x443730, the task the game
+// registers with the draw chain) copies its position (+0x610) into that object's position
+// (+0x5F4 = the object's +0x5E0) before drawing it, so moving the position moves the player's
+// sprite the same way the bullets' position does.
+//
+// Everything else the player puts on screen is positioned by the update instead, so those sprites
+// have to be moved themselves:
+//
+//   - the options (the sub-shots that sit beside the player) are two arrays of slots of 0xE4
+//     bytes: 4 of them at +0x660 and 8 at +0x9F0 (0x442380 is their update, once per array from
+//     0x441CF0). A slot that is up (its +0x00 is set) keeps two sprite object ids at
+//     +0xB0/+0xB4 and a position in 1/128 pixel units at +0x5C, which the update walks toward the
+//     player's position and then writes into the two sprites.
+//   - the player's shots (the bullets it fires) are 256 slots of 0xC0 bytes at +0x1118. A live
+//     slot (its +0x84 is set) keeps its sprite object id at +0x00 and its position in pixels at
+//     +0x40, which the update copies into the sprite and then moves (0x4456D0).
+//
+// The sprites those two keep are found the way the game finds one from an id (0x46EFA0): the
+// sprite manager at 0x4C0F48 holds its objects in slots of 0x614 bytes starting at +0xEC, each of
+// them with the id it belongs to at +0x538 and an "in use" byte at +0x60C, and ids whose low 13
+// bits are 0x1FFF are on one of the manager's two lists instead (the player's sprites never are).
+// The lookup is written out here instead of called: it takes its argument on the stack, and a
+// call through a function pointer is not put together with that in mind - the garbage it gets
+// back hands back a pointer that is not a sprite at all (the same mistake th15 made once).
+//
+// The player moves by what the input says rather than by a velocity that could be read back, and
+// the options and shots move by what comes out of that plus their own motion, so what each sprite
+// moves by in a frame is measured instead of read: every game frame the positions are compared
+// with the ones of the frame before, and the extra presentations move the sprites by that
+// difference times the fraction of a frame they stand for. Something that didn't move - a held
+// picture, a paused game - comes out as zero on its own.
+
+static void** const th16_player = (void**)0x004A6EF8;
+static const size_t th16_player_position = 0x610;        // the player's own position, 3 floats
+static const size_t th16_player_options_a = 0x660;       // the first option array
+static const size_t th16_player_options_a_count = 4;
+static const size_t th16_player_options_b = 0x9F0;       // the second one
+static const size_t th16_player_options_b_count = 8;
+static const size_t th16_player_option_size = 0xE4;
+static const size_t th16_player_option_sprite = 0xB0;    // 2 object ids
+static const size_t th16_player_shots = 0x1118;          // 256 slots of 0xC0 bytes
+static const size_t th16_player_shot_count = 256;
+static const size_t th16_player_shot_size = 0xC0;
+static const size_t th16_player_shot_live = 0x84;        // nonzero while the shot is in use
+static const size_t th16_player_shot_sprite = 0x00;      // the sprite's object id
+static const size_t th16_object_position = 0x5E0;        // in a sprite object, 3 floats
+// Nothing on screen moves this far in one frame (the player's own speed is a few pixels), so a
+// difference bigger than this is a slot that was handed to another object, not a movement
+static const float th16_max_step = 48.0f;
+
+// One thing to move for an extra presentation: the sprite object whose position is shifted. What
+// the sprite moved by is measured on that same position, so the entry only has to remember it.
+static const size_t th16_tracked_max = 1
+	+ (th16_player_options_a_count + th16_player_options_b_count) * 2
+	+ th16_player_shot_count;
+
+struct Th16SpriteMotion {
+	void* sprite;         // the sprite object it is about, null while the entry is free
+	unsigned int frame;   // the frame it was last measured in
+	float last_x, last_y;
+	float delta_x, delta_y;
+};
+
+static Th16SpriteMotion th16_motions[th16_tracked_max];
+static unsigned int th16_motion_frame = 1;
+static float* th16_tracked[th16_tracked_max];
+static size_t th16_tracked_count;
+static float th16_tracked_saved[th16_tracked_max][3];
+
+// Diagnostics: the largest movement the player's own position had since the last dump
+static float th16_player_movement;
+// Diagnostics: how many sprites this frame couldn't be given a movement record (see
+// th16_sprite_motion - it should stay 0)
+static unsigned int th16_sprites_untracked;
+
+// The sprite object an id refers to: the same lookup the game does (0x46EFA0), written out
+// instead of called (see the comment above).
+static void* th16_object_by_id(unsigned int id) {
+	const unsigned int index = id & 0x1FFF;
+	if (id == 0 || index == 0x1FFF)
+		return nullptr;
+
+	void* manager = *(void**)0x004C0F48;
+	if (manager == nullptr)
+		return nullptr;
+
+	char* object = (char*)manager + 0xEC + (size_t)index * 0x614;
+	if (*(unsigned char*)(object + 0x60C) == 0)
+		return nullptr;
+	if (*(unsigned int*)(object + 0x538) != id)
+		return nullptr;
+	return object;
+}
+
+// The record of a sprite, made the first time it is seen.
+//
+// Nothing tells a sprite that is gone from a slot that is still up, so a record can't be dropped
+// when its sprite stops being drawn - which means they have to be recycled instead. Without that,
+// everything a stage ever puts on screen keeps a record of its own, the table fills up, and from
+// then on every sprite that isn't in it already quietly stops being moved (the player itself is
+// the first to suffer when a stage is started again, since it is built at another address then).
+//
+// The one that was measured longest ago is the one recycled: a record that wasn't measured in the
+// frame right before this one has nothing to compare against anyway. A record that is in use this
+// frame is never taken, so the sprite it belongs to keeps moving with the others.
+static Th16SpriteMotion* th16_sprite_motion(void* sprite) {
+	Th16SpriteMotion* empty = nullptr;
+	Th16SpriteMotion* oldest = nullptr;
+	for (size_t i = 0; i < th16_tracked_max; ++i) {
+		Th16SpriteMotion& motion = th16_motions[i];
+		if (motion.sprite == sprite)
+			return &motion;
+		if (motion.sprite == nullptr) {
+			if (empty == nullptr)
+				empty = &motion;
+			continue;
+		}
+		if (motion.frame == th16_motion_frame)
+			continue;
+		if (oldest == nullptr || motion.frame < oldest->frame)
+			oldest = &motion;
+	}
+
+	Th16SpriteMotion* motion = empty != nullptr ? empty : oldest;
+	if (motion == nullptr)
+		return nullptr;
+	motion->sprite = sprite;
+	motion->frame = 0;
+	motion->last_x = 0.0f;
+	motion->last_y = 0.0f;
+	motion->delta_x = 0.0f;
+	motion->delta_y = 0.0f;
+	return motion;
+}
+
+// Adds a sprite to what this frame moves, and works out what it moved by since the frame before
+static void th16_track(float* position) {
+	if (th16_tracked_count >= th16_tracked_max)
+		return;
+	// Two ids can name the same sprite (the game doesn't mind), and moving one twice would put it
+	// twice as far out and only be able to put back one of the two
+	for (size_t i = 0; i < th16_tracked_count; ++i) {
+		if (th16_tracked[i] == position)
+			return;
+	}
+	Th16SpriteMotion* motion = th16_sprite_motion(position);
+	if (motion == nullptr) {
+		++th16_sprites_untracked;
+		return;
+	}
+
+	const float x = position[0];
+	const float y = position[1];
+
+	// Only a sprite that was measured in the frame right before this one has something to compare
+	// against (one that just appeared, or that came back after the game didn't draw for a while,
+	// hasn't moved as far as this can tell)
+	if (motion->frame + 1 == th16_motion_frame) {
+		const float dx = x - motion->last_x;
+		const float dy = y - motion->last_y;
+		// The pools hand their slots out again, and the object that used to be there is somewhere
+		// else entirely - that difference is not something to project
+		if (dx > -th16_max_step && dx < th16_max_step && dy > -th16_max_step && dy < th16_max_step) {
+			motion->delta_x = dx;
+			motion->delta_y = dy;
+		} else {
+			motion->delta_x = 0.0f;
+			motion->delta_y = 0.0f;
+		}
+	} else {
+		motion->delta_x = 0.0f;
+		motion->delta_y = 0.0f;
+	}
+	motion->frame = th16_motion_frame;
+	motion->last_x = x;
+	motion->last_y = y;
+
+	th16_tracked[th16_tracked_count++] = position;
+}
+
+// Collects what is on screen this frame and works out what it moved by since the frame before.
+// This runs once per game frame, from the game's own present (see th16_present_hook).
+static void th16_player_measure() {
+	th16_tracked_count = 0;
+	th16_sprites_untracked = 0;
+	++th16_motion_frame;
+
+	void* player = *th16_player;
+	if (player == nullptr)
+		return;
+
+	// The player itself: its own position is what the render pass reads
+	th16_track((float*)((char*)player + th16_player_position));
+	if (th16_tracked_count > 0) {
+		const Th16SpriteMotion* motion = th16_sprite_motion(th16_tracked[0]);
+		if (motion != nullptr) {
+			const float x = motion->delta_x < 0.0f ? -motion->delta_x : motion->delta_x;
+			const float y = motion->delta_y < 0.0f ? -motion->delta_y : motion->delta_y;
+			const float magnitude = x > y ? x : y;
+			if (magnitude > th16_player_movement)
+				th16_player_movement = magnitude;
+		}
+	}
+
+	// The options, and the shots, are only measured while they are up
+	const size_t option_arrays[2][2] = {
+		{ th16_player_options_a, th16_player_options_a_count },
+		{ th16_player_options_b, th16_player_options_b_count },
+	};
+	for (size_t array = 0; array < 2; ++array) {
+		for (size_t i = 0; i < option_arrays[array][1]; ++i) {
+			const char* slot = (const char*)player + option_arrays[array][0] + i * th16_player_option_size;
+			if (*(const int*)slot == 0)
+				continue;
+			for (int sprite = 0; sprite < 2; ++sprite) {
+				void* object = th16_object_by_id(*(const unsigned int*)(slot + th16_player_option_sprite + sprite * 4));
+				if (object == nullptr)
+					continue;
+				th16_track((float*)((char*)object + th16_object_position));
+			}
+		}
+	}
+
+	for (size_t i = 0; i < th16_player_shot_count; ++i) {
+		const char* slot = (const char*)player + th16_player_shots + i * th16_player_shot_size;
+		if (*(const int*)(slot + th16_player_shot_live) == 0)
+			continue;
+		void* object = th16_object_by_id(*(const unsigned int*)(slot + th16_player_shot_sprite));
+		if (object == nullptr)
+			continue;
+		th16_track((float*)((char*)object + th16_object_position));
+	}
+}
+
+// Moves the player, its options and its shots t frames ahead of the state the game is in, and
+// remembers what it changed
+static void th16_player_advance(float t) {
+	for (size_t i = 0; i < th16_tracked_count; ++i) {
+		float* position = th16_tracked[i];
+		for (int axis = 0; axis < 3; ++axis)
+			th16_tracked_saved[i][axis] = position[axis];
+		const Th16SpriteMotion* motion = th16_sprite_motion(position);
+		if (motion != nullptr) {
+			position[0] += motion->delta_x * t;
+			position[1] += motion->delta_y * t;
+		}
+	}
+}
+
+static void th16_player_undo() {
+	for (size_t i = 0; i < th16_tracked_count; ++i) {
+		float* position = th16_tracked[i];
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = th16_tracked_saved[i][axis];
+	}
+}
+
 // The number of presentations per second the config asks for. 0 means interpolation is off.
 //
 // "-1" picks the largest multiple of the game's frame rate that still fits the display refresh
@@ -346,6 +609,13 @@ static void th16_diag_dump() {
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th16_bullets_in_play, th16_bullets_moved);
+	fprintf(file, "player: %u sprite(s) moved (the player, its options and its shots)\n",
+		(unsigned int)th16_tracked_count);
+	fprintf(file, "player: %u sprite(s) this frame had no movement record (should stay 0)\n",
+		th16_sprites_untracked);
+	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n",
+		th16_player_movement);
+	th16_player_movement = 0.0f;
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -405,10 +675,12 @@ static void th16_extra_presentation(float t) {
 	*th16_render_flag = 0xFF;
 	th16_prepare_render(th16_render_context);
 	ToolState::ReadyToDraw();
-	// The bullets are drawn where they will be t frames from now; the render bakes the positions
+	// The objects are drawn where they will be t frames from now; the render bakes the positions
 	// into the sprite queue, so they can go back right after it
 	th16_bullets_advance(t);
+	th16_player_advance(t);
 	th16_render_objects();
+	th16_player_undo();
 	th16_bullets_undo();
 	th16_draw_sprite_queue(*th16_sprite_manager);
 	device->SetTexture(0, nullptr);
@@ -438,6 +710,10 @@ static HRESULT th16_present_hook() {
 
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
+
+	// The game's own update has run and it is about to put that frame on screen: this is the one
+	// point per frame where the movement of the player, its options and its shots can be measured
+	th16_player_measure();
 
 	// The game's own presentation of this frame, through the device it drew with, so that the
 	// hooks the user's tools have on it still see it
