@@ -802,6 +802,170 @@ static void th10_player_advance(float t) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the straight lasers
+// ---------------------------------------------------------------------------
+//
+// The lasers of a stage live in a manager of their own, [0x47781C], which FUN_0041C290 builds as
+// one 0x45C byte block (the node the game works from sits at +0x10 of it) and FUN_0041C120 fills in
+// when a stage starts - that is where bullet.anm goes, into manager+0x458, and where the manager's
+// two tasks are registered: the update walk (0x41C480 -> FUN_0041C330) and the draw walk (0x41C4E0).
+// The draw walk starts from the root node's next at [manager+0x18] and follows each object's own
+// next at +0x08, skipping every one whose state at +0x0C is 1 - the same test the update's own
+// removal makes. The objects are of the two classes FUN_0041C5B0 and FUN_0041C680 build (0xD58 and
+// 0xD74 bytes, vtables 0x46DA60 and 0x46DA10), and both of them are lasers: their own draw
+// (FUN_0041D7C0 and the one at 0x41EA40) copies the position at +0x24/+0x28/+0x2C, with the play
+// field origin 224.0f at 0x470B4C and 16.0f at 0x470B48, and the angle at +0x3C into the two
+// animation objects each of them embeds (+0x600 and +0x9AC, +0x61C and +0x9C8) and queues those with
+// FUN_004451C0. The draw runs on the render walk, which is what an extra presentation runs again, so
+// the position and the angle are what the beam on screen is drawn from.
+//
+// What each of the two classes moves by is in its own places, read out of its own update
+// (FUN_0041D3D0 and FUN_0041E700), where each of them multiplies one of its own fields by the
+// global scale at 0x476F78 and adds it to the field that field belongs to:
+//
+//   the class at vtable 0x46DA60  velocity +0x30/+0x34/+0x38, the length grows by the rate at +0x48
+//                                 up to the limit at +0x434, and it does not turn - its update
+//                                 never writes the angle.
+//   the class at vtable 0x46DA10  velocity +0x430/+0x434/+0x438, the angle turns by the speed at
+//                                 +0x440, and the length grows by the same +0x48 up to +0x444.
+//
+// Both keep the position at +0x24/+0x28/+0x2C, the angle at +0x3C and the length at +0x40, which is
+// the same three fields th11 projects its lasers from. The length is carried along even though the
+// draw reads nothing of the sort (the drawn size of a beam is a sprite field the game's own update
+// computes from the length once a frame, so the beam still grows in whole frames rather than
+// smoothly): it is what the game's own update moves, and carrying it keeps the two in step.
+
+// One class of straight laser: where it keeps what it moves by, and what it grows towards
+struct Th10LaserLayout {
+	const void* vtable;
+	size_t velocity;      // 3 floats
+	size_t angle_speed;   // 0 for a class that doesn't turn
+	size_t length_speed;
+	size_t length_limit;
+};
+
+static void** const th10_laser_manager = (void**)0x0047781C;
+static const size_t th10_laser_list = 0x18;      // in the manager: the first laser of the list
+static const size_t th10_laser_next = 0x08;      // in a laser: the next one
+static const size_t th10_laser_state = 0x0C;     // in a laser: 1 while it isn't drawn yet
+static const size_t th10_laser_position = 0x24;  // where it starts, 3 floats
+static const size_t th10_laser_angle = 0x3C;     // the direction it points in, radians
+static const size_t th10_laser_length = 0x40;    // how far it reaches
+
+static const size_t th10_lasers_max = 0x100 + 1; // the manager's own limit, plus one for safety
+static const Th10LaserLayout th10_laser_layouts[] = {
+	// The class that doesn't turn on its own, and whose length stops at +0x434
+	{ (const void*)0x0046DA60, 0x30,  0,     0x48, 0x434 },
+	// The class that turns by +0x440, and whose length stops at +0x444
+	{ (const void*)0x0046DA10, 0x430, 0x440, 0x48, 0x444 },
+};
+
+// The layout of the class this laser is, or null if it isn't one of the straight ones
+static const Th10LaserLayout* th10_laser_layout(const void* laser) {
+	const void* vtable = *(const void* const*)laser;
+	for (size_t i = 0; i < sizeof(th10_laser_layouts) / sizeof(th10_laser_layouts[0]); ++i) {
+		if (vtable == th10_laser_layouts[i].vtable)
+			return &th10_laser_layouts[i];
+	}
+	return nullptr;
+}
+
+struct Th10SavedLaser {
+	void* laser;
+	float position[3];
+	float angle, length;
+};
+
+static Th10SavedLaser th10_saved_lasers[th10_lasers_max];
+static size_t th10_saved_lasers_count;
+static unsigned int th10_lasers_in_play;
+static unsigned int th10_lasers_projected;
+
+// Moves the straight lasers t frames ahead of the state the game is in, and remembers what it
+// changed. Each laser is put where the velocity it carries right now would have it t frames from
+// here: the game's own update adds velocity * the global scale to the position once a frame, so
+// this is that same step, taken for the fraction of a frame this presentation stands for.
+static void th10_lasers_advance(float t) {
+	th10_saved_lasers_count = 0;
+	th10_lasers_in_play = 0;
+	th10_lasers_projected = 0;
+
+	void* manager = *th10_laser_manager;
+	if (manager == nullptr || th10_held())
+		return;
+
+	unsigned int frames_per_render = *th10_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	float scale = *th10_time_scale;
+	if (!(scale >= 0.0f && scale <= 2.0f))
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
+
+	void* laser = *(void**)((char*)manager + th10_laser_list);
+	// The list is the game's own and this runs where nothing can change it; the bound is only so a
+	// list that got broken some other way can't run away with the frame
+	for (size_t guard = 0; laser != nullptr && guard < th10_lasers_max * 4; ++guard) {
+		void* next = *(void**)((char*)laser + th10_laser_next);
+		const Th10LaserLayout* layout = th10_laser_layout(laser);
+		// One whose state is 1 isn't drawn yet: the draw walk skips those
+		if (layout != nullptr && *(const int*)((char*)laser + th10_laser_state) != 1) {
+			++th10_lasers_in_play;
+			if (th10_saved_lasers_count < th10_lasers_max) {
+				Th10SavedLaser& saved = th10_saved_lasers[th10_saved_lasers_count++];
+				saved.laser = laser;
+
+				float* position = (float*)((char*)laser + th10_laser_position);
+				float* angle = (float*)((char*)laser + th10_laser_angle);
+				float* length = (float*)((char*)laser + th10_laser_length);
+				for (int axis = 0; axis < 3; ++axis)
+					saved.position[axis] = position[axis];
+				saved.angle = *angle;
+				saved.length = *length;
+
+				const float* velocity = (const float*)((char*)laser + layout->velocity);
+				for (int axis = 0; axis < 3; ++axis)
+					position[axis] += velocity[axis] * step;
+
+				if (layout->angle_speed != 0) {
+					*angle += *(const float*)((char*)laser + layout->angle_speed) * step;
+					// The game keeps the angle in [0, 2 pi) and hands it out from there
+					while (*angle < 0.0f)
+						*angle += 6.28318531f;
+					while (*angle >= 6.28318531f)
+						*angle -= 6.28318531f;
+				}
+
+				if (layout->length_speed != 0) {
+					// Both classes stop growing at the length the game's own update clamps them to
+					const float limit = *(const float*)((char*)laser + layout->length_limit);
+					*length += *(const float*)((char*)laser + layout->length_speed) * step;
+					if (limit > 0.0f && *length > limit)
+						*length = limit;
+				}
+				++th10_lasers_projected;
+			}
+		}
+		laser = next;
+	}
+}
+
+// Puts the position, the angle and the length of every laser th10_lasers_advance moved back
+static void th10_lasers_undo() {
+	for (size_t i = 0; i < th10_saved_lasers_count; ++i) {
+		const Th10SavedLaser& saved = th10_saved_lasers[i];
+		float* position = (float*)((char*)saved.laser + th10_laser_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = saved.position[axis];
+		*(float*)((char*)saved.laser + th10_laser_angle) = saved.angle;
+		*(float*)((char*)saved.laser + th10_laser_length) = saved.length;
+	}
+	th10_saved_lasers_count = 0;
+}
+
 // Puts the sprite queue back to empty, the way the frame function inlines it (0x43949C)
 static void th10_reset_sprite_queue() {
 	void* manager = *(void**)th10_sprite_manager;
@@ -897,9 +1061,12 @@ static void th10_diag_dump() {
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th10_bullets_in_play, th10_bullets_moved);
+	fprintf(file, "lasers: %u in play, %u projected forward (last game frame)\n",
+		th10_lasers_in_play, th10_lasers_projected);
 	fprintf(file, "player: %u body, %u option and %u shot sprite(s) projected (last game frame, %u shot(s) in flight)\n",
 		th10_body_sprites, th10_option_sprites_moved, th10_shot_sprites_moved, th10_shots_in_flight);
-	fprintf(file, "player: %u sprite(s) this frame had no movement record (should stay 0)\n",
+	fprintf(file, "player: %u sprite(s) this frame had no movement record (a handle the game had just"
+		" taken the sprite away from; costs that sprite one frame)\n",
 		th10_sprites_untracked);
 	fprintf(file, "player: %u moved position(s) were written back during the walk (0: the renderer reads them)\n",
 		th10_shifts_lost);
@@ -988,10 +1155,12 @@ static void th10_extra_presentation(IDirect3DDevice9* device, float t) {
 	// what it draws, so they can all go back right after it
 	th10_bullets_advance(t);
 	th10_player_advance(t);
+	th10_lasers_advance(t);
 	// Nothing to render into an empty scene, and the walk itself would read the object it is handed
 	void* scene = *th10_scene;
 	if (scene != nullptr)
 		th10_render_objects(scene);
+	th10_lasers_undo();
 	th10_undo_shifts();
 	th10_bullets_undo();
 	// The walk just ran the game's rate task, so what it made of that has to go back as well
