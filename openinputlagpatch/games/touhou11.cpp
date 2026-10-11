@@ -169,6 +169,304 @@ static void th11_bullets_undo() {
 }
 
 // ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player, its options and its shots
+// ---------------------------------------------------------------------------
+//
+// The player of the stage that is running is at 0x4A8EB4 (0x8D24 bytes, one animation object of
+// its own at +0x14 and another at +0x448). Its draw callback (FUN_00431BC0, the task the stage
+// build registers) reads the three floats at +0x87C/+0x880/+0x884, copies them into the body
+// animation object's drawn position - (player+0x14)+0x3E8, which is player+0x3FC - and hands that
+// object to the sprite queue in the same breath, so the renderer reads exactly that position:
+// moving the logical position is what moves the player, the same rule th13's player follows.
+//
+// Everything else the player puts on screen is positioned by the update instead, so those sprites
+// are what has to move:
+//
+//   - the options are 8 slots of 0xE4 bytes at +0x7570. A slot keeps a flag at +0x00 (non-zero
+//     while the slot is in use), the position the game smooths as two ints in 1/128 pixel units at
+//     +0x5C/+0x60 (the option update at 0x430B64 through 0x430D8B reads exactly those two and hands
+//     them to FUN_004563A0), and the two animation objects it wears as handles at +0xB0/+0xB4.
+//   - the shots are 256 slots of 0x6C bytes at +0x96C. The spawn (FUN_00433F90) and the per-frame
+//     refresh (FUN_00434440) give a slot in use a non-zero countdown at +0x48, the position the
+//     game moves at +0x14/+0x18/+0x1C (three floats, in pixels) and the animation object it wears
+//     as a handle at +0x4C (plus a second one at +0x50).
+//
+// An animation object - what the game builds for a sprite - keeps its drawn position at
+// +0x3E8/+0x3EC/+0x3F0, which is what the game's own FUN_004563A0 and FUN_00434440 write and what
+// the queue bake (FUN_00451EF0 and the renderers it dispatches to) reads. A handle is the object's
+// own address, and the object is threaded onto one of the sprite manager's two lists (at
+// [0x4C3268]+0x7B562C and +0x7B5634, next at node+4), which is how FUN_004561E0 looks one up; the
+// same walk is written out here rather than calling it, because its arguments are split between a
+// register and the stack.
+//
+// None of the three have a velocity that could be read - the options follow the player and the
+// shots follow whatever pattern they were fired with - so what each of them moves by in a frame is
+// measured, the way th12 and th13 measure theirs: every game frame the position is compared with
+// the one of the frame before, and the extra presentations move the sprite by that difference
+// times the fraction of a frame they stand for. The shift is undone after every presentation, so
+// what gets measured is the game's own movement. The sprites are looked up again every frame, for
+// the reason th12 has to do the same: the game frees them and a slot can keep pointing at one that
+// is gone.
+
+static void** const th11_player = (void**)0x004A8EB4;
+static const size_t th11_player_position = 0x87C;        // the player's own position, 3 floats
+static const size_t th11_player_options = 0x7570;        // 8 slots of 0xE4 bytes
+static const size_t th11_player_option_count = 8;
+static const size_t th11_player_option_size = 0xE4;
+static const size_t th11_player_option_position = 0x5C;  // 2 ints, in 1/128 pixels
+static const size_t th11_player_option_sprite = 0xB0;    // 2 animation objects
+static const size_t th11_player_shots = 0x96C;           // 256 slots of 0x6C bytes
+static const size_t th11_player_shot_count = 256;
+static const size_t th11_player_shot_size = 0x6C;
+static const size_t th11_player_shot_live = 0x48;        // non-zero while the slot is in use
+static const size_t th11_player_shot_position = 0x14;    // 3 floats
+static const size_t th11_player_shot_sprite = 0x4C;      // 2 animation objects
+static const size_t th11_sprite_position = 0x3E8;        // in an animation object: 3 floats
+static const size_t th11_sprite_children = 0x14;         // node[0] = child, node[4] = next
+static const size_t th11_sprite_children_off = 0x18;     // non-zero: the children are not moved
+// The option positions are kept in 1/128 pixel units
+static const float th11_units_per_pixel = 128.0f;
+static const float th11_max_step = 48.0f;
+
+// What one thing moved by in a frame, kept per thing the player owns. Every one of them is a fixed
+// slot of the player object (the player itself, one of the 8 options, one of the 256 shots), so a
+// record never has to be recycled: an empty shot slot simply has nothing to move.
+struct Th11Motion {
+	unsigned int frame;
+	float last_x, last_y;
+	float delta_x, delta_y;
+};
+
+static unsigned int th11_motion_frame = 1;
+
+static void th11_measure(Th11Motion& motion, float x, float y) {
+	// Only a thing that was measured in the frame right before this one has something to compare
+	// against - one that just appeared has not moved as far as this can tell
+	if (motion.frame + 1 == th11_motion_frame) {
+		const float dx = x - motion.last_x;
+		const float dy = y - motion.last_y;
+		if (dx > -th11_max_step && dx < th11_max_step && dy > -th11_max_step && dy < th11_max_step) {
+			motion.delta_x = dx;
+			motion.delta_y = dy;
+		} else {
+			motion.delta_x = 0.0f;
+			motion.delta_y = 0.0f;
+		}
+	} else {
+		motion.delta_x = 0.0f;
+		motion.delta_y = 0.0f;
+	}
+	motion.frame = th11_motion_frame;
+	motion.last_x = x;
+	motion.last_y = y;
+}
+
+// The animation object a handle names, or null if it names none that is live right now. An object
+// keeps its own address in its first dword and is threaded onto one of the sprite manager's two
+// lists. This walks them the way the game's own lookup (FUN_004561E0) does, instead of trusting
+// the handle to be a pointer - a slot can keep a stale handle after its sprite is gone, and
+// dereferencing that would be a crash.
+static void* th11_sprite_by_handle(unsigned int handle) {
+	if (handle == 0)
+		return nullptr;
+	void* manager = *(void**)0x004C3268;
+	if (manager == nullptr)
+		return nullptr;
+	const size_t lists[2] = { 0x7B562C, 0x7B5634 };
+	for (size_t list = 0; list < 2; ++list) {
+		void* node = *(void**)((char*)manager + lists[list]);
+		for (size_t guard = 0; node != nullptr && guard < 0x2000; ++guard) {
+			void* object = *(void**)node;
+			if (*(unsigned int*)object == handle)
+				return object;
+			node = *(void**)((char*)node + 4);
+		}
+	}
+	return nullptr;
+}
+
+// One thing to move for an extra presentation, and what its position was
+struct Th11Shifted {
+	float* position;
+	float saved[3];
+};
+
+static const size_t th11_shifted_max = 4096;
+static Th11Shifted th11_shifted[th11_shifted_max];
+static size_t th11_shifted_count;
+
+// Moves one position and remembers what it changed
+static void th11_shift_position(float* position, const Th11Motion& motion, float t) {
+	if (position == nullptr || th11_shifted_count >= th11_shifted_max)
+		return;
+	Th11Shifted& shifted = th11_shifted[th11_shifted_count++];
+	shifted.position = position;
+	for (int axis = 0; axis < 3; ++axis)
+		shifted.saved[axis] = position[axis];
+	position[0] += motion.delta_x * t;
+	position[1] += motion.delta_y * t;
+}
+
+// The same, for the drawn position of one animation object
+static void th11_shift_object(void* object, const Th11Motion& motion, float t) {
+	if (object == nullptr)
+		return;
+	th11_shift_position((float*)((char*)object + th11_sprite_position), motion, t);
+}
+
+// The same, for a sprite the game wears: the game gives the objects hanging off it (the node chain
+// at +0x14) the same position unless the flag at +0x18 says not to (FUN_004563A0), so they move
+// with it here as well.
+static void th11_shift_sprite(void* sprite, const Th11Motion& motion, float t) {
+	th11_shift_object(sprite, motion, t);
+	if (*(const int*)((char*)sprite + th11_sprite_children_off) != 0)
+		return;
+	void* node = *(void**)((char*)sprite + th11_sprite_children);
+	for (size_t guard = 0; node != nullptr && guard < 16; ++guard) {
+		th11_shift_object(*(void**)node, motion, t);
+		node = *(void**)((char*)node + 4);
+	}
+}
+
+static void th11_undo_shifts() {
+	for (size_t i = 0; i < th11_shifted_count; ++i) {
+		const Th11Shifted& shifted = th11_shifted[i];
+		for (int axis = 0; axis < 3; ++axis)
+			shifted.position[axis] = shifted.saved[axis];
+	}
+	th11_shifted_count = 0;
+}
+
+// The player itself: a motion record of its own, and nothing else to keep
+static Th11Motion th11_body_motion;
+
+// The options: what each of the 8 slots moved by, and the animation objects it wears
+static Th11Motion th11_option_motions[th11_player_option_count];
+static void* th11_option_sprites[th11_player_option_count][2];
+
+// The shots: the same, one per slot of the 256
+static Th11Motion th11_shot_motions[th11_player_shot_count];
+static void* th11_shot_sprites[th11_player_shot_count][2];
+
+// What the last game frame had on screen and how much of it was projected forward, for the
+// diagnostics dump below
+static unsigned int th11_sprites_untracked;
+static unsigned int th11_body_sprites;
+static unsigned int th11_option_sprites_moved;
+static unsigned int th11_shot_sprites_moved;
+static float th11_player_movement;
+
+// Collects what the player owns this frame and works out what it moved by since the frame before.
+// This runs once per game frame, from the game's own present (see th11_present_hook).
+static void th11_player_measure() {
+	++th11_motion_frame;
+	th11_sprites_untracked = 0;
+	th11_body_sprites = 0;
+	th11_option_sprites_moved = 0;
+	th11_shot_sprites_moved = 0;
+
+	void* player = *th11_player;
+	if (player == nullptr)
+		return;
+
+	for (unsigned int i = 0; i < th11_player_shot_count; ++i) {
+		const char* slot = (const char*)player + th11_player_shots + i * th11_player_shot_size;
+		if (*(const int*)(slot + th11_player_shot_live) != 0) {
+			const float* position = (const float*)(slot + th11_player_shot_position);
+			th11_measure(th11_shot_motions[i], position[0], position[1]);
+			for (int sprite = 0; sprite < 2; ++sprite) {
+				const unsigned int handle =
+					*(const unsigned int*)(slot + th11_player_shot_sprite + sprite * 4);
+				th11_shot_sprites[i][sprite] = th11_sprite_by_handle(handle);
+				if (handle != 0 && th11_shot_sprites[i][sprite] == nullptr)
+					++th11_sprites_untracked;
+			}
+		} else {
+			th11_shot_sprites[i][0] = nullptr;
+			th11_shot_sprites[i][1] = nullptr;
+			th11_shot_motions[i].frame = 0;
+		}
+	}
+
+	for (unsigned int i = 0; i < th11_player_option_count; ++i) {
+		const char* slot = (const char*)player + th11_player_options + i * th11_player_option_size;
+		const int* position = (const int*)(slot + th11_player_option_position);
+		if (*(const int*)slot == 0) {
+			th11_option_sprites[i][0] = nullptr;
+			th11_option_sprites[i][1] = nullptr;
+			th11_option_motions[i].frame = 0;
+			continue;
+		}
+		th11_measure(th11_option_motions[i],
+			(float)position[0] / th11_units_per_pixel, (float)position[1] / th11_units_per_pixel);
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			const unsigned int handle =
+				*(const unsigned int*)(slot + th11_player_option_sprite + sprite * 4);
+			th11_option_sprites[i][sprite] = th11_sprite_by_handle(handle);
+			if (handle != 0 && th11_option_sprites[i][sprite] == nullptr)
+				++th11_sprites_untracked;
+		}
+	}
+
+	// The player itself: its position is what the update moves, and its draw copies it into the
+	// sprite it wears, so that is what is measured
+	{
+		const float* position = (const float*)((const char*)player + th11_player_position);
+		th11_measure(th11_body_motion, position[0], position[1]);
+		const float x = th11_body_motion.delta_x < 0.0f ? -th11_body_motion.delta_x : th11_body_motion.delta_x;
+		const float y = th11_body_motion.delta_y < 0.0f ? -th11_body_motion.delta_y : th11_body_motion.delta_y;
+		const float magnitude = x > y ? x : y;
+		if (magnitude > th11_player_movement)
+			th11_player_movement = magnitude;
+	}
+}
+
+// Moves the player and everything it put on screen t frames ahead of the state the game is in, and
+// remembers what it changed
+static void th11_player_advance(float t) {
+	th11_body_sprites = 0;
+	th11_option_sprites_moved = 0;
+	th11_shot_sprites_moved = 0;
+	th11_shifted_count = 0;
+
+	if (th11_bullets_held())
+		return;
+
+	void* player = *th11_player;
+	if (player == nullptr)
+		return;
+
+	if (th11_motion_frame == th11_body_motion.frame) {
+		// The draw copies this into the body animation object, and it runs below, so the position
+		// the extra presentation draws is this one
+		th11_shift_position((float*)((char*)player + th11_player_position), th11_body_motion, t);
+		++th11_body_sprites;
+	}
+
+	for (unsigned int i = 0; i < th11_player_option_count; ++i) {
+		if (th11_motion_frame != th11_option_motions[i].frame)
+			continue;
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			if (th11_option_sprites[i][sprite] == nullptr)
+				continue;
+			th11_shift_sprite(th11_option_sprites[i][sprite], th11_option_motions[i], t);
+			++th11_option_sprites_moved;
+		}
+	}
+
+	for (unsigned int i = 0; i < th11_player_shot_count; ++i) {
+		if (th11_motion_frame != th11_shot_motions[i].frame)
+			continue;
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			if (th11_shot_sprites[i][sprite] == nullptr)
+				continue;
+			th11_shift_sprite(th11_shot_sprites[i][sprite], th11_shot_motions[i], t);
+			++th11_shot_sprites_moved;
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Frame interpolation, stage 0: extra presentations
 // ---------------------------------------------------------------------------
 //
@@ -388,6 +686,12 @@ static void th11_diag_dump() {
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th11_bullets_in_play, th11_bullets_moved);
+	fprintf(file, "player: %u body, %u option and %u shot sprite(s) projected (last game frame)\n",
+		th11_body_sprites, th11_option_sprites_moved, th11_shot_sprites_moved);
+	fprintf(file, "player: %u sprite(s) this frame had no movement record (should stay 0)\n",
+		th11_sprites_untracked);
+	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n", th11_player_movement);
+	th11_player_movement = 0.0f;
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -443,8 +747,10 @@ static void th11_extra_presentation(IDirect3DDevice9* device, float t) {
 	// Everything is drawn where it will be t frames from now; the render bakes those positions into
 	// what it draws, so they can all go back right after it
 	th11_bullets_advance(t);
+	th11_player_advance(t);
 	th11_render_objects();
 	th11_bullets_undo();
+	th11_undo_shifts();
 	th11_draw_sprite_queue();
 	device->SetTexture(0, nullptr);
 	device->EndScene();
@@ -473,6 +779,10 @@ static HRESULT th11_present_hook() {
 
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
+
+	// The game's own update has run and it is about to put that frame on screen: this is the one
+	// point per frame where the movement of the player, its options and its shots can be measured
+	th11_player_measure();
 
 	HRESULT result = device->Present(nullptr, nullptr, nullptr, nullptr);
 	overlay_mark_presentation();
