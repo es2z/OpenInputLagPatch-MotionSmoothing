@@ -11,6 +11,77 @@ is also the record of what has actually been verified rather than just what was 
 
 ### Added
 
+- **Touhou 18 (Unconnected Marketeers) gets frame interpolation too** (`3e0ad73`, `d73f0df`, `ab192a5`, `f19deb1`, `7be70e3`)
+
+  Unconnected Marketeers is the same family as Wily Beast and Weakest Creature but **not the same
+  generation**: the idea of three render blocks and three presents is the same, what is inside the
+  block is not, so every address was looked up in th18 itself. The device is `[0x4CCDF8]`, the
+  sprite (ANM) manager `[0x51F65C]`, the dword the block sets to `0xFF` is `[0x4CD918]`, the queue
+  is reset by `0x47E6E0` and drawn by `0x47E730`, and the objects are rendered by `0x401420`; the
+  renders are at `0x471BCB`, `0x472F21` and `0x47307A` and the presents at `0x472D1D`, `0x472F5C`
+  and `0x473129` (the same 5 byte device load and 14 bytes of arguments, with all five arguments
+  inside the skipped part and nothing in there writing a register the code after it needs).
+  **Three things are laid out differently from th17**: there is no "prepare the render" call (the
+  block sets D3DRS_FOGENABLE to 0 itself), the sprite queue is drawn twice per block (once right
+  after the reset and once after the objects are rendered), and there is no camera object and no
+  SetTransform anywhere in the frame functions - the frame hands the device the viewport at
+  `[0x4CD5DC]+0x10C` and copies two integers (`+0x104/+0x108`) into the sprite manager as the
+  floats at `+0xD8/+0xDC`. An extra presentation therefore restores the viewport and the
+  transforms read back from the device, and puts those two floats back as well.
+
+  The bullets are the manager `[0x4CF2BC]` (one 0x7A41F8 byte object): a pool of 2001 bullets of
+  `0xFA0` bytes from `manager+0xEC` (`0xEC + 2001 * 0xFA0` is `0x7A228C`, exactly where the
+  constructor starts clearing the 2001 words that follow it), threaded onto a list whose first node
+  is at `manager+0xC0` and whose node is part of the bullet at `+0x10` (the bullet at `node[0]`,
+  the next node at `node[4]` - both the game's own update walk at `0x424C50` and the routine that
+  creates one, `FUN_00424FE0`, agree). The position is `+0x638`, the velocity `+0x644`, the 16 bit
+  state `+0xF68` (1 moves a whole step, 2 and 3 half of one), the 0x200 flag on `+0x20` holds a
+  bullet, the scale is `[0x4CCBF0]`, the half step is the 0.5f at `[0x4B9138]`, and the byte that
+  says how many of the game's updates a rendered frame covers is `[0x4CD00C]` (read and never
+  written, so it stays 0). **What holds the picture is a different object this time**: the game
+  thread at `[0x4CF2E4]`, its flags at `+0xB0` (the update task stops for the low bits, the draw
+  task for bit 2, the walk itself for bit 0x400). th18 has one more of those - with the ability
+  shop open (`[0x4CF2A4]` set) the bullets stop as well - and that counts as a held picture too.
+
+  The player is `[0x4CF410]` (0x479D0 bytes): its own position at `+0x620` (the render pass
+  `0x45CAC0` copies it into the animation object at `+0x14`'s `+0x5F0` while drawing), the shots
+  are **128 slots of `0xF8` bytes at `+0x1570`** with the same layout th17's had (`+0x8C` in use,
+  the sprite id at `+0x08`, the position at `+0x48`, which the slot's update copies into the sprite
+  at `+0x5F0`), and the sprite the player's own shot is drawn with is kept at `+0x476B0`. **The
+  ability cards** the user called out work out like this: every card keeps the animation id of its
+  in-game effect at `+0x1C` (thprac's `anm_id_for_ingame_effect`; both `0x41051E` and `0x410AD6`
+  push it into the sprite lookup), and the card list hangs off the ability manager
+  (`[0x4CF298]`) at `+0x1C`, with the card at `node[0]` and the next node at `node[4]` (the walk
+  the player's own update does at `0x45C0D1`) - so those sprites are projected with the player's
+  own. What a card adds to the player's fire is a shot like any other and lands in the same slot
+  array. Sprites are found from an id the way the game finds them, written out rather than called
+  (slot = `[0x51F65C] + 0x700 + (id & 0x7FFF) * 0x624`, in use at `+0x61C`, id at `+0x544`), and
+  their draw position is `+0x5F0`.
+
+  The straight lasers are the manager `[0x4CF3F4]` (one 0x7C4 byte object, built right after the
+  bullet manager): the list starts at `manager+0x14`, the next is at `obj+0x08` and `obj+0x10 == 1`
+  means the laser is finished (not drawn, and not projected). The geometry is the same th15 to
+  th17 have - the position at `+0x54`, the angle at `+0x6C` and the length at `+0x70`. The
+  velocity reading the other games use carries over: the vtables come out of the RTTI in two steps
+  (Line `0x4B687C`, Infinite `0x4B680C`, Beam `0x4B679C`, Curve `0x4B672C`), and the whitelist
+  holds only Line (velocity `+0x60`, length rate `+0x78`, clamp `+0x798`, no turning) and Infinite
+  (velocity `+0x794`, angle rate `+0x7A4`, length rate `+0x78`, clamp `+0x7A8`). The beam class's
+  update (`0x452B80`) is a `return 0` stub, so it never moves and is left out; the curve class is
+  left out as the requirements ask.
+
+  The menus' text got its fix at the same time, including the shop: the text object is `[0x4CF2AC]`,
+  the record array is at `+0xC24` (0x138 bytes a record, up to 0x140 of them), the frame's count
+  of them is `+0x19224` (appended by `0x419B90`, printed through `0x41A110`, walked by `0x41A180`;
+  it is reset every frame by the aging task `0x4198B0`, which sits on the update chain), and the
+  render hook keeps the count for every extra presentation to put back.
+
+  In game the extra presentations land evenly at 180 a second (`average: 3.000 presents per frame,
+  180.6 presentations per second`), the diagnostics read `659 in play, 659 projected` bullets, `99
+  sprite(s) moved` for the player, its shots and its cards' effects (with the count of sprites that
+  had no movement record staying 0), and `24 in play` straight lasers, and the title, the menus,
+  the pause screen, the shop and the replay saving screen all look the way they do without the
+  patch.
+
 - **Touhou 17 (Wily Beast and Weakest Creature) gets frame interpolation too** (`a2f749b`, `13b2f6b`, `a4ce5b3`, `74d1665`)
 
   Wily Beast and Weakest Creature is Hidden Star in Four Seasons' engine again, so the whole path
