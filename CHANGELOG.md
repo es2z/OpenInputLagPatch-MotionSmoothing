@@ -7,6 +7,88 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-12
+
+### Added
+
+- **Touhou 17 (Wily Beast and Weakest Creature) gets frame interpolation too** (`a2f749b`, `13b2f6b`, `a4ce5b3`, `74d1665`)
+
+  Wily Beast and Weakest Creature is Hidden Star in Four Seasons' engine again, so the whole path
+  follows th16's - with every offset looked up in th17 itself rather than carried over. Its frame
+  functions have the same **three render blocks and three presents** (the renders at `0x461248`,
+  `0x4622C4` and `0x4623FD`, the presents at `0x4620FD`, `0x4622FF` and `0x4624AC`, the second one
+  sitting inside the window update, so the title screen and the menus get the extra frames as
+  well). The device is `[0x4B5AE8]`, the scene object `0x4B5AE0`, the sprite manager `[0x509A20]`,
+  the dword the block sets to `0xFF` is `[0x4B64F0]`, the queue is reset by `0x46D050`, prepared by
+  `0x4421C0`, filled by the render at `0x4013E0` and drawn by `0x46D0A0`. **The camera is the one
+  thing laid out differently from th16**: there is no function that takes the camera object - the
+  frame function calls `0x409460` with the scene object and the index of the view it wants
+  (`push 2; mov ecx, 0x4B5AE0`), and that picks one of the views the scene keeps (the one in use
+  is pointed at by `[0x4B5AE0+0x6E8]`, each view 0x12C bytes: the view transform at `+0x60`, the
+  projection at `+0xA0`, the two queue placement floats at `+0xFC/+0x100` and the viewport at
+  `+0xE0`). An extra presentation reads that pointer, so it never has to guess an index. All three
+  presents are laid out identically (5 bytes of device load then 14 bytes of arguments, with all
+  five arguments inside the skipped part).
+
+  The bullets are the manager `[0x4B768C]`: one pool of 2001 bullets of `0xE88` bytes (from
+  `manager+0xEC`), with the bullets in play on a list whose first node is at `manager+0xC0` and
+  whose node is part of the bullet itself (bullet`+0x10`, the bullet at `node[0]` and the next node
+  at `node[4]`). The position is `+0x62C`, the velocity `+0x638`, the 16 bit state `+0xE50` (1
+  moves a whole step, 2 and 3 half of one), the 0x200 flag on `+0x20` holds a bullet, what
+  everything is scaled by is `[0x4B5918]`, and `[0x4A3B48]` is the 0.5 the half steps use. The byte
+  that says how many of the game's updates one rendered frame covers (`[0x4B5CD4]`) is only ever
+  read in this executable and always 0. One mechanism is th17's own: the movement all lands in the
+  generic `pos += velocity * [0x4B5918]` at `0x415121`, while the state 1 script interpreter
+  (`0x4165B0`) and the mode handlers only ever change the velocity and the angle - so projecting
+  from the velocity still holds.
+
+  The player is `[0x4B77D0]` (0x190FC bytes): its own position is `+0x610` (the render pass at
+  `0x448CF0` copies it into the animation object it carries, `+0x5F4`, while it draws). **The beast
+  spirits (the "goast" - what sits beside the player and what the roar summons) are not slots of
+  the player in this game at all**: they live in a manager of their own at `[0x4B7684]` (built with
+  `beast.anm`), each one a 0x70 byte object on its list (the first at `[manager+0x18]`, the next at
+  `+0x04`), keeping the sprite id it is drawn with at `+0x10`, **the sprites the roar's aura and
+  effects are drawn with at `+0x28`/`+0x2C`/`+0x30`/`+0x38`/`+0x44`** and its position at `+0x18`
+  (its update `FUN_00410AF0` writes that into the main sprite every frame). The shots are 256 slots
+  of 0xE0 bytes at `+0x1110` (`+0x8C` in use, the sprite id at `+0x08`, the position at `+0x48`),
+  and the sprite the player's own shot is drawn with is kept at `+0x19094`. The sprites are
+  resolved from their ids **every frame**, with the array branch written out rather than called
+  (the manager at `[0x509A20]`, slots of 0x618 bytes from `+0x6EC`, the "in use" byte at `+0x610`
+  and the id at `+0x538`, since the game's own lookup `0x476470` takes its argument on the stack),
+  and what gets moved is the sprite's position at **`+0x5E4`**. Like th15 and th16, these three are
+  measured rather than read.
+
+  The hyper the game is known for is a feature of that same beast manager (thprac hooks the roar at
+  `0x40FC8A`, inside the 0x40Fxxx block that manager's code lives in), so the effects it draws are
+  those sprite ids of the beasts and the special shots it fires go through the same shot slots -
+  both come along with the player for free.
+
+  The lasers are the manager `[0x4B76BC]`: the list starts at `manager+0x14` and its links are the
+  object's own `+0x08`, and the geometry is th15's and th16's exactly (position `+0x54`, angle
+  `+0x6C`, length `+0x70`; the line laser's draw at `0x437A40` writes them into the animation
+  objects it carries while it draws). They use the **read-the-velocity** way of doing it: the
+  vtables come out of the RTTI (LaserLineInf `0x4A1924`, LaserInfiniteInf `0x4A18B8`, LaserBeamInf
+  `0x4A184C`, LaserCurveInf `0x4A17E0`), with one twist this game has - the `.*AVLaser*Inf@@` name
+  strings are not in `.rdata`, and the first hit `find:` gives for one of them is not the locator
+  but a second table that also names the type. The hit that matters is the one inside an
+  RTTICompleteObjectLocator, so the locator is that hit minus 0xC, and `find:` of the locator gives
+  `vtable - 4`. The whitelist holds only the line class (velocity `+0x60`, rate `+0x78`, limit
+  `+0x5E4`, and it doesn't turn) and the infinite one (velocity `+0x5E0`, angle speed `+0x5F0`,
+  rate `+0x78`, limit `+0x5F4`); the beam class needs no entry because its update `0x440520` is a
+  stub that returns 0, and the curve class is left alone.
+
+  The menus' text (the bug th12 to th16 had) is handled in the same round: the text object is
+  `[0x4B7678]`, its records are 0x138 bytes each from `+0xC10` (up to 0x140 of them), and the count
+  of them for the frame is `+0x19210` (appended by `FUN_00408190`, walked by `FUN_00408560`). The
+  render hook keeps that count and puts it back before every extra presentation.
+
+  Measured: on an 180Hz display the extra frames land evenly at 180 a second (`average: 3.000
+  presents per frame, 180.6 presentations per second`), with `161 in play, 161 projected` bullets,
+  `42 sprite(s) moved` for the player, its beast spirits and its shots with none of them missing a
+  movement record, and `86 straight laser(s) in play`. The title, the menus, the pause screen and
+  the save screen all look right, with the replay information line on the save screen showing up
+  once.
+
 ## 2026-10-11
 
 ### Added
