@@ -579,6 +579,179 @@ static void th18_player_undo() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the straight lasers
+// ---------------------------------------------------------------------------
+//
+// The lasers of a stage live in a manager of their own, which the stage setup builds right after
+// the bullet manager (0x442C45: one 0x7C4 byte object, loading bullet.anm into +0x7B8) and puts in
+// 0x4CF3F4. The manager threads them onto a list whose first laser is at manager+0x14 and whose
+// next is the object's own +0x08; the update task (0x448870, thunk registered with the id 0x1C at
+// 0x442CB3) walks it and calls each object's virtual update at vtable+0x10, and the draw task
+// (0x4488E0, id 0x24) walks the same list calling vtable+0x14 and skipping the objects whose
+// +0x10 says they are finished.
+//
+// The update task holds the picture the way the bullets' own tasks do, with the game thread object
+// at 0x4CF2E4 (its flags at +0xB0): it stops for the low bits, for bit 0x400 and while the ability
+// shop is open (0x4CF2A4), and for bit 2 it runs the walk with the global scale 0x4CCBF0 set to 0
+// (the same trick th13, th14 and th15 use). The draw task stops for bit 2. All of those are the
+// same "the picture is held" test the bullets use, so the lasers reuse it.
+//
+// The line laser's draw (0x44AB60) builds its picture out of three of its own fields: the position
+// at +0x54, the angle at +0x6C and the length at +0x70. It copies the position into the first
+// sprite it draws (at +0xBE8, whose position is +0x5F0 in) and puts the far end of the beam at
+// position + polar(angle, length) (0x452C90), so moving those fields moves the laser - the same
+// three fields th15, th16 and th17 have, at the same offsets.
+//
+// Each class of straight laser keeps what it moves by in a different place, so the layout is
+// picked by vtable along with which classes are straight at all:
+//
+//   LaserLineInf (vtable 0x4B687C)      update 0x44A4F0: `pos += vel * [0x4CCBF0]` with the
+//                                       velocity at 0x60/0x64/0x68 (0x44A6BE-0x44A6F2), the length
+//                                       growing by the rate at 0x78 up to the clamp at 0x798
+//                                       (0x44A66E-0x44A6A7), and it does not turn on its own.
+//   LaserInfiniteInf (vtable 0x4B680C)  update 0x44CAE0: the velocity at 0x794/0x798/0x79C
+//                                       (0x44CC32-0x44CC7B), the angle turning by the speed at
+//                                       0x7A4 (0x44CB64-0x44CBCE) and the length growing by the
+//                                       same 0x78 up to the clamp at 0x7A8 (0x44CB32-0x44CB5F).
+//
+// The beam class (vtable 0x4B679C) is deliberately not in the table: its own update (0x452B80) is
+// a stub that just returns 0, so it never moves and there is nothing to project for it. The curve
+// class (vtable 0x4B672C) is left out as the requirements ask.
+
+// The laser manager of the stage that is running (null while no stage is)
+static void** const th18_laser_manager = (void**)0x004CF3F4;
+static const size_t th18_laser_list = 0x14;      // in it: the first laser
+static const size_t th18_laser_next = 0x08;      // in a laser: the next one
+static const size_t th18_laser_state = 0x10;     // in a laser: 1 once it is done, and not drawn
+static const size_t th18_laser_position = 0x54;  // where it starts, 3 floats
+static const size_t th18_laser_angle = 0x6C;     // the direction it points in, radians
+static const size_t th18_laser_length = 0x70;    // how far it reaches
+
+struct Th18LaserLayout {
+	const void* vtable;
+	size_t velocity;            // 3 floats
+	size_t angle_speed;         // 0 for a class that doesn't turn
+	size_t length_speed;
+	size_t length_limit;
+	size_t length_limit_subtract;
+};
+
+static const Th18LaserLayout th18_laser_layouts[] = {
+	{ (const void*)0x004B687C, 0x60,  0,     0x78, 0x798, 0 },
+	{ (const void*)0x004B680C, 0x794, 0x7A4, 0x78, 0x7A8, 0 },
+};
+
+static const size_t th18_lasers_max = 0x200 + 1; // the manager's own limit, plus its root entry
+
+struct Th18LaserMoved {
+	void* laser;
+	float position[3];
+	float angle, length;
+};
+
+static Th18LaserMoved th18_lasers_moved[th18_lasers_max];
+static size_t th18_lasers_moved_count;
+static unsigned int th18_lasers_seen;
+static unsigned int th18_lasers_projected;
+
+// The layout of the class this laser is, or null if it isn't one of the straight ones
+static const Th18LaserLayout* th18_laser_layout(const void* laser) {
+	const void* vtable = *(const void* const*)laser;
+	for (size_t i = 0; i < sizeof(th18_laser_layouts) / sizeof(th18_laser_layouts[0]); ++i) {
+		if (vtable == th18_laser_layouts[i].vtable)
+			return &th18_laser_layouts[i];
+	}
+	return nullptr;
+}
+
+// Moves the straight lasers t frames ahead of the state the game is in, and remembers what it
+// changed. Each laser is put where the velocity it carries right now would have it t frames from
+// here: the game's own update adds velocity * the global scale to the position once per frame, and
+// this is that same step for the fraction of a frame this presentation stands for.
+static void th18_lasers_advance(float t) {
+	th18_lasers_moved_count = 0;
+	th18_lasers_seen = 0;
+	th18_lasers_projected = 0;
+
+	void* manager = *th18_laser_manager;
+	if (manager == nullptr || th18_bullets_held())
+		return;
+
+	unsigned int frames_per_render = *th18_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	float scale = *th18_time_scale;
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
+
+	void* laser = *(void**)((char*)manager + th18_laser_list);
+	// The list is the game's own and this runs where nothing can change it; the bound is only so a
+	// list that got broken some other way can't run away with the frame
+	for (size_t guard = 0; laser != nullptr && guard < th18_lasers_max * 4; ++guard) {
+		void* next = *(void**)((char*)laser + th18_laser_next);
+		const Th18LaserLayout* layout = th18_laser_layout(laser);
+		// A laser that is finished is not drawn, and the game takes it off the list on its next
+		// update - nothing to project for it
+		if (layout != nullptr && *(const int*)((char*)laser + th18_laser_state) != 1 &&
+			th18_lasers_moved_count < th18_lasers_max) {
+			++th18_lasers_seen;
+			Th18LaserMoved& moved = th18_lasers_moved[th18_lasers_moved_count++];
+			moved.laser = laser;
+
+			float* position = (float*)((char*)laser + th18_laser_position);
+			float* angle = (float*)((char*)laser + th18_laser_angle);
+			float* length = (float*)((char*)laser + th18_laser_length);
+			for (int axis = 0; axis < 3; ++axis)
+				moved.position[axis] = position[axis];
+			moved.angle = *angle;
+			moved.length = *length;
+
+			const float* velocity = (const float*)((char*)laser + layout->velocity);
+			for (int axis = 0; axis < 3; ++axis)
+				position[axis] += velocity[axis] * step;
+
+			if (layout->angle_speed != 0) {
+				*angle += *(const float*)((char*)laser + layout->angle_speed) * step;
+				// the game keeps the angle in [0, 2 pi) and hands it out from there
+				while (*angle < 0.0f)
+					*angle += 6.28318531f;
+				while (*angle >= 6.28318531f)
+					*angle -= 6.28318531f;
+			}
+
+			if (layout->length_speed != 0) {
+				float limit = *(const float*)((char*)laser + layout->length_limit);
+				if (layout->length_limit_subtract != 0)
+					limit -= *(const float*)((char*)laser + layout->length_limit_subtract);
+				// the game only grows the length while it is short of its clamp
+				if (limit > *length) {
+					*length += *(const float*)((char*)laser + layout->length_speed) * step;
+					if (*length > limit)
+						*length = limit;
+				}
+			}
+			++th18_lasers_projected;
+		}
+		laser = next;
+	}
+}
+
+static void th18_lasers_undo() {
+	for (size_t i = 0; i < th18_lasers_moved_count; ++i) {
+		const Th18LaserMoved& moved = th18_lasers_moved[i];
+		float* position = (float*)((char*)moved.laser + th18_laser_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = moved.position[axis];
+		*(float*)((char*)moved.laser + th18_laser_angle) = moved.angle;
+		*(float*)((char*)moved.laser + th18_laser_length) = moved.length;
+	}
+	th18_lasers_moved_count = 0;
+}
+
 // The number of presentations per second the config asks for. 0 means interpolation is off.
 //
 // "-1" picks the largest multiple of the game's frame rate that still fits the display refresh
@@ -644,6 +817,8 @@ static void th18_diag_dump() {
 	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n",
 		th18_player_movement);
 	th18_player_movement = 0.0f;
+	fprintf(file, "lasers: %u straight laser(s) in play (the curve ones are left alone)\n",
+		th18_lasers_seen);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -709,7 +884,9 @@ static void th18_extra_presentation(float t) {
 	// into the sprite queue, so they can go back right after it
 	th18_bullets_advance(t);
 	th18_player_advance(t);
+	th18_lasers_advance(t);
 	th18_render_objects();
+	th18_lasers_undo();
 	th18_player_undo();
 	th18_bullets_undo();
 	th18_draw_sprite_queue(*th18_sprite_manager);
