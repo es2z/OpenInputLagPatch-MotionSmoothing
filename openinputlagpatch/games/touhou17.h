@@ -1,5 +1,5 @@
 #pragma once
-// Touhou 17: Hidden Star in Four Seasons v1.00b
+// Touhou 17: Wily Beast and Weakest Creature v1.00b
 
 #include <Windows.h>
 
