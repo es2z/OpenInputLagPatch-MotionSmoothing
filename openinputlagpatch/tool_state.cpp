@@ -22,12 +22,15 @@ namespace {
 	bool search_over = false;
 	unsigned int samples = 0;
 	unsigned char* tool_draw_address = nullptr;
+	// Whether the code at tool_draw_address takes an argument off the stack when it returns, which
+	// is what the test below has to hand it (see WatchFrameReady)
+	bool tool_draw_takes_argument = false;
 	std::vector<DWORD*> candidates;
 
 	// The tool draws its overlay through a hook it installed on a plain return. Nothing hooked
 	// there means there's no tool to follow.
-	bool tool_present(unsigned char* hook_address) {
-		return hook_address != nullptr && *hook_address != 0xC3;
+	bool tool_present(unsigned char* hook_address, unsigned char plain_byte) {
+		return hook_address != nullptr && *hook_address != plain_byte;
 	}
 
 	bool contains_ci(const wchar_t* haystack, const wchar_t* needle) {
@@ -112,7 +115,14 @@ namespace {
 	bool find_frame_value() {
 		for (size_t i = 0; i < candidates.size(); ++i) {
 			*candidates[i] = 2;
-			((void(*)())tool_draw_address)();
+			// Where the game's return there is a `ret 4` (th10, see tool_state.h), the argument is
+			// handed over through a stdcall type so that it belongs to the callee and the caller
+			// doesn't take it off as well: a cdecl call would have the caller clean an argument the
+			// return already took off, leaving the stack 4 bytes higher than it started
+			if (tool_draw_takes_argument)
+				((void(__stdcall*)(void*))tool_draw_address)(nullptr);
+			else
+				((void(*)())tool_draw_address)();
 
 			if (*candidates[i] == 0) {
 				frame_value = candidates[i];
@@ -135,10 +145,11 @@ namespace {
 	const unsigned int samples_needed = 3;
 }
 
-void ToolState::WatchFrameReady(unsigned char* frame_address, unsigned char* draw_address) {
+void ToolState::WatchFrameReady(unsigned char* frame_address, unsigned char* draw_address,
+	unsigned char plain_byte, bool draw_pops_argument) {
 	if (search_over && frame_value == nullptr)
 		return;
-	if (!tool_present(frame_address))
+	if (!tool_present(frame_address, plain_byte))
 		return;
 
 	if (!searching) {
@@ -146,6 +157,7 @@ void ToolState::WatchFrameReady(unsigned char* frame_address, unsigned char* dra
 		// be drawn is a candidate
 		searching = true;
 		tool_draw_address = draw_address;
+		tool_draw_takes_argument = draw_pops_argument;
 
 		HMODULE module = find_tool_module();
 		std::vector<std::pair<unsigned char*, size_t>> regions;

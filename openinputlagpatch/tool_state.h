@@ -12,7 +12,15 @@ namespace ToolState {
 	// Call where the tool's frame is ready but not drawn yet - in the game's frame, right before the
 	// object render (the tool's draw hook runs on the return of that). frame_address is where the
 	// tool builds its frame, draw_address where it draws it.
-	void WatchFrameReady(unsigned char* frame_address, unsigned char* draw_address);
+	//
+	// plain_byte is what the game has at frame_address while no tool is loaded: the tools hook a
+	// plain `ret`, so it is 0xC3 for most of the games, but th10's walks end with `ret 4` and it
+	// has to pass 0xC2 (see draw_pops_argument as well). draw_pops_argument says whether the code
+	// at draw_address takes an argument off the stack when it returns, which is exactly what a
+	// `ret 4` does: the check below calls that address as if it were a plain function, and without
+	// this it would walk the stack up by 4 bytes every time it does.
+	void WatchFrameReady(unsigned char* frame_address, unsigned char* draw_address,
+		unsigned char plain_byte = 0xC3, bool draw_pops_argument = false);
 
 	// Call after the tool has drawn its frame (the game's present, for example)
 	void WatchFrameDrawn();
