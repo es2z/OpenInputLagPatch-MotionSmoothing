@@ -11,6 +11,71 @@ is also the record of what has actually been verified rather than just what was 
 
 ### Added
 
+- **Touhou 16 (Hidden Star in Four Seasons) gets frame interpolation too** (`9c0cb56`, `22d89ad`, `0ab4c41`, `1e673bb`)
+
+  Hidden Star in Four Seasons is the same engine as Legacy of Lunatic Kingdom, so the whole path
+  follows th15's - with every offset looked up in th16 itself rather than carried over. Its frame
+  functions have the same **three render blocks and three presents** (the renders at `0x45A99C`,
+  `0x45AD9C` and `0x45AF28`, the presents at `0x45ABAA`, `0x45ADF6` and `0x45AFFB`, one of which
+  sits inside the window update `CWindowManager__UpdateFast` at `0x45AC50`, so the title screen and
+  the menus get the extra frames as well). The device is `[0x4C10D8]`, the render context
+  `0x4C10D0`, the sprite manager `[0x4C0F48]`, the dword the block sets to `0xFF` is `[0x4C1ADC]`,
+  the queue is reset by `0x465A30`, prepared by `0x43C4F0`, filled by the render at `0x4015A0` and
+  drawn by `0x465A80`; the camera is `0x43C710(0x4C1560)` (it hands the device the view and
+  projection transforms and the sprite manager the two values that place its queue on screen) and
+  the viewport is at `0x4C1640`. All three presents are laid out identically - 5 bytes of device
+  load then 14 bytes of arguments - so one hook covers them, with none of the instruction-in-the-
+  middle-of-a-setup trouble th13's second present had.
+
+  The bullets are the manager `[0x4A6DAC]`: two pools of 2001 bullets of `0x1478` bytes (the first
+  at `+0x9C`, the second at `+0x9FFE94` being the copy the game keeps for its replay snapshots),
+  with the bullets in play on a list whose first node is at `manager+0x70` and whose node is part
+  of the bullet itself (bullet`+0x10`, the bullet at `node[0]` and the next node at `node[4]`).
+  The position is `+0xC20`, the velocity `+0xC2C`, the 16 bit state `+0xC72` (1 moves a whole step,
+  2, 3 and 5 half of one), the 0x200 flag on `+0x20` holds a bullet, and what everything is scaled
+  by is `[0x4A5788]` (with `[0x49449C]` being the 0.5 the half steps use). The byte that says how
+  many of the game's updates one rendered frame covers (`[0x4C12C4]`) is only ever read in this
+  executable and always 0, so one rendered frame is one update. One detail is th16's own: a bullet
+  in state 5 doesn't move until its timer at `+0x1450` is past 2, and the projection reproduces
+  that instead of treating it as noise.
+
+  The player is `[0x4A6EF8]` (0x2C828 bytes): its own position is `+0x610` (the render pass at
+  `0x443730` copies it into the animation object the player carries). **The options are two arrays
+  of slots**, 4 at `+0x660` and 8 at `+0x9F0`, 0xE4 bytes each (`+0x00` in use, the target at
+  `+0x54/+0x58`, the position in 1/128 pixels at `+0x5C/+0x60`, two sprite ids at `+0xB0/+0xB4`);
+  the shots are 256 slots of 0xC0 bytes at `+0x1118` (`+0x84` in use, the sprite id at `+0x00`,
+  the position at `+0x40`). The sprites are resolved from their ids **every frame** (the array
+  branch written out rather than called: the manager at `[0x4C0F48]`, slots of 0x614 bytes from
+  `+0xEC`, the "in use" byte at `+0x60C` and the id at `+0x538`, since the game's own lookup
+  `0x46EFA0` takes its argument on the stack), and what gets moved is the sprite's position at
+  **`+0x5E0`** (th16's animation objects sit 0xC lower than th15's). Like th15, these three are
+  measured rather than read: the player moves by what the input says, the options walk toward it
+  and the shots add their own motion on top, so there is no velocity to read back.
+
+  The lasers are the manager `[0x4A6EE0]`: the list starts at `manager+0x14` and its links are the
+  object's own `+0x08` and `+0x04`, and the geometry is th15's exactly (position `+0x54`, angle
+  `+0x6C`, length `+0x70`; the line laser's draw at `0x433720` writes them into the two animation
+  objects it carries while it draws). They use the **read-the-velocity** way of doing it, which
+  th12 to th15 were changed to in the same round: four vtables come out of the RTTI (LaserCurveInf
+  `0x4922E0`, LaserBeamInf `0x49234C`, LaserInfiniteInf `0x4923B8`, LaserLineInf `0x492424`), the
+  whitelist holds only the line class (velocity `+0x60`, rate `+0x78`, limit `+0x5E4`, and it
+  doesn't turn) and the infinite one (velocity `+0x5E0`, angle speed `+0x5F0`, rate `+0x78`, limit
+  `+0x5F4`), the beam class needs no entry at all because its update `0x43AC00` is a stub that
+  returns 0, and the curve class is left alone.
+
+  The menus' text (the bug th12 to th15 had) is handled in the same round: the text object is
+  `[0x4A6D98]`, its records are 0x138 bytes each from `+0xBF0` (up to 0x140 of them), and the count
+  of them for the frame is `+0x19208` (appended by `FUN_00408140`, walked by `FUN_00408560`). The
+  render hook keeps that count and puts it back before every extra presentation. th16 doesn't need
+  the twelve layout fields th13 did: its record draw (`FUN_00408650`) writes none of them.
+
+  Measured: on an 180Hz display the extra frames land evenly at 180 a second (`average: 3.000
+  presents per frame, 180.6 presentations per second`), with `622 in play, 622 projected` bullets
+  (and `114 in play, 114 projected` in another run), `98 sprite(s) moved` for the player, its
+  options and its shots (with none of them ever missing a movement record) and `55 in play, 55
+  projected` lasers; the title screen, the menus, the pause screen and the replay save screen are
+  all normal.
+
 - **Touhou 10 (Mountain of Faith) gets frame interpolation too** (`229342c`, `7036f2d`, `dcd812a`, `cf6f78d`, `b9c8811`)
 
   Mountain of Faith is the oldest of this batch (2007, a generation before Subterranean Animism),
