@@ -389,6 +389,419 @@ static void th10_bullets_undo() {
 	th10_saved_bullets_count = 0;
 }
 
+	// ---------------------------------------------------------------------------
+	// Frame interpolation, stage 1: the player, its options and its shots, and the sprites they wear
+	// ---------------------------------------------------------------------------
+	//
+	// The player of the stage that is running is at [0x477834] (0x4478 bytes, cleared by
+	// FUN_004246C0 once the stage sets it up). Its update (FUN_004250B0, which the stage's own
+	// update calls) keeps the position it moves as two ints in 1/128 pixel units at +0x3CC/+0x3D0
+	// (clamped to the play field, +/-0x47E0 across and 0xC80 to 0xA8C0 down), adds the two speeds at
+	// +0x3F0/+0x3F4 to them, and writes the two floats at +0x3C0/+0x3C4 back out from them (times
+	// 1/128, the float at 0x470B00).
+	//
+	// What the player puts on screen is placed by the update, not by a draw callback: the animation
+	// object it wears as a handle at +0x329C is put where it is with FUN_004492F0, and each of its
+	// options with FUN_00449350. Those two are the whole of it - FUN_004491C0 is what finds the
+	// object a handle names, and the two setters write the drawn position at +0x340/+0x344/+0x348 of
+	// it (the second one adds the play field's own origin, 224.0f at 0x470B4C and 16.0f at 0x470B48,
+	// which is the offset the bullets carry around as well), moving the objects hanging off it (the
+	// node chain at +0x14, unless the flag at +0x18 says not to) along with it. So those sprite
+	// objects are what an extra presentation has to move - the same rule th13 and th15 follow, and
+	// where th10 differs from th11, whose player's draw copies the position into its sprite every
+	// frame and can be moved by its logical position alone.
+	//
+	// A handle is the sprite object's own first dword, and FUN_004491C0 finds one by walking the two
+	// lists the sprite manager keeps at +0x72DAD4 and +0x72DADC (node[0] = the object, node[4] =
+	// next), which is written out here rather than called: a slot can keep a stale handle after the
+	// game takes its sprite away, and the sprites are looked up again every frame for the reason
+	// th12 has to do the same.
+	//
+	// None of them has a velocity worth reading - the player moves by whatever the input says, the
+	// options follow it and whatever they put on screen follows them - so what each of them moves by
+	// in a frame is measured, the way th11 does it: every game frame the position is compared with
+	// the one of the frame before, and an extra presentation moves the sprite by that difference
+	// times the fraction of a frame it stands for, then puts it back.
+
+	static void** const th10_player = (void**)0x00477834;
+	static const size_t th10_player_position = 0x3C0;        // 2 floats, in pixels
+	static const size_t th10_player_sprite = 0x329C;         // the handle of its own sprite
+	// The animation the player object carries itself, drawn at +0x354/+0x358 (FUN_00426360 copies
+	// the logical position into it every frame, adding the play field's origin)
+	static const size_t th10_player_drawn = 0x354;
+	static const size_t th10_player_options = 0x32A0;        // 4 slots of 0x98 bytes
+	static const size_t th10_player_option_count = 4;
+	static const size_t th10_player_option_size = 0x98;
+	static const size_t th10_player_option_position = 0x34;  // 2 ints, in 1/128 pixels
+	static const size_t th10_player_option_sprite = 0x68;    // 2 handles
+	static const size_t th10_sprite_position = 0x340;        // in a sprite object: 3 floats
+	static const size_t th10_sprite_children = 0x14;         // node[0] = child, node[4] = next
+	static const size_t th10_sprite_children_off = 0x18;     // non-zero: the children are not moved
+	static const size_t th10_sprite_lists[2] = { 0x72DAD4, 0x72DADC };
+	// The option positions are kept in 1/128 pixel units
+	static const float th10_units_per_pixel = 128.0f;
+	static const float th10_max_step = 48.0f;
+
+	// The shots are a pool of the player's own, 128 slots of 0x5C bytes at +0x49C. That pool is what
+	// three of the player's functions work on: FUN_00427E90 fills a slot in when the firing pattern
+	// (FUN_00428160, walked from the table the stage put at [player+0x45C]+0x110) fires one,
+	// FUN_00428280 walks the whole pool every frame (its own slot pointer starts 0x20 into the slot,
+	// at +0x4BC, and runs 0x5C at a time), and FUN_00428630 tests the slots against the enemies. A
+	// slot keeps:
+	//   +0x14/+0x18/+0x1C  the position: 3 floats in pixels, started at the player's own
+	//                      +0x3C0/+0x3C4/+0x3C8 or at one of the options' +0x3244/+0x3248 (in 1/128)
+	//   +0x40              non-zero while the slot is in use - that is what both of them test, and
+	//                      what FUN_00428280 clears when it takes the slot back
+	//   +0x44 and +0x48    the two sprite handles the shot is drawn as (FUN_00428280 puts both of
+	//                      them where the slot's position is, at +0x340/+0x344/+0x348 = position +
+	//                      the play field origin 224.0f/16.0f, so the sprites are what has to move)
+	//   +0x58              the firing pattern entry the shot was made from
+	// The slot moves itself with the direction and speed it was started with (+0x20/+0x24, +0x2C...
+	// the pool updates those itself), so, as in th11, what each one moves by in a frame is measured
+	// rather than read.
+	static const size_t th10_player_shots = 0x49C;
+	static const size_t th10_player_shot_count = 0x80;
+	static const size_t th10_player_shot_size = 0x5C;
+	static const size_t th10_player_shot_live = 0x40;     // non-zero while the slot is in use
+	static const size_t th10_player_shot_position = 0x14; // 2 floats, in pixels
+	static const size_t th10_player_shot_sprite = 0x44;   // 2 handles
+	// The stage also builds one single shot object (FUN_004056B0, 0x48 bytes, kept at [0x4776EC]),
+	// which FUN_00405750 updates - it is what the task FUN_004055C0 registers (callback 0x405840,
+	// the object itself as the context) runs - and which FUN_00405860 fills in again from the
+	// player's own shot state machine (FUN_00425730) whenever its state at +0x28 is 0. Its position
+	// is at +0x30/+0x34 (in pixels, the y one subtracted from every frame) and the sprite it is
+	// drawn as is the handle at +0x2C, put where it is with FUN_004492F0 - the same setter, and the
+	// same 224.0f/16.0f origin, the pool's sprites are drawn with. It is a shot of the player's too
+	// (a single one rather than a pool), so an extra presentation moves its sprite the same way.
+	static void** const th10_shot_object = (void**)0x004776EC;
+	static const size_t th10_shot_object_state = 0x28;    // 1 while it is in flight
+	static const size_t th10_shot_object_sprite = 0x2C;   // 1 handle
+	static const size_t th10_shot_object_position = 0x30; // 2 floats, in pixels
+
+	static unsigned int th10_shots_in_flight;     // live slots the pool had, last game frame
+	static unsigned int th10_shot_frames;         // game frames of the recorded ones with one live
+	static unsigned int th10_shot_object_frames;  // the same, for the single shot object
+
+// What one thing moved by in a frame, kept per thing the player owns. Every one of them is a fixed
+// slot of the player object (the player itself, one of the 4 options), so a record never has to be
+// recycled: an empty option slot simply has nothing to move.
+struct Th10Motion {
+	unsigned int frame;
+	float last_x, last_y;
+	float delta_x, delta_y;
+};
+
+static unsigned int th10_motion_frame = 1;
+
+static void th10_measure(Th10Motion& motion, float x, float y, float max_step) {
+	// Only a thing that was measured in the frame right before this one has something to compare
+	// against - one that just appeared has not moved as far as this can tell
+	if (motion.frame != 0 && motion.frame + 1 == th10_motion_frame) {
+		const float dx = x - motion.last_x;
+		const float dy = y - motion.last_y;
+		if (dx > -max_step && dx < max_step && dy > -max_step && dy < max_step) {
+			motion.delta_x = dx;
+			motion.delta_y = dy;
+		} else {
+			motion.delta_x = 0.0f;
+			motion.delta_y = 0.0f;
+		}
+	} else {
+		motion.delta_x = 0.0f;
+		motion.delta_y = 0.0f;
+	}
+	motion.frame = th10_motion_frame;
+	motion.last_x = x;
+	motion.last_y = y;
+}
+
+// The sprite object a handle names, or null if it names none that is live right now. The object
+// keeps its own address in its first dword and is threaded onto one of the sprite manager's two
+// lists, which is what the game's own lookup (FUN_004491C0) walks. This walks them here rather than
+// calling it, because its arguments are split between registers and the stack.
+static void* th10_sprite_by_handle(unsigned int handle) {
+	if (handle == 0)
+		return nullptr;
+	void* manager = *(void**)th10_sprite_manager;
+	if (manager == nullptr)
+		return nullptr;
+	for (size_t list = 0; list < 2; ++list) {
+		void* node = *(void**)((char*)manager + th10_sprite_lists[list]);
+		for (size_t guard = 0; node != nullptr && guard < 0x2000; ++guard) {
+			void* object = *(void**)node;
+			if (*(unsigned int*)object == handle)
+				return object;
+			node = *(void**)((char*)node + 4);
+		}
+	}
+	return nullptr;
+}
+
+// One thing to move for an extra presentation, and what its position was
+struct Th10Shifted {
+	float* position;
+	float saved[3];
+	float moved_x, moved_y;   // what was added to it, to see later whether it stayed
+};
+
+static const size_t th10_shifted_max = 4096;
+static Th10Shifted th10_shifted[th10_shifted_max];
+static size_t th10_shifted_count;
+static unsigned int th10_shifts_lost;
+
+// Moves one position and remembers what it changed
+static void th10_shift_position(float* position, const Th10Motion& motion, float t) {
+	if (position == nullptr || th10_shifted_count >= th10_shifted_max)
+		return;
+	Th10Shifted& shifted = th10_shifted[th10_shifted_count++];
+	shifted.position = position;
+	for (int axis = 0; axis < 3; ++axis)
+		shifted.saved[axis] = position[axis];
+	position[0] += motion.delta_x * t;
+	position[1] += motion.delta_y * t;
+	shifted.moved_x = motion.delta_x * t;
+	shifted.moved_y = motion.delta_y * t;
+}
+
+// The same, for the drawn position of one sprite object
+static void th10_shift_object(void* object, const Th10Motion& motion, float t) {
+	if (object == nullptr)
+		return;
+	th10_shift_position((float*)((char*)object + th10_sprite_position), motion, t);
+}
+
+// The same, for a sprite the game hands out: the objects hanging off it (the node chain at +0x14)
+// are given the same position unless the flag at +0x18 says not to (FUN_004492F0 and FUN_00449350
+// both do that), so they move with it here as well.
+static void th10_shift_sprite(void* sprite, const Th10Motion& motion, float t) {
+	th10_shift_object(sprite, motion, t);
+	if (*(const int*)((char*)sprite + th10_sprite_children_off) != 0)
+		return;
+	void* node = *(void**)((char*)sprite + th10_sprite_children);
+	for (size_t guard = 0; node != nullptr && guard < 16; ++guard) {
+		th10_shift_object(*(void**)node, motion, t);
+		node = *(void**)((char*)node + 4);
+	}
+}
+
+static void th10_undo_shifts() {
+	// Something in the render walk can put a position back where it was before the walk drew it
+	// (an animation callback that owns the position, for example), which would leave the extra
+	// presentation looking exactly like the game's own. Counting those is what says whether the
+	// field being moved is the one the renderer ends up reading.
+	th10_shifts_lost = 0;
+	for (size_t i = 0; i < th10_shifted_count; ++i) {
+		const Th10Shifted& shifted = th10_shifted[i];
+		if (shifted.position[0] != shifted.saved[0] + shifted.moved_x ||
+				shifted.position[1] != shifted.saved[1] + shifted.moved_y)
+			++th10_shifts_lost;
+		for (int axis = 0; axis < 3; ++axis)
+			shifted.position[axis] = shifted.saved[axis];
+	}
+	th10_shifted_count = 0;
+}
+
+// The player itself: a motion record of its own, and nothing else to keep
+static Th10Motion th10_body_motion;
+
+// The options: what each of the 4 slots moved by, and the two sprites it wears
+static Th10Motion th10_option_motions[th10_player_option_count];
+static void* th10_option_sprites[th10_player_option_count][2];
+
+// The shots: what each of the 128 slots of the player's pool moved by, the two sprites it wears, and
+// the handle of the first one the frame before, which says whether the slot was fired again since
+static Th10Motion th10_shot_motions[th10_player_shot_count];
+static void* th10_shot_sprites[th10_player_shot_count][2];
+static unsigned int th10_shot_handles[th10_player_shot_count];
+
+// The one single shot object, and the sprite it wears this frame
+static Th10Motion th10_shot_object_motion;
+static void* th10_shot_object_sprite_object;
+
+// What the last game frame had on screen and how much of it was projected forward, for the
+// diagnostics dump below
+static unsigned int th10_sprites_untracked;
+static unsigned int th10_body_sprites;
+static unsigned int th10_option_sprites_moved;
+static unsigned int th10_shot_sprites_moved;
+static float th10_shot_movement;
+static float th10_player_movement;
+
+// Collects what the player owns this frame and works out what it moved by since the frame before.
+// This runs once per game frame, from the game's own present (see th10_present_hook).
+static void th10_player_measure() {
+	++th10_motion_frame;
+	th10_sprites_untracked = 0;
+	th10_body_sprites = 0;
+	th10_option_sprites_moved = 0;
+	th10_shot_sprites_moved = 0;
+	th10_shots_in_flight = 0;
+
+	// The shots, from the pool the player keeps them in (see th10_player_shots above)
+	{
+		void* player = *th10_player;
+		for (unsigned int i = 0; i < th10_player_shot_count; ++i) {
+			const char* slot = player == nullptr
+				? nullptr : (const char*)player + th10_player_shots + i * th10_player_shot_size;
+			if (slot == nullptr || *(const int*)(slot + th10_player_shot_live) == 0) {
+				th10_shot_sprites[i][0] = nullptr;
+				th10_shot_sprites[i][1] = nullptr;
+				th10_shot_motions[i].frame = 0;
+				th10_shot_handles[i] = 0;
+				continue;
+			}
+			++th10_shots_in_flight;
+			// A slot the pattern has fired into since the frame before is a new shot that happens to
+			// have taken the slot over: it has no movement to project yet
+			const unsigned int handle = *(const unsigned int*)(slot + th10_player_shot_sprite);
+			const bool refired = handle != 0 && handle != th10_shot_handles[i];
+			th10_shot_handles[i] = handle;
+			const float* position = (const float*)(slot + th10_player_shot_position);
+			th10_measure(th10_shot_motions[i], position[0], position[1], th10_max_step);
+			if (refired) {
+				th10_shot_motions[i].delta_x = 0.0f;
+				th10_shot_motions[i].delta_y = 0.0f;
+			}
+			{
+				const float dx = th10_shot_motions[i].delta_x < 0.0f
+					? -th10_shot_motions[i].delta_x : th10_shot_motions[i].delta_x;
+				const float dy = th10_shot_motions[i].delta_y < 0.0f
+					? -th10_shot_motions[i].delta_y : th10_shot_motions[i].delta_y;
+				const float magnitude = dx > dy ? dx : dy;
+				if (magnitude > th10_shot_movement)
+					th10_shot_movement = magnitude;
+			}
+			for (int sprite = 0; sprite < 2; ++sprite) {
+				const unsigned int sprite_handle = *(const unsigned int*)(
+					slot + th10_player_shot_sprite + sprite * 4);
+				th10_shot_sprites[i][sprite] = th10_sprite_by_handle(sprite_handle);
+				if (sprite_handle != 0 && th10_shot_sprites[i][sprite] == nullptr)
+					++th10_sprites_untracked;
+			}
+		}
+		if (th10_shots_in_flight != 0)
+			++th10_shot_frames;
+	}
+
+	// The single shot object, if the stage has one and it is in flight (see th10_shot_object above)
+	{
+		void* shot = *th10_shot_object;
+		if (shot != nullptr && *(const int*)((const char*)shot + th10_shot_object_state) == 1) {
+			++th10_shot_object_frames;
+			const float* position = (const float*)((const char*)shot + th10_shot_object_position);
+			th10_measure(th10_shot_object_motion, position[0], position[1], th10_max_step);
+			const unsigned int handle =
+				*(const unsigned int*)((const char*)shot + th10_shot_object_sprite);
+			th10_shot_object_sprite_object = th10_sprite_by_handle(handle);
+			if (handle != 0 && th10_shot_object_sprite_object == nullptr)
+				++th10_sprites_untracked;
+		} else {
+			th10_shot_object_sprite_object = nullptr;
+			th10_shot_object_motion.frame = 0;
+		}
+	}
+
+	void* player = *th10_player;
+	if (player == nullptr)
+		return;
+
+	for (unsigned int i = 0; i < th10_player_option_count; ++i) {
+		const char* slot = (const char*)player + th10_player_options + i * th10_player_option_size;
+		const int* position = (const int*)(slot + th10_player_option_position);
+		if (*(const int*)slot == 0) {
+			th10_option_sprites[i][0] = nullptr;
+			th10_option_sprites[i][1] = nullptr;
+			th10_option_motions[i].frame = 0;
+			continue;
+		}
+		th10_measure(th10_option_motions[i],
+			(float)position[0] / th10_units_per_pixel, (float)position[1] / th10_units_per_pixel,
+			th10_max_step);
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			const unsigned int handle =
+				*(const unsigned int*)(slot + th10_player_option_sprite + sprite * 4);
+			th10_option_sprites[i][sprite] = th10_sprite_by_handle(handle);
+			if (handle != 0 && th10_option_sprites[i][sprite] == nullptr)
+				++th10_sprites_untracked;
+		}
+	}
+
+	// The player itself: its own position is what the update moves, and it is that position the
+	// sprite it wears is put at, so that is what is measured
+	{
+		const float* position = (const float*)((const char*)player + th10_player_position);
+		th10_measure(th10_body_motion, position[0], position[1], th10_max_step);
+		const float x = th10_body_motion.delta_x < 0.0f ? -th10_body_motion.delta_x : th10_body_motion.delta_x;
+		const float y = th10_body_motion.delta_y < 0.0f ? -th10_body_motion.delta_y : th10_body_motion.delta_y;
+		const float magnitude = x > y ? x : y;
+		if (magnitude > th10_player_movement)
+			th10_player_movement = magnitude;
+	}
+}
+
+// Moves the player and everything it put on screen t frames ahead of the state the game is in, and
+// remembers what it changed
+static void th10_player_advance(float t) {
+	th10_body_sprites = 0;
+	th10_option_sprites_moved = 0;
+	th10_shot_sprites_moved = 0;
+	th10_shifted_count = 0;
+
+	if (th10_held())
+		return;
+
+	void* player = *th10_player;
+	if (player == nullptr)
+		return;
+
+	if (th10_motion_frame == th10_body_motion.frame) {
+		// The render walk copies this position into the animation the player object itself carries
+		// (drawn at +0x354/+0x358), so moving it here covers the body; the sprite the player wears
+		// as a handle is placed by the update instead (FUN_004492F0), so it moves with it, the way
+		// th13's notes ended up covering both.
+		th10_shift_position((float*)((char*)player + th10_player_position), th10_body_motion, t);
+		th10_shift_position((float*)((char*)player + th10_player_drawn), th10_body_motion, t);
+		++th10_body_sprites;
+		const unsigned int handle = *(const unsigned int*)((char*)player + th10_player_sprite);
+		void* sprite = th10_sprite_by_handle(handle);
+		if (sprite != nullptr) {
+			th10_shift_sprite(sprite, th10_body_motion, t);
+		} else if (handle != 0) {
+			++th10_sprites_untracked;
+		}
+	}
+
+	for (unsigned int i = 0; i < th10_player_option_count; ++i) {
+		if (th10_motion_frame != th10_option_motions[i].frame)
+			continue;
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			if (th10_option_sprites[i][sprite] == nullptr)
+				continue;
+			th10_shift_sprite(th10_option_sprites[i][sprite], th10_option_motions[i], t);
+			++th10_option_sprites_moved;
+		}
+	}
+
+	// The shots: a slot that was measured this frame still has the sprites it was drawn as, and those
+	// are what moves
+	for (unsigned int i = 0; i < th10_player_shot_count; ++i) {
+		if (th10_motion_frame != th10_shot_motions[i].frame)
+			continue;
+		for (int sprite = 0; sprite < 2; ++sprite) {
+			if (th10_shot_sprites[i][sprite] == nullptr)
+				continue;
+			th10_shift_sprite(th10_shot_sprites[i][sprite], th10_shot_motions[i], t);
+			++th10_shot_sprites_moved;
+		}
+	}
+
+	// The single shot object: the same, for the one sprite it wears
+	if (th10_motion_frame == th10_shot_object_motion.frame && th10_shot_object_sprite_object != nullptr) {
+		th10_shift_sprite(th10_shot_object_sprite_object, th10_shot_object_motion, t);
+		++th10_shot_sprites_moved;
+	}
+}
+
 // Puts the sprite queue back to empty, the way the frame function inlines it (0x43949C)
 static void th10_reset_sprite_queue() {
 	void* manager = *(void**)th10_sprite_manager;
@@ -484,6 +897,20 @@ static void th10_diag_dump() {
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th10_bullets_in_play, th10_bullets_moved);
+	fprintf(file, "player: %u body, %u option and %u shot sprite(s) projected (last game frame, %u shot(s) in flight)\n",
+		th10_body_sprites, th10_option_sprites_moved, th10_shot_sprites_moved, th10_shots_in_flight);
+	fprintf(file, "player: %u sprite(s) this frame had no movement record (should stay 0)\n",
+		th10_sprites_untracked);
+	fprintf(file, "player: %u moved position(s) were written back during the walk (0: the renderer reads them)\n",
+		th10_shifts_lost);
+	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n", th10_player_movement);
+	th10_player_movement = 0.0f;
+	fprintf(file, "shot movement: up to %.2f px per frame since the last dump\n", th10_shot_movement);
+	th10_shot_movement = 0.0f;
+	fprintf(file, "shots: %u game frame(s) since the last dump had one of the player's pool in flight"
+		" (%u had the single shot object)\n", th10_shot_frames, th10_shot_object_frames);
+	th10_shot_frames = 0;
+	th10_shot_object_frames = 0;
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -560,10 +987,12 @@ static void th10_extra_presentation(IDirect3DDevice9* device, float t) {
 	// Everything is drawn where it will be t frames from now; the render bakes those positions into
 	// what it draws, so they can all go back right after it
 	th10_bullets_advance(t);
+	th10_player_advance(t);
 	// Nothing to render into an empty scene, and the walk itself would read the object it is handed
 	void* scene = *th10_scene;
 	if (scene != nullptr)
 		th10_render_objects(scene);
+	th10_undo_shifts();
 	th10_bullets_undo();
 	// The walk just ran the game's rate task, so what it made of that has to go back as well
 	th10_fps_restore(false);
@@ -595,6 +1024,10 @@ static HRESULT th10_present_hook() {
 
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
+
+	// The game's own update has run and it is about to put that frame on screen: this is the one
+	// point in the frame where the movement of the player and its options can be measured
+	th10_player_measure();
 
 	HRESULT result = device->Present(nullptr, nullptr, nullptr, nullptr);
 	overlay_mark_presentation();
