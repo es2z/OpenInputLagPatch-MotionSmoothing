@@ -11,6 +11,73 @@ is also the record of what has actually been verified rather than just what was 
 
 ### Added
 
+- **Touhou 11 (Subterranean Animism) gets frame interpolation too** (`26ac150`, `7d08bd2`, `7695746`, `af30cfb`)
+
+  Subterranean Animism is the oldest of this batch (2008, a generation before Undefined Fantastic
+  Object), so its offsets are its own: its frame code has the same **three render blocks and three
+  present sites** (renders at `0x446193`/`0x446571`/`0x446730`, presents at
+  `0x446382`/`0x4465D6`/`0x4467F9`), and one of the render blocks is inside the window update
+  `CWindowManager__UpdateFast` (`0x446420`) itself, which is why the menus and the title screen get
+  the extra frames too. Those six are what the extra presentations take over; the device is at
+  `[0x4C3288]`, the render context is the object the block puts in `EDI` (`0x4C3280`), the sprite
+  queue's owner is the one it puts in `ESI` (`[0x4C3268]`), `0x44FCE0` empties the queue,
+  `0x44FD10` draws it and `0x456E10` renders the objects.
+
+  Each render block presents from a small frame-end helper (`FUN_004461F0`/`FUN_004465D0`/
+  `FUN_00446790`), all of them a 5 byte load of the device followed by 16 bytes of arguments, so
+  all three are patched and the code after them runs with the present result. The two the block
+  calls with their object in a register (`0x42A300` wants `EDI`, `0x44FD10` wants `ESI`) go through
+  the same kind of `__declspec(naked)` trampoline th13 needed, with the caller's register put back
+  before returning. th11 inlines the sprite queue's reset into the frame function, so the extra
+  presentation calls `0x44FCE0`, which is the same thing.
+
+  An extra presentation also has to put the picture's own state back: the viewport, the view and
+  projection transforms (the game's frame builds them from its 2D context in `FUN_0042A810`, and a
+  tool drawing its overlay replaces them with its own), the 2D context the frame rendered with
+  (`[0x4C37CC]`, which the sprite queue's clipping reads) and the two values `FUN_0042A810` leaves
+  in the sprite manager at `+0xB0`/`+0xB4` that place the queue on screen. All of them are taken
+  where the game's own render runs and written back before every extra presentation (the game's own
+  `FUN_0042A810` is not called again - it draws the queue once on its way in).
+
+  The bullets are the manager `[0x4A8D68]` and its own six column lists (heads at `manager+0x14`,
+  next at `bullet+0x4B8`): position at `+0x43C/+0x440/+0x444`, velocity at `+0x448/+0x44C/+0x450`,
+  state at `+0x4B2` (1 is a full step, 2 and 3 are half of one) and the global slowdown at
+  `[0x4A7948]`. The update divisor `[0x4C3466]` is read in seven places across the executable and
+  written nowhere, and is 0, so there is exactly one update per rendered frame. The player is
+  `[0x4A8EB4]`, its own position at `+0x87C/+0x880/+0x884` (its draw callback `FUN_00431BC0` copies
+  that into the body animation object's drawn position every frame). Its options are 8 slots of
+  `0xE4` bytes at `+0x7570` (position at `+0x5C/+0x60` as ints in 1/128 pixels, two animation
+  objects at `+0xB0`/`+0xB4`) and its shots are 256 slots of `0x6C` bytes at `+0x96C` (position at
+  `+0x14/+0x18/+0x1C`, objects at `+0x4C`/`+0x50`). Those two have their positions written into the
+  objects' drawn position at `+0x3E8/+0x3EC` by the update, so it is the objects that are moved for
+  them; the player's own position is moved directly. The objects are looked up by handle again
+  every frame (by walking the sprite manager's two lists at `[0x4C3268]+0x7B562C`/`+0x7B5634`),
+  which is what keeps the crash th12 had - a cached pointer to a freed sprite - from happening.
+
+  The straight lasers are the manager `[0x4A8E94]` (list at `manager+0x18`, next at `laser+0x08`,
+  state at `+0x0C`). th11's RTTI carries only `LaserLineInf` (vtable `0x494A64`) and
+  `LaserInfiniteInf` (`0x494ABC`) - there is no curve or beam laser class in this game - and both
+  keep the position at `+0x3C/+0x40/+0x44`, the angle at `+0x54` and the length at `+0x58`, all of
+  which their draw (at vtable `+0x0C`) reads as it writes them into the two animation objects the
+  laser embeds, so moving them moves the beam. The velocity is read from each class (Line:
+  `+0x48/4C/50`, and it does not turn; Infinite: `+0x44C/450/454` with the turn rate at `+0x45C`),
+  the length grows by `+0x60` up to `+0x450` (Line) or `+0x460` (Infinite). One known difference:
+  a laser's length is not read at draw time in this game (the update folds it into a sprite's pixel
+  size once per frame), so a beam that is growing still extends in whole frames even though its
+  position and angle are smooth.
+
+  The menus' text list - the problem described under the Undefined Fantastic Object entry below -
+  is handled here from the start: the text object is `[0x4A8D58]`, its records are `0x130` bytes
+  each (th11 is a generation older, so they are smaller than the later games' `0x138`) at `+0x87C`
+  up to `0x140` of them, and the count of the ones the frame draws is at `+0x1847C`; the render
+  hook keeps it and every extra presentation puts it back before it draws.
+
+  Confirmed in-game: the extras land evenly at 180 presents per second (`average: 3.000 presents
+  per frame, 180.6 presentations per second`); `549 in play, 549 projected` for the bullets, `1
+  body, 8 option and 57 shot sprite(s) projected` for the player, and `256 in play, 256 projected`
+  for the lasers in a laser-heavy spell card (the manager's own limit of `0x100`), with the picture
+  and the pause and save screens normal.
+
 - **Touhou 12 (Undefined Fantastic Object) gets frame interpolation too** (`c4b7811`, `fe9146f`, `fd8eddc`)
 
   Undefined Fantastic Object is the last of the games the requirements name (the earlier ones already
