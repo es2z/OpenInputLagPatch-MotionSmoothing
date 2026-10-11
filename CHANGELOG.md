@@ -11,6 +11,94 @@ is also the record of what has actually been verified rather than just what was 
 
 ### Added
 
+- **Touhou 10 (Mountain of Faith) gets frame interpolation too** (`229342c`, `7036f2d`, `dcd812a`, `cf6f78d`, `b9c8811`)
+
+  Mountain of Faith is the oldest of this batch (2007, a generation before Subterranean Animism),
+  and it draws a frame the way th11 does with less of it: **one render block and one present**, both
+  inside the frame function `CWindowManager__Update` (`0x439390`) - the render block calls the
+  object render at `0x4394D8` and presents at `0x43920A` - so there are two addresses to take over
+  rather than six, and since that one render block sits in the window update, the title screen and
+  the menus get the extra frames as well. The device is `[0x491C30]`, the render context
+  `[0x491FAC]`, the sprite queue's owner `[0x491C10]`, the byte the block sets to `0xFF` is
+  `0x492378`; the object render is `FUN_00449D40` (its object in `EDI`) and the queue is drawn by
+  `FUN_00442F50` (its object in `ESI`), so both go through the same `__declspec(naked)` trampolines
+  th13 needed. Its present is laid out in pieces - the three pushes in front of the patched load
+  belong to the same call - so the hook has to return with `ret 0xC` and put those 12 bytes of
+  arguments back; getting that wrong is what made th10 fail its stack cookie and die on startup the
+  first time it was tried.
+
+  The bullets are the manager `[0x4776F0]`, whose pool is 2001 bullets of `0x7F0` bytes at
+  `manager+0x60` and whose six column lists (heads at `manager+0x14`, next at `bullet+0x44C`) are
+  both what the update rebuilds and what the draw walks, so they are exactly the bullets that are
+  drawn. Position at `+0x3B4/+0x3B8/+0x3BC`, velocity at `+0x3C0/+0x3C4/+0x3C8`, state at `+0x446`
+  (1 is a full step, 2 and 3 are half of one), global slowdown at `[0x476F78]`, and the drawn
+  position the draw copies the position into at `+0x33C/+0x340/+0x344`. The update divisor
+  `[0x491D66]` is read in the executable and written nowhere and is 0, so there is exactly one
+  update per rendered frame.
+
+  The player is `[0x477834]` (0x4478 bytes). Its update (`FUN_004250B0`) moves it as two ints in
+  1/128 pixels at `+0x3CC/+0x3D0` and writes the two floats at `+0x3C0/+0x3C4` back out from them,
+  and its draw callback (`FUN_00426360`) copies those into the animation object it carries at
+  `+0x354/+0x358` every frame, so moving the logical position is what moves the body - th13's and
+  th15's rule. Its options are 4 slots of `0x98` bytes at `+0x32A0` (in use when `+0x00` is
+  non-zero, position at `+0x34/+0x38` as ints in 1/128 pixels, two animation objects at
+  `+0x68/+0x6C`) and its shots are a pool of 128 slots of `0x5C` bytes at `+0x49C` (in use when
+  `+0x40` is non-zero, position at `+0x14/+0x18/+0x1C`, two animation objects at `+0x44/+0x48`).
+  The shots are filled in by `FUN_00427E90`, walked every frame by `FUN_00428280` and tested against
+  the enemies by `FUN_00428630`, and all three of those work on that one pool, which is what says
+  its shape is right (the offsets are each read out of those functions rather than carried over
+  from th11, whose pool is at `+0x96C` with 0x6C byte slots). Both the options and the shots are
+  positioned by the update rather than by a draw callback, so the objects are what is moved for
+  them, and they are looked up by handle again every frame (walking the sprite manager's two lists
+  at `[0x491C10]+0x72DAD4`/`+0x72DADC`; an object's drawn position is `+0x340/+0x344/+0x348`),
+  which is what keeps the crash th12 had - a cached pointer to a freed sprite - from happening.
+
+  The stage also builds **one single shot object** of its own (`FUN_004056B0`, 0x48 bytes, kept at
+  `[0x4776EC]`), updated by `FUN_00405750` and fired by `FUN_00405860` from the player's own shot
+  state machine (`FUN_00425730`). It is projected as well, so that a shot of that one's isn't left
+  stepping while the pool's are smooth, but in the runs below it was never in flight: the pool is
+  what the player's fire actually shows.
+
+  The straight lasers are the manager `[0x47781C]` (one 0x45C byte block, the node the game works
+  from at `+0x10`; list at `manager+0x18`, next at `laser+0x08`, state at `+0x0C`). th10 carries
+  **no RTTI at all** - its only RTTI names are the eight MSVC standard library ones - so the classes
+  are whitelisted by vtable instead of by name: the two of them (`0x46DA60` and `0x46DA10`, the
+  classes `FUN_0041C5B0` and `FUN_0041C680` build) both keep the position at `+0x24/+0x28/+0x2C`,
+  the angle at `+0x3C` and the length at `+0x40`, and each one's own draw (`FUN_0041D7C0` and the
+  one at `0x41EA40`) reads the position and the angle at draw time as it writes them into the two
+  animation objects the laser embeds, so moving them moves the beam. The velocity is read from each
+  class (`+0x30/34/38` for the one that doesn't turn, whose length stops at `+0x434`; `+0x430/434/438`
+  with the turn rate at `+0x440` and the length stopping at `+0x444` for the one that does). As in
+  th11, a beam's length is not read at draw time (the update folds it into a sprite's pixel size
+  once a frame), so a growing beam still extends in whole frames while its position and angle are
+  smooth.
+
+  The menus' text is the same problem the later games have, in an older shape: the text object is
+  `[0x4776E0]`, its two record tables start at `+0x76C` (0x68 bytes a record, up to 0x100 of them)
+  and `+0x6F6C`, and the counts of the ones the frame draws are at `+0x896C/+0x8970`, which the
+  update clears once a frame; those two are kept where the game's own render runs and put back
+  before every extra presentation, so an extra frame draws the same text the game's own frame did.
+  th10 also has a **frame rate module of its own** (`\src\game\fps.cpp` is in the executable) whose
+  task sits on the render chain, so an extra presentation would count three times the frames the
+  game actually ran and, past 65, make the game resynchronise its clock. What that module keeps is
+  saved where the game's own present runs and put back around every extra presentation (with its
+  window's start pushed into the future so the extra frame doesn't settle the window itself), and
+  its resynchronisation test is patched out the way thprac's th10 module does it (`EB 50` at
+  `0x413516`), which is what keeps the game's own rate display honest once the rate is raised. It is
+  also the first of the family to run part of the game on a **second thread** (the enemy thread
+  `FUN_0041FAC0` starts with `__beginthreadex`), which is why what is projected is read and written
+  at the one point in a frame where the game's own update walk has just run - the same point the
+  game's own render reads those containers from.
+
+  Confirmed in-game: the extras land evenly at 180 presents per second (`average: 3.000 presents per
+  frame, 180.6 presentations per second`), with `1028 in play, 1028 projected` for the bullets in
+  one run and `505 in play, 505 projected` in a later one, `1 body, 8 option and 42 shot sprite(s)
+  projected` for the player, and `144 in play, 144 projected` for the lasers in a laser-heavy
+  attack; nothing was left without a movement record and no projected position was written back
+  during the render, which is what says the positions being moved are the ones the renderer reads.
+  A replay recorded with the patch plays back on the unpatched game without desyncing, which is the
+  outside check that the logic and the random numbers are untouched.
+
 - **Touhou 11 (Subterranean Animism) gets frame interpolation too** (`26ac150`, `7d08bd2`, `7695746`, `af30cfb`)
 
   Subterranean Animism is the oldest of this batch (2008, a generation before Undefined Fantastic

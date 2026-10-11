@@ -65,7 +65,7 @@ GameFPS = 60
 ; 画出来之后再立刻还原，所以游戏自己的逻辑和随机数完全不受影响。这里没有保存上一帧、也没有做
 ; 反向插值——是单向的向前外推（extrapolation），不是常见的双向插值。
 ;
-; 目前对东方地灵殿（th11）、东方星莲船（th12）、东方神灵庙（th13）、东方辉针城（th14）与东方绀珠传（th15）生效：子弹、自机本体（含子机与自机弹）、
+; 目前对东方风神录（th10）、东方地灵殿（th11）、东方星莲船（th12）、东方神灵庙（th13）、东方辉针城（th14）与东方绀珠传（th15）生效：子弹、自机本体（含子机与自机弹）、
 ; 直线激光会被外推；敌人本体不做，曲线激光不做。开启 ShowOverlay 时，会在左下角「渲染耗时」
 ; 那行字的右边显示实际的呈现帧率。
 ;
@@ -80,7 +80,7 @@ GameFPS = 60
 ; drawn, and put back again, so the game's own logic and its random numbers never see it. No
 ; previous frame is kept and nothing is interpolated backwards - this is forward extrapolation.
 ;
-; Touhou 11, 12, 13, 14 and 15 for now: their bullets, the player itself (with its options and its shots) and
+; Touhou 10, 11, 12, 13, 14 and 15 for now: their bullets, the player itself (with its options and its shots) and
 ; the straight lasers are extrapolated; the enemies aren't interpolated and the curve lasers are
 ; left alone. With ShowOverlay on, the rate the frames are actually presented at is shown next to
 ; the render time line in the bottom left corner.
@@ -280,7 +280,7 @@ CoverTaskbar = 0
 
 `Direct3DCreate9` is hooked to use `Direct3DCreate9Ex` instead, which allows the use of `IDirect3DDevice9Ex::SetMaximumFrameLatency`, which should shave off an additional 0 to 2 frames of input lag. **This only does anything for the old blt model presentation** (native D3D9, or D3D8 through d3d8to9): with dgVoodoo2 the game is presented through a DXGI flip model swapchain, whose queue is already as short as it gets, so there is nothing left for this to save - that flip model is also why dgVoodoo2 measures best for input lag.
 
-Frame interpolation (`Interpolation`) presents every game frame more than once: the game keeps running at its own frame rate, and the patch draws the same state again right after the game's own present, spreading the extra presentations over the rest of the frame (a 60fps game on a 180hz display gets one at 0, half a frame and one frame). ZUN's engine separates the logic from the rendering, so drawing the same state again is safe by itself; for the extra presentations to show motion, the patch moves what is on screen forward by "velocity × the fraction of a frame" before each of them - the same movement the game applies itself - and puts it back right after the render, so the game's own logic never sees the moved positions. The extras go through the device's own Present rather than the hooks tools put in front of it (which measure the input latency assuming one present per game frame, and would report a fraction of a frame with the extras), and the overlay a tool has already built is drawn into every one of them without running any of its UI or input code (holding a direction key won't skip through its menus). Touhou 11, 12, 13, 14 and 15 have this so far: their bullets, the player itself (with its options and its shots) and the straight lasers. The enemies are not interpolated - their animation scripts place them and there is no velocity to read - and the curve lasers are left alone, as the requirements say.
+Frame interpolation (`Interpolation`) presents every game frame more than once: the game keeps running at its own frame rate, and the patch draws the same state again right after the game's own present, spreading the extra presentations over the rest of the frame (a 60fps game on a 180hz display gets one at 0, half a frame and one frame). ZUN's engine separates the logic from the rendering, so drawing the same state again is safe by itself; for the extra presentations to show motion, the patch moves what is on screen forward by "velocity × the fraction of a frame" before each of them - the same movement the game applies itself - and puts it back right after the render, so the game's own logic never sees the moved positions. The extras go through the device's own Present rather than the hooks tools put in front of it (which measure the input latency assuming one present per game frame, and would report a fraction of a frame with the extras), and the overlay a tool has already built is drawn into every one of them without running any of its UI or input code (holding a direction key won't skip through its menus). Touhou 10, 11, 12, 13, 14 and 15 have this so far: their bullets, the player itself (with its options and its shots) and the straight lasers. The enemies are not interpolated - their animation scripts place them and there is no velocity to read - and the curve lasers are left alone, as the requirements say.
 
 Finally, the in-game frame limiter is disabled and a heavily simplified version of vpatch's frame limiter is used.
 
