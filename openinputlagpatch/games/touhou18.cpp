@@ -103,6 +103,48 @@ static bool th18_scene_transforms = false;
 static unsigned char* const th18_tool_frame_address = (unsigned char*)0x004013F5;
 static unsigned char* const th18_tool_draw_address = (unsigned char*)0x00401510;
 
+// The menus draw their text through a list of records the game keeps in the manager it holds at
+// [0x4CF2AC] (thprac calls the global the ASCII manager): drawing a string appends a record (0x138
+// bytes each, at +0xC24 - the append is 0x419B90, which refuses to go past 0x140 of them) and
+// bumps the frame's count of them (+0x19224), and the manager's own draw (0x41A180, the task
+// 0x419940 the setup registers with the draw chain) then walks the records that count covers. The
+// appends happen while the frame is being drawn, so an extra presentation that draws the same
+// screen appends its own records after the ones the game's own pass left behind and draws both -
+// the same text twice, which the alpha blending these screens use turns into text that looks a
+// little denser than the game's own frame shows, or, where the second batch is placed differently,
+// into a second copy of it.
+//
+// The count is put back to what the game's own pass started from before every extra presentation:
+// each one then appends its own records from the start of the list, exactly the way the game's own
+// frame did, and what it leaves behind is what the game's own pass left. The count being reset
+// every frame is the other half of it: that happens in the update pass, which the extra
+// presentations don't replay (the manager's aging task, 0x4198B0, is registered with the update
+// chain at 0x4195AA, and it is what compacts the records and writes the surviving count back).
+//
+// The other values the appends touch (+0x19228, +0x1922B, +0x19244 and so on) are the layout
+// style of the next record, set by the caller before each append; an extra presentation runs the
+// same drawing code and sets them to the same values again, so the count is all that has to go
+// back (the same holds for th12, th14, th15 and th16; th13 needed a handful of them, and if th18's
+// text still comes out a little shifted that is where to look next).
+static void** const th18_text_object = (void**)0x004CF2AC;
+static const size_t th18_text_record_count = 0x19224;
+static unsigned int th18_text_records;
+
+static unsigned int th18_text_count() {
+	void* text = *th18_text_object;
+	return text != nullptr ? *(unsigned int*)((char*)text + th18_text_record_count) : 0;
+}
+
+static void th18_text_records_save() {
+	th18_text_records = th18_text_count();
+}
+
+static void th18_text_records_restore() {
+	void* text = *th18_text_object;
+	if (text != nullptr)
+		*(unsigned int*)((char*)text + th18_text_record_count) = th18_text_records;
+}
+
 // Remembers the viewport, the transforms and the two queue floats the scene is about to be drawn
 // with, then lets the game's own render run exactly as it always did
 static void th18_render_hook() {
@@ -122,6 +164,10 @@ static void th18_render_hook() {
 	// The tool's frame is built by now (it runs from the scene update's return, before this) but
 	// not drawn yet (that happens on the return of the render below): the point to watch it from
 	ToolState::WatchFrameReady(th18_tool_frame_address, th18_tool_draw_address);
+
+	// What the game's own run of the walk finds the text list at, for the extra presentations to
+	// put back (see th18_text_record_count)
+	th18_text_records_save();
 
 	th18_render_objects();
 }
@@ -885,6 +931,9 @@ static void th18_extra_presentation(float t) {
 	th18_bullets_advance(t);
 	th18_player_advance(t);
 	th18_lasers_advance(t);
+	// The text list goes back to how the game's own run of the walk found it, so this presentation
+	// draws the same text that one drew (see th18_text_record_count above)
+	th18_text_records_restore();
 	th18_render_objects();
 	th18_lasers_undo();
 	th18_player_undo();
