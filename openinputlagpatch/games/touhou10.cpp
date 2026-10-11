@@ -582,6 +582,21 @@ void th10_install_patches() {
 		// Hook window update
 		patch_call(0x00438D31, th10_window_update_hook);
 	}
+	{
+		// th10 keeps a frame rate of its own and acts on it: once the rate it works out goes above
+		// the threshold it has at [0x470BB8] it treats the frame as having run too fast, and after
+		// two of those in a row it re-syncs its own clock from the performance counter - after four
+		// it clears that counter's base as well, which is what makes the rate it reports read as 0
+		// for a while (its own source says so: see fps.cpp, the task FUN_004134B0 runs).
+		//
+		// Running the game at its own 60 frames a second never reaches that threshold, but raising
+		// the frame rate does, right away - the rate is that much higher than 60 by design, and the
+		// limiter is what is really pacing the game then. That leaves this protection nothing to act
+		// on and only the re-syncing it does on the way, so it goes: the jump here is the same one
+		// thprac's own th10 module makes (0x413516, `EB 50`) when it is the one running the game.
+		BYTE patch[] = { 0xEB, 0x50 };
+		patch_bytes(0x00413516, patch, sizeof(patch));
+	}
 	if (Config::D3D9Ex) {
 		// Redirect Direct3DCreate9 call
 		// IAT is being hooked, but thcrap also hooks Direct3DCreate9 in the same place
