@@ -89,6 +89,15 @@ static unsigned char* const th12_tool_draw_address = (unsigned char*)0x00462722;
 // The viewport the scene is drawn with, taken from the frame the game's own render ran in
 static D3DVIEWPORT9 th12_scene_viewport = {};
 
+// The two transforms the game sets before its render block (its camera setup calls SetTransform with
+// D3DTS_VIEW and D3DTS_PROJECTION, from the matrices it keeps in the object at 0x4CEC04), taken from
+// the frame the game's own render ran in. An extra presentation runs after the whole frame has been
+// drawn and a menu sets up a camera of its own, so these are put back before the frame is drawn again
+// (see th12_extra_presentation).
+static D3DMATRIX th12_scene_view = {};
+static D3DMATRIX th12_scene_projection = {};
+static bool th12_scene_transforms = false;
+
 // The device the game draws with. The present sites load it from the game's own global, so that is
 // the device that has to present the frame - not the one the patch's D3D9 hook captured, which is
 // the same object while that hook is in place and nothing at all if the game got its device in a
@@ -101,14 +110,52 @@ static IDirect3DDevice9* th12_device() {
 	return d3d9_hooked_device();
 }
 
+// The menus draw their text through a list of records the game keeps in the text object it holds at
+// [0x4B43B8]: the game's own printf-for-text call appends a record (0x138 bytes each, at +0x97C -
+// FUN_004014F0 does that) and bumps the frame's count of them (+0x18F7C), and the drawing then walks
+// the records that count covers (FUN_00401790). The list is started over once per frame - that is
+// part of what the update walk does, which an extra presentation does not run - so an extra frame
+// that draws the same screen while the list still holds the records the game's own frame appended
+// draws that text a second time on top of itself, which the alpha blending these screens use turns
+// into text that looks a little denser than the game's own frame shows.
+//
+// So the count the game's own run of the walk started from is kept here and put back before every
+// extra presentation: each one then appends its own records from the start of the list, exactly the
+// way the game's own frame did.
+static const size_t th12_text_record_count = 0x18F7C;
+static const size_t th12_text_record_array = 0x97C;
+static unsigned int th12_text_records;
+
+static unsigned int th12_text_count() {
+	void* text = *(void**)0x004B43B8;
+	return text != nullptr ? *(unsigned int*)((char*)text + th12_text_record_count) : 0;
+}
+
+static void th12_text_records_save() {
+	th12_text_records = th12_text_count();
+}
+
+static void th12_text_records_restore() {
+	void* text = *(void**)0x004B43B8;
+	if (text != nullptr)
+		*(unsigned int*)((char*)text + th12_text_record_count) = th12_text_records;
+}
+
 // Remembers the viewport the scene is about to be drawn with, then lets the game's own render run
 // exactly as it always did (see th12_extra_presentation for what it's for)
 static void th12_render_hook() {
 	IDirect3DDevice9* device = th12_device();
-	if (device != nullptr)
+	if (device != nullptr) {
 		device->GetViewport(&th12_scene_viewport);
+		th12_scene_transforms = SUCCEEDED(device->GetTransform(D3DTS_VIEW, &th12_scene_view)) &&
+			SUCCEEDED(device->GetTransform(D3DTS_PROJECTION, &th12_scene_projection));
+	}
 
 	ToolState::WatchFrameReady(th12_tool_frame_address, th12_tool_draw_address);
+
+	// What the game's own run of the walk finds the text list at, for the extra presentations to put
+	// back (see th12_text_record_count)
+	th12_text_records_save();
 
 	th12_render_objects();
 }
@@ -832,13 +879,40 @@ static void th12_lasers_undo() {
 	th12_lasers_moved_count = 0;
 }
 
+// The camera setup (0x430910) takes its object - the one the game keeps at 0x4CEC04 - in EDI, which a
+// plain call cannot set, so it goes through this. EDI is callee-saved, so the caller's value is put
+// back before returning.
+static void* const th12_camera_setup_address = (void*)0x00430910;
+
+static void __declspec(naked) th12_camera_setup() {
+	__asm {
+		push edi
+		mov edi, 0x004CEC04
+		call dword ptr [th12_camera_setup_address]
+		pop edi
+		ret
+	}
+}
+
 // One extra presentation of the frame: the same render block the game runs, once more, so the state
 // the game is in is drawn and presented again. The tool's frame is readied again, so the object
 // render below draws its overlay into this presentation the same way it does in the game's own one.
 static void th12_extra_presentation(IDirect3DDevice9* device, float t) {
 	device->BeginScene();
+	if (th12_scene_transforms) {
+		device->SetTransform(D3DTS_VIEW, &th12_scene_view);
+		device->SetTransform(D3DTS_PROJECTION, &th12_scene_projection);
+	}
 	if (th12_scene_viewport.Width != 0)
 		device->SetViewport(&th12_scene_viewport);
+	// The game sets its camera up before its render block and a menu sets those up differently for
+	// itself, so an extra presentation calls the game's own setup again to get the transforms above
+	// plus the two values it leaves in the sprite manager that place the queue on screen.
+	//
+	// The queue is emptied first: the setup draws the queue once on its way in, and with nothing
+	// queued that draw does nothing. The render block below empties it again anyway.
+	th12_reset_sprite_queue();
+	th12_camera_setup();
 	th12_reset_sprite_queue();
 	*(DWORD*)0x004CF278 = 0xFF;
 	th12_prepare_render();
@@ -848,6 +922,9 @@ static void th12_extra_presentation(IDirect3DDevice9* device, float t) {
 	th12_bullets_advance(t);
 	th12_player_advance(t);
 	th12_lasers_advance(t);
+	// The text list goes back to how the game's own run of the walk found it, so this presentation
+	// draws the same text that one drew (see th12_text_record_count above)
+	th12_text_records_restore();
 	th12_render_objects();
 	th12_lasers_undo();
 	th12_undo_shifts();

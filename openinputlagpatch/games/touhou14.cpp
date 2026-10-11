@@ -675,16 +675,64 @@ static unsigned char* const th14_tool_draw_address = (unsigned char*)0x0040149A;
 // the device (the pause screens, for example, render into a smaller part of the back buffer)
 static D3DVIEWPORT9 th14_scene_viewport = {};
 
+// The two transforms the game sets before its render block (its camera setup calls SetTransform with
+// D3DTS_VIEW and D3DTS_PROJECTION, from matrices it keeps in a camera object of its own), taken from
+// the frame the game's own render ran in. An extra presentation runs after the whole frame has been
+// drawn and a menu sets up a camera of its own, so these are put back before the frame is drawn again
+// (see th14_extra_presentation).
+static D3DMATRIX th14_scene_view = {};
+static D3DMATRIX th14_scene_projection = {};
+static bool th14_scene_transforms = false;
+
+// The menus draw their text through a list of records the game keeps in the text object it holds at
+// [0x4DB520]: the game's own printf-for-text call appends a record (0x138 bytes each, at +0xBAC) and
+// bumps the frame's count of them (+0x191AC), and the drawing then walks the records that count
+// covers. The list is started over once per frame - that is part of what the update walk does, which
+// an extra presentation does not run - so an extra frame that draws the same screen while the list
+// still holds the records the game's own frame appended draws that text a second time, with whatever
+// the drawing left in those records: the replay screens' information line comes out twice, offset
+// more and more along it. It only shows from the second extra presentation of a frame on, because
+// that is the one that draws into the same back buffer the game's own frame was presented from.
+//
+// So the count the game's own run of the walk started from is kept here and put back before every
+// extra presentation: each one then appends its own records from the start of the list, exactly the
+// way the game's own frame did.
+static const size_t th14_text_record_count = 0x191AC; // the same field as th13's +0x1915C
+static const size_t th14_text_record_array = 0xBAC;   // the same list as th13's +0xB5C
+static unsigned int th14_text_records;
+
+static unsigned int th14_text_count() {
+	void* text = *(void**)0x004DB520;
+	return text != nullptr ? *(unsigned int*)((char*)text + th14_text_record_count) : 0;
+}
+
+static void th14_text_records_save() {
+	th14_text_records = th14_text_count();
+}
+
+static void th14_text_records_restore() {
+	void* text = *(void**)0x004DB520;
+	if (text != nullptr)
+		*(unsigned int*)((char*)text + th14_text_record_count) = th14_text_records;
+}
+
 // Remembers the viewport the scene is about to be drawn with, then lets the game's own render run
 // exactly as it always did (see th14_extra_presentation for what it's for)
 static void th14_render_hook() {
 	IDirect3DDevice9* device = d3d9_hooked_device();
-	if (device != nullptr)
+	if (device != nullptr) {
 		device->GetViewport(&th14_scene_viewport);
+		th14_scene_transforms = SUCCEEDED(device->GetTransform(D3DTS_VIEW, &th14_scene_view)) &&
+			SUCCEEDED(device->GetTransform(D3DTS_PROJECTION, &th14_scene_projection));
+	}
 
 	// The tool's frame is built by now (it runs from the scene update's return, before this) but
 	// not drawn yet (that happens on the return of the render below): the point to watch it from
 	ToolState::WatchFrameReady(th14_tool_frame_address, th14_tool_draw_address);
+
+	// What the game's own run of the walk finds the text list at, for the extra presentations to put
+	// back (see th14_text_record_count)
+	th14_text_records_save();
 
 	th14_render_objects();
 }
@@ -779,6 +827,11 @@ static void th14_diag_dump() {
 	printf("Wrote oilp_diag.txt\n");
 }
 
+// The camera setup (0x4461E0) takes its object - the one the game keeps at 0x4D93E8 - on the stack
+// and cleans that up itself (ret 4), so it is called like a plain __stdcall function.
+static void* const th14_camera_object = (void*)0x004D93E8;
+static auto th14_camera_setup_fn = (void(__stdcall*)(void*))0x004461E0;
+
 // One extra presentation of the frame: the same render block the game runs, once more, so the state
 // the game is in is drawn and presented again, with the objects projected t frames ahead of it -
 // t = 0 is the state the game's own presentation showed, and the presentations of one frame reach
@@ -792,10 +845,24 @@ static void th14_extra_presentation(float t) {
 		return;
 
 	device->BeginScene();
+	// The game's own pass set the transforms before this point, and the menus change them, so put back
+	// whatever the scene was drawn with (see th14_render_hook)
+	if (th14_scene_transforms) {
+		device->SetTransform(D3DTS_VIEW, &th14_scene_view);
+		device->SetTransform(D3DTS_PROJECTION, &th14_scene_projection);
+	}
 	// The game's own pass set the viewport before this point, and the pause screens and the menus
 	// change it, so put back whatever the scene was drawn with (see th14_render_hook)
 	if (th14_scene_viewport.Width != 0)
 		device->SetViewport(&th14_scene_viewport);
+	// The game sets its camera up before its render block and a menu sets those up differently for
+	// itself, so an extra presentation calls the game's own setup again to get the transforms above
+	// plus the two values it leaves in the sprite manager that place the queue on screen.
+	//
+	// The queue is emptied first: the setup draws the queue once on its way in, and with nothing
+	// queued that draw does nothing. The render block below empties it again anyway.
+	th14_reset_sprite_queue();
+	th14_camera_setup_fn(th14_camera_object);
 	th14_reset_sprite_queue();
 	*(DWORD*)0x004D9960 = 0xFF;
 	th14_prepare_render((void*)0x004D8F60);
@@ -805,6 +872,9 @@ static void th14_extra_presentation(float t) {
 	th14_bullets_advance(t);
 	th14_player_advance(t);
 	th14_lasers_advance(t);
+	// The text list goes back to how the game's own run of the walk found it, so this presentation
+	// draws the same text that one drew (see th14_text_record_count above)
+	th14_text_records_restore();
 	th14_render_objects();
 	th14_lasers_undo();
 	th14_player_undo();

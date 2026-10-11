@@ -91,6 +91,15 @@ static unsigned char* const th13_tool_draw_address = (unsigned char*)0x00470D27;
 // The viewport the scene is drawn with, taken from the frame the game's own render ran in
 static D3DVIEWPORT9 th13_scene_viewport = {};
 
+// The two transforms the game sets before its render block (its camera setup, 0x43B900, calls
+// SetTransform with D3DTS_VIEW and D3DTS_PROJECTION from the matrices it keeps in the object at
+// 0x4DC9D0), taken from the frame the game's own render ran in. An extra presentation runs after the
+// whole frame has been drawn and a menu sets up a camera of its own, so these are put back before the
+// frame is drawn again (see th13_extra_presentation).
+static D3DMATRIX th13_scene_view = {};
+static D3DMATRIX th13_scene_projection = {};
+static bool th13_scene_transforms = false;
+
 // The device the game draws with. The present sites load it from the game's own global, so that is
 // the device that has to present the frame - not the one the patch's D3D9 hook captured, which is
 // the same object while that hook is in place and nothing at all if the game got its device in a
@@ -103,14 +112,65 @@ static IDirect3DDevice9* th13_device() {
 	return d3d9_hooked_device();
 }
 
+// The text the game's screens draw (the pause menu, the replay screens and the small line of replay
+// information the save replay screen shows) is laid out through a pool of per character records in the
+// text object the game keeps at [0x4C2160]. Drawing a line walks that pool, and the game rewinds it
+// once per frame - that is part of what the update walk does, which an extra presentation does not
+// run. An extra frame that draws the same line without rewinding the pool first takes the slice after
+// the one the game's own frame took (the counter at +0x1915C goes 0 -> 0x6B -> 0xD6, so it is the
+// next 107 characters each time), and every character then comes out with the animation state those
+// records were left in by the frame before: the line is drawn a second time, offset more and more
+// along it. This is what the game's own run of the walk starts from, saved in the render hook and put
+// back before every extra presentation, so each one draws the line exactly the way that frame did.
+// The fields are the ones the game's own walk was measured to change, no more.
+struct Th13TextPool {
+	unsigned int write;      // +0x040: where the next character's record is taken from
+	float left_off_x;        // +0x050: where the text was left off
+	float left_off_y;        // +0x054
+	float tail[8];           // +0x3CC: what the characters drawn last left behind
+	unsigned int counter;    // +0x1915C: how far into the pool this frame's text has got
+};
+static Th13TextPool th13_text_pool = {};
+
+static void th13_text_pool_save() {
+	void* text = *(void**)0x004C2160;
+	if (text == nullptr)
+		return;
+	th13_text_pool.write = *(unsigned int*)((char*)text + 0x040);
+	th13_text_pool.left_off_x = *(float*)((char*)text + 0x050);
+	th13_text_pool.left_off_y = *(float*)((char*)text + 0x054);
+	for (int i = 0; i < 8; ++i)
+		th13_text_pool.tail[i] = *(float*)((char*)text + 0x3CC + i * 4);
+	th13_text_pool.counter = *(unsigned int*)((char*)text + 0x1915C);
+}
+
+static void th13_text_pool_restore() {
+	void* text = *(void**)0x004C2160;
+	if (text == nullptr)
+		return;
+	*(unsigned int*)((char*)text + 0x040) = th13_text_pool.write;
+	*(float*)((char*)text + 0x050) = th13_text_pool.left_off_x;
+	*(float*)((char*)text + 0x054) = th13_text_pool.left_off_y;
+	for (int i = 0; i < 8; ++i)
+		*(float*)((char*)text + 0x3CC + i * 4) = th13_text_pool.tail[i];
+	*(unsigned int*)((char*)text + 0x1915C) = th13_text_pool.counter;
+}
+
 // Remembers the viewport the scene is about to be drawn with, then lets the game's own render run
 // exactly as it always did (see th13_extra_presentation for what it's for)
 static void th13_render_hook() {
 	IDirect3DDevice9* device = th13_device();
-	if (device != nullptr)
+	if (device != nullptr) {
 		device->GetViewport(&th13_scene_viewport);
+		th13_scene_transforms = SUCCEEDED(device->GetTransform(D3DTS_VIEW, &th13_scene_view)) &&
+			SUCCEEDED(device->GetTransform(D3DTS_PROJECTION, &th13_scene_projection));
+	}
 
 	ToolState::WatchFrameReady(th13_tool_frame_address, th13_tool_draw_address);
+
+	// What the game's own run of the walk finds the text pool at, for the extra presentations to put
+	// back (see Th13TextPool)
+	th13_text_pool_save();
 
 	th13_render_objects();
 }
@@ -761,14 +821,41 @@ static void th13_lasers_undo() {
 	th13_lasers_moved_count = 0;
 }
 
+// The camera setup (0x43B900) takes its object - the one the game keeps at 0x4DC9D0 - in EDI, which a
+// plain call cannot set, so it goes through this. EDI is callee-saved, so the caller's value is put
+// back before returning.
+static void* const th13_camera_setup_address = (void*)0x0043B900;
+
+static void __declspec(naked) th13_camera_setup() {
+	__asm {
+		push edi
+		mov edi, 0x004DC9D0
+		call dword ptr [th13_camera_setup_address]
+		pop edi
+		ret
+	}
+}
+
 // One extra presentation of the frame: the same render block the game runs, once more, so the state
 // the game is in is drawn and presented again, with the bullets, the player and the lasers projected
 // t frames ahead of it. The tool's frame is readied again, so the object render below draws its
 // overlay into this presentation the same way it does in the game's own one.
 static void th13_extra_presentation(IDirect3DDevice9* device, float t) {
 	device->BeginScene();
+	if (th13_scene_transforms) {
+		device->SetTransform(D3DTS_VIEW, &th13_scene_view);
+		device->SetTransform(D3DTS_PROJECTION, &th13_scene_projection);
+	}
 	if (th13_scene_viewport.Width != 0)
 		device->SetViewport(&th13_scene_viewport);
+	// The game sets its camera up before its render block and a menu sets those up differently for
+	// itself, so an extra presentation calls the game's own setup again to get the transforms above
+	// plus the two values it leaves in the sprite manager that place the queue on screen.
+	//
+	// The queue is emptied first: the setup draws the queue once on its way in, and with nothing
+	// queued that draw does nothing. The render block below empties it again anyway.
+	th13_reset_sprite_queue();
+	th13_camera_setup();
 	th13_reset_sprite_queue();
 	*(DWORD*)0x004DCF30 = 0xFF;
 	th13_prepare_render();
@@ -778,6 +865,9 @@ static void th13_extra_presentation(IDirect3DDevice9* device, float t) {
 	th13_bullets_advance(t);
 	th13_player_advance(t);
 	th13_lasers_advance(t);
+	// The pool the text is laid out in goes back to what the game's own run of the walk started with,
+	// so this presentation draws the same line the way that one did (see Th13TextPool)
+	th13_text_pool_restore();
 	th13_render_objects();
 	th13_player_undo();
 	th13_bullets_undo();
