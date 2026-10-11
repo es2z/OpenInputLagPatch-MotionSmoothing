@@ -304,6 +304,281 @@ static void th18_bullets_undo() {
 	th18_saved_bullets_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player, its shots and its ability cards' effects
+// ---------------------------------------------------------------------------
+//
+// The player of the stage that is running is at 0x4CF410 (FUN_0045AF20 builds it - one 0x479D0
+// byte object - and puts itself there, FUN_0045B020 releases it and clears the pointer). Its own
+// picture is the animation object at +0x14, and the render pass of the player (0x45CAC0, the task
+// the game registers with the draw chain - FUN_0045A7A0 registers it with the task id 0x1D, next
+// to the update at 0x45CAA0 with the id 0x17) copies its position (+0x620, three floats) into that
+// object's position (+0x604 = the object's +0x5F0) before drawing it, so moving the position moves
+// the player's sprite the way the bullets' position moves theirs.
+//
+// Everything else the player puts on screen keeps a sprite object of its own and is positioned by
+// the update instead, so those sprites have to be moved themselves:
+//
+//   - the shots the player fires are 128 slots of 0xF8 bytes at +0x1570 (FUN_0045E930 picks the
+//     first one whose +0x8C is clear and walks them four at a time up to 0x200). A live slot keeps
+//     the sprite object id it is drawn with at +0x08 and a position at +0x48, which the slot's own
+//     update copies into that sprite (+0x5F0) before moving it. Anything a card adds to the
+//     player's fire is a shot like any other and lands in these slots.
+//   - the sprite the player's own shot is drawn with is kept at +0x476B0 (the movement code looks
+//     it up and scales it every frame, and picks a new one out of the table at 0x405BF0 when the
+//     field is empty).
+//   - every ability card the player carries has the animation id of its in-game effect at +0x1C,
+//     which the card's own code looks up as a sprite to put around the player (0x41051E and
+//     0x410AD6 both push [card+0x1C] and call the lookup with it).
+//
+// The sprites those keep are found the way the game finds one from an id (0x488B40, ECX = the
+// sprite manager [0x51F65C], the id on the stack): ids whose low 15 bits are 0x7FFF are on one of
+// the manager's two lists, and every other id is a slot of 0x624 bytes starting at manager+0x700,
+// with the "in use" byte at +0x61C and the id it belongs to at +0x544. The lookup is written out
+// here instead of called: it takes its argument on the stack, and a call through a function
+// pointer is not put together with that in mind - the garbage it gets back hands back a pointer
+// that is not a sprite at all (the same mistake th15 made once).
+//
+// The player moves by what the input says rather than by a velocity that could be read back, and
+// the shots and the card effects move by what comes out of that plus their own motion, so what
+// each sprite moves by in a frame is measured instead of read: every game frame the positions are
+// compared with the ones of the frame before, and the extra presentations move the sprites by that
+// difference times the fraction of a frame they stand for. Something that didn't move - a held
+// picture, a paused game - comes out as zero on its own.
+
+static void** const th18_player = (void**)0x004CF410;
+static const size_t th18_player_position = 0x620;      // the player's own position, 3 floats
+static const size_t th18_player_shot_sprite = 0x476B0; // the sprite its own shot is drawn with
+static const size_t th18_player_shots = 0x1570;        // 128 slots of 0xF8 bytes
+static const size_t th18_player_shot_count = 128;
+static const size_t th18_player_shot_size = 0xF8;
+static const size_t th18_player_shot_live = 0x8C;      // nonzero while the shot is in use
+static const size_t th18_player_shot_sprite_id = 0x08; // the sprite's object id
+static void** const th18_ability_manager = (void**)0x004CF298;
+static const size_t th18_ability_list = 0x1C;          // in it: the first card list node
+static const size_t th18_ability_next = 0x04;          // in a node: the next one
+static const size_t th18_card_effect_sprite = 0x1C;    // in a card: the id of its effect sprite
+static const size_t th18_cards_max = 64;               // the most cards the player can carry
+static void** const th18_sprite_objects = (void**)0x0051F65C;
+static const size_t th18_object_slot_base = 0x700;     // in the manager: the slots by id
+static const size_t th18_object_slot_size = 0x624;
+static const size_t th18_object_in_use = 0x61C;        // in a slot: the "in use" byte
+static const size_t th18_object_id = 0x544;            // in a slot: the id it belongs to
+static const size_t th18_object_position = 0x5F0;      // in a sprite object, 3 floats
+// Nothing on screen moves this far in one frame (the player's own speed is a few pixels), so a
+// difference bigger than this is a slot that was handed to another object, not a movement
+static const float th18_max_step = 48.0f;
+
+// One thing to move for an extra presentation: the sprite object whose position is shifted. What
+// the sprite moved by is measured on that same position, so the entry only has to remember it.
+static const size_t th18_tracked_max = 1 + 1 + th18_player_shot_count + th18_cards_max;
+
+struct Th18SpriteMotion {
+	void* sprite;         // the sprite object it is about, null while the entry is free
+	unsigned int frame;   // the frame it was last measured in
+	float last_x, last_y;
+	float delta_x, delta_y;
+};
+
+static Th18SpriteMotion th18_motions[th18_tracked_max];
+static unsigned int th18_motion_frame = 1;
+static float* th18_tracked[th18_tracked_max];
+static size_t th18_tracked_count;
+static float th18_tracked_saved[th18_tracked_max][3];
+
+// Diagnostics: the largest movement the player's own position had since the last dump
+static float th18_player_movement;
+// Diagnostics: how many sprites this frame couldn't be given a movement record (see
+// th18_sprite_motion - it should stay 0)
+static unsigned int th18_sprites_untracked;
+
+// The sprite object an id refers to: the same lookup the game does (0x488B40), written out instead
+// of called (see the comment above).
+static void* th18_object_by_id(unsigned int id) {
+	const unsigned int index = id & 0x7FFF;
+	if (id == 0 || index == 0x7FFF)
+		return nullptr;
+
+	void* manager = *th18_sprite_objects;
+	if (manager == nullptr)
+		return nullptr;
+
+	char* object = (char*)manager + th18_object_slot_base + (size_t)index * th18_object_slot_size;
+	if (*(unsigned char*)(object + th18_object_in_use) == 0)
+		return nullptr;
+	if (*(unsigned int*)(object + th18_object_id) != id)
+		return nullptr;
+	return object;
+}
+
+// The record of a sprite, made the first time it is seen.
+//
+// Nothing tells a sprite that is gone from a slot that is still up, so a record can't be dropped
+// when its sprite stops being drawn - which means they have to be recycled instead. Without that,
+// everything a stage ever puts on screen keeps a record of its own, the table fills up, and from
+// then on every sprite that isn't in it already quietly stops being moved (the player itself is
+// the first to suffer when a stage is started again, since it is built at another address then).
+//
+// The one that was measured longest ago is the one recycled: a record that wasn't measured in the
+// frame right before this one has nothing to compare against anyway. A record that is in use this
+// frame is never taken, so the sprite it belongs to keeps moving with the others.
+static Th18SpriteMotion* th18_sprite_motion(void* sprite) {
+	Th18SpriteMotion* empty = nullptr;
+	Th18SpriteMotion* oldest = nullptr;
+	for (size_t i = 0; i < th18_tracked_max; ++i) {
+		Th18SpriteMotion& motion = th18_motions[i];
+		if (motion.sprite == sprite)
+			return &motion;
+		if (motion.sprite == nullptr) {
+			if (empty == nullptr)
+				empty = &motion;
+			continue;
+		}
+		if (motion.frame == th18_motion_frame)
+			continue;
+		if (oldest == nullptr || motion.frame < oldest->frame)
+			oldest = &motion;
+	}
+
+	Th18SpriteMotion* motion = empty != nullptr ? empty : oldest;
+	if (motion == nullptr)
+		return nullptr;
+	motion->sprite = sprite;
+	motion->frame = 0;
+	motion->last_x = 0.0f;
+	motion->last_y = 0.0f;
+	motion->delta_x = 0.0f;
+	motion->delta_y = 0.0f;
+	return motion;
+}
+
+// Adds a sprite to what this frame moves, and works out what it moved by since the frame before
+static void th18_track(float* position) {
+	if (th18_tracked_count >= th18_tracked_max)
+		return;
+	// Two ids can name the same sprite (the game doesn't mind), and moving one twice would put it
+	// twice as far out and only be able to put back one of the two
+	for (size_t i = 0; i < th18_tracked_count; ++i) {
+		if (th18_tracked[i] == position)
+			return;
+	}
+	Th18SpriteMotion* motion = th18_sprite_motion(position);
+	if (motion == nullptr) {
+		++th18_sprites_untracked;
+		return;
+	}
+
+	const float x = position[0];
+	const float y = position[1];
+
+	// Only a sprite that was measured in the frame right before this one has something to compare
+	// against (one that just appeared, or that came back after the game didn't draw for a while,
+	// hasn't moved as far as this can tell)
+	if (motion->frame + 1 == th18_motion_frame) {
+		const float dx = x - motion->last_x;
+		const float dy = y - motion->last_y;
+		// The pools hand their slots out again, and the object that used to be there is somewhere
+		// else entirely - that difference is not something to project
+		if (dx > -th18_max_step && dx < th18_max_step && dy > -th18_max_step && dy < th18_max_step) {
+			motion->delta_x = dx;
+			motion->delta_y = dy;
+		} else {
+			motion->delta_x = 0.0f;
+			motion->delta_y = 0.0f;
+		}
+	} else {
+		motion->delta_x = 0.0f;
+		motion->delta_y = 0.0f;
+	}
+	motion->frame = th18_motion_frame;
+	motion->last_x = x;
+	motion->last_y = y;
+
+	th18_tracked[th18_tracked_count++] = position;
+}
+
+// Collects what is on screen this frame and works out what it moved by since the frame before.
+// This runs once per game frame, from the game's own present (see th18_present_hook).
+static void th18_player_measure() {
+	th18_tracked_count = 0;
+	th18_sprites_untracked = 0;
+	++th18_motion_frame;
+
+	void* player = *th18_player;
+	if (player == nullptr)
+		return;
+
+	// The player itself: its own position is what the render pass reads
+	th18_track((float*)((char*)player + th18_player_position));
+	if (th18_tracked_count > 0) {
+		const Th18SpriteMotion* motion = th18_sprite_motion(th18_tracked[0]);
+		if (motion != nullptr) {
+			const float x = motion->delta_x < 0.0f ? -motion->delta_x : motion->delta_x;
+			const float y = motion->delta_y < 0.0f ? -motion->delta_y : motion->delta_y;
+			const float magnitude = x > y ? x : y;
+			if (magnitude > th18_player_movement)
+				th18_player_movement = magnitude;
+		}
+	}
+
+	// The sprite the player's own shot is drawn with: the update keeps it on the player
+	{
+		void* object = th18_object_by_id(*(unsigned int*)((char*)player + th18_player_shot_sprite));
+		if (object != nullptr)
+			th18_track((float*)((char*)object + th18_object_position));
+	}
+
+	// The shots, which are only measured while they are up
+	for (size_t i = 0; i < th18_player_shot_count; ++i) {
+		const char* slot = (const char*)player + th18_player_shots + i * th18_player_shot_size;
+		if (*(const int*)(slot + th18_player_shot_live) == 0)
+			continue;
+		void* object = th18_object_by_id(*(const unsigned int*)(slot + th18_player_shot_sprite_id));
+		if (object == nullptr)
+			continue;
+		th18_track((float*)((char*)object + th18_object_position));
+	}
+
+	// The effect sprite of every ability card the player carries, which the card's code puts
+	// around the player (see the comment above)
+	void* cards = *th18_ability_manager;
+	if (cards != nullptr) {
+		void* node = *(void**)((char*)cards + th18_ability_list);
+		for (size_t guard = 0; node != nullptr && guard < th18_cards_max * 4; ++guard) {
+			void* card = *(void**)node;
+			if (card != nullptr) {
+				void* object = th18_object_by_id(*(const unsigned int*)((char*)card + th18_card_effect_sprite));
+				if (object != nullptr)
+					th18_track((float*)((char*)object + th18_object_position));
+			}
+			node = *(void**)((char*)node + th18_ability_next);
+		}
+	}
+}
+
+// Moves the player, its shots and its cards' effect sprites t frames ahead of the state the game
+// is in, and remembers what it changed
+static void th18_player_advance(float t) {
+	for (size_t i = 0; i < th18_tracked_count; ++i) {
+		float* position = th18_tracked[i];
+		for (int axis = 0; axis < 3; ++axis)
+			th18_tracked_saved[i][axis] = position[axis];
+		const Th18SpriteMotion* motion = th18_sprite_motion(position);
+		if (motion != nullptr) {
+			position[0] += motion->delta_x * t;
+			position[1] += motion->delta_y * t;
+		}
+	}
+}
+
+static void th18_player_undo() {
+	for (size_t i = 0; i < th18_tracked_count; ++i) {
+		float* position = th18_tracked[i];
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = th18_tracked_saved[i][axis];
+	}
+}
+
 // The number of presentations per second the config asks for. 0 means interpolation is off.
 //
 // "-1" picks the largest multiple of the game's frame rate that still fits the display refresh
@@ -362,6 +637,13 @@ static void th18_diag_dump() {
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th18_bullets_in_play, th18_bullets_moved);
+	fprintf(file, "player: %u sprite(s) moved (the player, its shots and its cards' effects)\n",
+		(unsigned int)th18_tracked_count);
+	fprintf(file, "player: %u sprite(s) this frame had no movement record (should stay 0)\n",
+		th18_sprites_untracked);
+	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n",
+		th18_player_movement);
+	th18_player_movement = 0.0f;
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -426,7 +708,9 @@ static void th18_extra_presentation(float t) {
 	// The objects are drawn where they will be t frames from now; the render bakes the positions
 	// into the sprite queue, so they can go back right after it
 	th18_bullets_advance(t);
+	th18_player_advance(t);
 	th18_render_objects();
+	th18_player_undo();
 	th18_bullets_undo();
 	th18_draw_sprite_queue(*th18_sprite_manager);
 	device->SetTexture(0, nullptr);
@@ -456,6 +740,11 @@ static HRESULT th18_present_hook() {
 
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
+
+	// The game's own update has run and it is about to put that frame on screen: this is the one
+	// point per frame where the movement of the player, its shots and its cards' effects can be
+	// measured
+	th18_player_measure();
 
 	// The game's own presentation of this frame, through the device it drew with, so that the
 	// hooks the user's tools have on it still see it
