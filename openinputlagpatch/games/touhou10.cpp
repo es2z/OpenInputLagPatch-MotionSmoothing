@@ -246,6 +246,149 @@ static void th10_fps_restore(bool as_presentation) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: project the bullets forward
+// ---------------------------------------------------------------------------
+//
+// A stage's bullets live in the manager at [0x4776F0], which FUN_00406060 allocates as one
+// 0x3E0B54 byte block and FUN_00405E20 fills in: it loads bullet.anm into manager+0x3E0B50, points
+// manager+0x10 at the pool that starts at manager+0x60 and holds 2001 bullets of 0x7F0 bytes each,
+// and registers the manager's two tasks - the update one (thunk 0x406770) and the draw one (thunk
+// 0x4067A0).
+//
+// The update (FUN_004065C0) clears the six column heads at manager+0x14 and the six tails at
+// manager+0x2C, walks the pool, runs every bullet whose state at +0x446 is not 0 through
+// FUN_00406240, and threads it onto the list of the column it keeps as a float at +0x460; the link
+// to the next bullet of its column is its own +0x44C, and the count of the ones in play is at
+// manager+0x5C. The draw (FUN_004066E0, which the draw thunk calls once per column) walks those
+// same lists, so they are exactly the bullets that get drawn - that is the list walked here, and it
+// is read after the game's own update ran, which is the case by the time a frame is presented.
+//
+// A bullet moves by its velocity: FUN_00406240 adds the three floats at +0x3C0/+0x3C4/+0x3C8 to
+// the position at +0x3B4/+0x3B8/+0x3BC, scaled by the global 0x476F78, once per frame. It moves at
+// half of that while its state at +0x446 is 2 or 3 (that half is the float at 0x470B0C), and not at
+// all in any other state. The draw follows on its own: FUN_004066E0 copies the position into the
+// fields at +0x33C/+0x340/+0x344 (adding the play field's own origin, 224.0f at 0x470B4C and 16.0f
+// at 0x470B48) right before it hands the bullet to the queue, so moving the position is enough -
+// the same rule as in th11 to th15.
+
+static void** const th10_bullet_manager = (void**)0x004776F0;
+static const size_t th10_bullet_lists = 0x14;      // in the manager: the first column's head
+static const size_t th10_bullet_columns = 6;       // ...and how many columns there are
+static const size_t th10_bullet_next = 0x44C;      // in a bullet: the next one of its column
+static const size_t th10_bullet_position = 0x3B4;  // in a bullet: its position, 3 floats
+static const size_t th10_bullet_velocity = 0x3C0;  // in a bullet: what it moves by, 3 floats
+static const size_t th10_bullet_state = 0x446;     // in a bullet: what it's doing, 16 bits
+// The factor the game scales every movement with (1 unless it is slowing everything down)
+static float* const th10_time_scale = (float*)0x00476F78;
+// How many of the game's updates it runs per rendered frame, minus one
+static unsigned char* const th10_frames_per_render = (unsigned char*)0x00491D66;
+// The half a bullet in state 2 or 3 moves by (the game multiplies by this one, 0.5)
+static float* const th10_half_step = (float*)0x00470B0C;
+// The object of the pause screen while it is up, and the flags of it the bullet tasks look at
+static void** const th10_pause_object = (void**)0x00477810;
+static const size_t th10_pause_flags = 0x58;
+
+// The pool holds 2001 bullets, so the lists of the ones in play can't be longer
+static const size_t th10_bullets_saved_max = 2001;
+struct Th10SavedBullet {
+	void* bullet;
+	float position[3];
+};
+static Th10SavedBullet th10_saved_bullets[th10_bullets_saved_max];
+static size_t th10_saved_bullets_count;
+
+// What the last game frame had in play and how much of it was projected forward, for the
+// diagnostics dump below
+static unsigned int th10_bullets_in_play;
+static unsigned int th10_bullets_moved;
+
+// Whether the pause screen has the picture held. A picture the game isn't updating (or isn't
+// drawing) must not be moved forward either. 0x406770 and 0x4067A0 are the game's two bullet
+// tasks, and this is the same test each of them makes - plus the one the pool walk makes per
+// bullet (a held picture leaves the bullets in their lists but doesn't run them).
+static bool th10_held() {
+	void* pause = *th10_pause_object;
+	if (pause == nullptr)
+		return false;
+	const unsigned int flags = *(unsigned int*)((char*)pause + th10_pause_flags);
+	if (((flags | (flags >> 2)) & 1) != 0 || (flags & 4) != 0)
+		return true;
+	return (flags & 2) != 0 && (flags & 0x400) != 0;
+}
+
+// How much of a frame's movement a bullet in this state gets (FUN_00406240)
+static float th10_bullet_step_factor(unsigned short state) {
+	switch (state) {
+	case 1:
+		return 1.0f;
+	case 2:
+	case 3:
+		return *th10_half_step;
+	default:
+		return 0.0f;
+	}
+}
+
+// Moves every bullet in play forward by t frames and remembers what it changed
+static void th10_bullets_advance(float t) {
+	th10_saved_bullets_count = 0;
+	th10_bullets_in_play = 0;
+	th10_bullets_moved = 0;
+
+	void* manager = *th10_bullet_manager;
+	if (manager == nullptr || th10_held())
+		return;
+
+	unsigned int frames_per_render = *th10_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	// The factor the game's own update multiplies every movement by, as it is right now - a bullet
+	// that isn't moving for the game isn't moved here either
+	float scale = *th10_time_scale;
+	if (!(scale >= 0.0f && scale <= 2.0f))
+		scale = 1.0f;
+
+	const float step = t * (float)(frames_per_render + 1) * scale;
+
+	for (size_t column = 0; column < th10_bullet_columns; ++column) {
+		void* bullet = *(void**)((char*)manager + th10_bullet_lists + column * 4);
+		for (size_t guard = 0; bullet != nullptr && guard < th10_bullets_saved_max; ++guard) {
+			void* next = *(void**)((char*)bullet + th10_bullet_next);
+
+			++th10_bullets_in_play;
+			const float factor = th10_bullet_step_factor(*(unsigned short*)((char*)bullet + th10_bullet_state));
+			if (factor != 0.0f && th10_saved_bullets_count < th10_bullets_saved_max) {
+				float* position = (float*)((char*)bullet + th10_bullet_position);
+				const float* velocity = (const float*)((char*)bullet + th10_bullet_velocity);
+				Th10SavedBullet& saved = th10_saved_bullets[th10_saved_bullets_count++];
+				saved.bullet = bullet;
+
+				const float bullet_step = step * factor;
+				for (int axis = 0; axis < 3; ++axis) {
+					saved.position[axis] = position[axis];
+					position[axis] += velocity[axis] * bullet_step;
+				}
+				++th10_bullets_moved;
+			}
+
+			bullet = next;
+		}
+	}
+}
+
+// Puts the positions of every bullet th10_bullets_advance moved back
+static void th10_bullets_undo() {
+	for (size_t i = 0; i < th10_saved_bullets_count; ++i) {
+		const Th10SavedBullet& saved = th10_saved_bullets[i];
+		float* position = (float*)((char*)saved.bullet + th10_bullet_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = saved.position[axis];
+	}
+	th10_saved_bullets_count = 0;
+}
+
 // Puts the sprite queue back to empty, the way the frame function inlines it (0x43949C)
 static void th10_reset_sprite_queue() {
 	void* manager = *(void**)th10_sprite_manager;
@@ -339,6 +482,8 @@ static void th10_diag_dump() {
 	fprintf(file, "logic frame rate: %.2f, configured presentation rate: %.2f\n",
 		Limiter::game_fps, th10_present_rate());
 	fprintf(file, "frames recorded: %u\n", count);
+	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
+		th10_bullets_in_play, th10_bullets_moved);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -412,10 +557,14 @@ static void th10_extra_presentation(IDirect3DDevice9* device, float t) {
 	// Same for the game's own frame rate accounting: this presentation shows the rate the game's
 	// own frame showed and isn't counted as a frame of its own (see th10_fps above)
 	th10_fps_restore(true);
+	// Everything is drawn where it will be t frames from now; the render bakes those positions into
+	// what it draws, so they can all go back right after it
+	th10_bullets_advance(t);
 	// Nothing to render into an empty scene, and the walk itself would read the object it is handed
 	void* scene = *th10_scene;
 	if (scene != nullptr)
 		th10_render_objects(scene);
+	th10_bullets_undo();
 	// The walk just ran the game's rate task, so what it made of that has to go back as well
 	th10_fps_restore(false);
 	th10_draw_sprite_queue();
