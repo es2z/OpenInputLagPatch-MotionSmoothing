@@ -203,6 +203,245 @@ static void** th19_sprite_manager = (void**)rebase(0x005D19BC);
 // The dword the render block sets to 0xFF (and back to 0) around its first draw of the queue
 static DWORD* th19_render_flag = (DWORD*)rebase(0x0062C70C);
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: project the bullets forward
+// ---------------------------------------------------------------------------
+//
+// th19 is a 1v1 game, so it doesn't have one bullet manager: it has one per side, and the side
+// table they are kept in is at 0x5D1A60 with a stride of 0x3C - side 0's manager is the dword
+// there, side 1's the one 0x3C later (the table's own layout was read out of the constructor
+// FUN_00530AE0, which stores the object it builds at table + 0x14, and out of the bullet
+// manager's constructor FUN_004F6470, which stores itself at +0). The object is a pool of 2001
+// bullets of 0x1088 bytes, plus two tasks (the update at 0x25 and the draw at 0x29).
+//
+// A bullet keeps its position at +0x650 (three floats) and its velocity at +0x65C (three), and
+// the game moves it the way th18's bullets move: position += velocity * the global scale. The
+// code that does it is at 0x4F5D4E, inside the per bullet update FUN_004F5680:
+//
+//     0x4F5D4E  test [bullet+0x10], 200h      a held bullet is not moved (and not drawn)
+//     0x4F5D55  jne  0x4F5E64
+//     0x4F5D5B  movss xmm2, [0x5C6418]        the scale the game applies to every movement
+//     0x4F5D69  mulss xmm0, [bullet+0x65C]    velocity.x
+//     0x4F5D71  mulss xmm1, [bullet+0x660]    velocity.y
+//     0x4F5D79  mulss xmm2, [bullet+0x664]    velocity.z
+//     0x4F5D81  addss xmm0, [bullet+0x650]    + position.x
+//     0x4F5D89  addss xmm1, [bullet+0x654]    + position.y
+//     0x4F5D91  addss xmm2, [bullet+0x658]    + position.z
+//
+// with the velocity itself coming out of the bullet's speed and angle (FUN_004F08A0:
+// cos([bullet+0x670]) * the speed into +0x65C, sin(...) into +0x660).
+//
+// Two things about the scale: the game doesn't necessarily move a bullet by the global scale as
+// it stands - before it moves one whose state (+0x1044) isn't 2, 3 or 4 it copies two of that
+// bullet's own factors into the global ([bullet+0x1038] * [bullet+0x1024], see the top of
+// FUN_004F5680), so the scale a bullet moves by is the one it carries. The global dword is a
+// scratch the sub-functions read, not the per frame setting th18's is, so it isn't read here.
+// The state 2/3/4 bullets keep whatever the scale already was; they are moved with 1 (the value
+// the per bullet code leaves behind), which is what the other games' half stepping amounts to
+// being absent here.
+//
+// The bullets in play are the ones on the six layer chains the update walk (FUN_004F4C30) builds
+// every frame: the heads are at manager+0x14 (the tails at +0x2C), one chain per layer, threaded
+// through bullet+0x6B8, and the layer a bullet belongs to is at +0x6C0. That walk is the only
+// thing that moves bullets - the wrapper that also moves them, FUN_004F55C0, isn't called from
+// anywhere in this build - and the extra presentations only run the render walk, so a bullet is
+// never stepped twice by them.
+//
+// The sprites are the other half: the update walk copies a bullet's position into the sprite
+// object it found for the bullet's id at +0x64C, and it is that copy the draw walk puts on
+// screen. Since the update walk isn't replayed, an extra presentation has to move the copy as
+// well as the bullet. The sprite is looked up here rather than through the game's own lookup
+// (FUN_004CB8B0, whose array branch is reproduced): slot = [0x5D19BC] + 0x754 + (id & 0xFFFF) *
+// 0x64C, with the id at +0x4D8, the in use byte at +0x644 and the position at +0x614.
+
+// The side table the bullet managers are kept in, and how far apart its entries are
+static char* th19_side_table = (char*)rebase(0x005D1A60);
+static const size_t th19_side_stride = 0x3C;
+
+// In a bullet manager: the six layer chains the update walk builds (heads, then tails), and in a
+// bullet: where it is, where it is going, and what it is doing
+static const size_t th19_bullet_layers = 6;
+static const size_t th19_bullet_layer_head = 0x14;
+static const size_t th19_bullet_layer_next = 0x6B8;
+static const size_t th19_bullet_position = 0x650;
+static const size_t th19_bullet_velocity = 0x65C;
+static const size_t th19_bullet_flags = 0x10;     // 0x200 holds it (it is neither moved nor drawn)
+static const size_t th19_bullet_state = 0x1044;
+static const size_t th19_bullet_scale_a = 0x1038; // the two factors the game copies into the
+static const size_t th19_bullet_scale_b = 0x1024; // global scale before it moves the bullet
+static const size_t th19_bullet_sprite = 0x64C;   // the id of the sprite that draws it
+
+// In the sprite manager: how to find a sprite by id, and where its drawn position is
+static const size_t th19_sprite_stride = 0x64C;
+static const size_t th19_sprite_base = 0x754;
+static const size_t th19_sprite_in_use = 0x644;
+static const size_t th19_sprite_id = 0x4D8;
+static const size_t th19_sprite_position = 0x614;
+
+// How many of the game's updates it runs per rendered frame, minus one (the game never writes it)
+static unsigned char* th19_frames_per_render = (unsigned char*)rebase(0x0062BDDC);
+// The game's own thread/state object, whose flags say whether the picture is held
+static void** th19_game_object = (void**)rebase(0x005D1A54);
+static const size_t th19_game_flags = 0x140;
+
+// The sprite a bullet's id names, or null if there is none (the array branch of the game's own
+// lookup, reproduced - see the comment above)
+static void* th19_sprite_for_id(unsigned int id) {
+	void* manager = *th19_sprite_manager;
+	if (manager == nullptr || id == 0)
+		return nullptr;
+
+	if ((id & 0xFFFF) == 0xFFFF) {
+		// The ids 0xFFFF and up are kept on the manager's own lists instead (two of them, each with
+		// two ends), whose nodes hold the sprite and the next node
+		static const size_t heads[] = { 0x714, 0x71C, 0x734, 0x73C };
+		for (size_t i = 0; i < sizeof(heads) / sizeof(heads[0]); ++i) {
+			for (void* node = *(void**)((char*)manager + heads[i]); node != nullptr;
+				node = *(void**)((char*)node + 4)) {
+				void* sprite = *(void**)node;
+				if (sprite != nullptr && *(unsigned int*)((char*)sprite + th19_sprite_id) == id)
+					return sprite;
+			}
+		}
+		return nullptr;
+	}
+
+	char* sprite = (char*)manager + th19_sprite_base + (size_t)(id & 0xFFFF) * th19_sprite_stride;
+	if (sprite[th19_sprite_in_use] == 0 || *(unsigned int*)(sprite + th19_sprite_id) != id)
+		return nullptr;
+	return sprite;
+}
+
+// Whether the picture is held: the bullet tasks stop for these, and a picture the game is not
+// updating must not be moved forward either
+static bool th19_bullets_held() {
+	void* game = *th19_game_object;
+	if (game == nullptr)
+		return false;
+	// The update task stops for the low bits and for 0x800, the draw task for bit 2 (see
+	// FUN_004F4950 and FUN_004F4C30)
+	const unsigned int flags = *(unsigned int*)((char*)game + th19_game_flags);
+	return ((flags | (flags >> 2)) & 1) != 0 || (flags & 4) != 0 || (flags & 0x800) != 0;
+}
+
+// The scale a bullet moves by: the one the game copies into its global scale before moving it, or
+// 1 for the states that don't get that copy and for anything that doesn't look like a scale
+static float th19_bullet_step_scale(const void* bullet) {
+	const int state = *(const int*)((const char*)bullet + th19_bullet_state);
+	if (state == 2 || state == 3 || state == 4)
+		return 1.0f;
+
+	float scale = *(const float*)((const char*)bullet + th19_bullet_scale_a) *
+		*(const float*)((const char*)bullet + th19_bullet_scale_b);
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+	return scale;
+}
+
+// The bullets that were moved for the presentation being drawn, where they were, and where the
+// sprites that draw them were. Both sides together can have 2001 bullets each, so a little more
+// than that is the most this list can hold; only the bullets that were saved are moved, so a list
+// that somehow grew past that would only cost the projection of the bullets at its end.
+static const size_t th19_bullets_saved_max = 2001 * 2;
+struct Th19SavedBullet {
+	float* position;      // in the bullet: where it is
+	float position_value[3];
+	float* sprite;        // in the sprite that draws it: where it is drawn, or null
+	float sprite_value[3];
+};
+static Th19SavedBullet th19_saved_bullets[th19_bullets_saved_max];
+static size_t th19_saved_bullets_count;
+
+// What the last presentation projected, for the diagnostics (see th19_diag_dump)
+static unsigned int th19_bullets_in_play;
+static unsigned int th19_bullets_moved;
+static unsigned int th19_bullets_no_sprite_id;   // drawn without a sprite object of their own
+static unsigned int th19_bullets_no_sprite;      // ...or with an id no sprite was found for
+
+// Moves every bullet in play forward by t frames (t = 0 is the state the game is in) and remembers
+// what it changed, so th19_bullets_undo can put it back.
+static void th19_bullets_advance(float t) {
+	th19_saved_bullets_count = 0;
+	th19_bullets_in_play = 0;
+	th19_bullets_moved = 0;
+	th19_bullets_no_sprite_id = 0;
+	th19_bullets_no_sprite = 0;
+
+	if (th19_bullets_held())
+		return;
+
+	unsigned int frames_per_render = *th19_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	for (size_t side = 0; side < 2; ++side) {
+		char* manager = *(char**)(th19_side_table + th19_side_stride * side);
+		if (manager == nullptr)
+			continue;
+
+		for (size_t layer = 0; layer < th19_bullet_layers; ++layer) {
+			void* bullet = *(void**)(manager + th19_bullet_layer_head + layer * 4);
+			// The list is the game's own and this runs where nothing can change it; the bound is
+			// only so a list that got broken some other way can't run away with the frame
+			for (size_t guard = 0; bullet != nullptr && guard < th19_bullets_saved_max * 4; ++guard) {
+				void* next = *(void**)((char*)bullet + th19_bullet_layer_next);
+				const unsigned int flags = *(const unsigned int*)((char*)bullet + th19_bullet_flags);
+				// A held bullet is neither moved nor drawn, so there is nothing to project for it
+				if ((flags & 0x200) == 0) {
+					++th19_bullets_in_play;
+					if (th19_saved_bullets_count < th19_bullets_saved_max) {
+						const float step = t * (float)(frames_per_render + 1) * th19_bullet_step_scale(bullet);
+						float* position = (float*)((char*)bullet + th19_bullet_position);
+						const float* velocity = (const float*)((char*)bullet + th19_bullet_velocity);
+						Th19SavedBullet& saved = th19_saved_bullets[th19_saved_bullets_count++];
+						saved.position = position;
+
+						// The sprite's copy of the position is what the draw walk puts on screen, and
+						// the update walk that writes it isn't replayed - so it has to be moved too
+						const unsigned int sprite_id =
+							*(const unsigned int*)((char*)bullet + th19_bullet_sprite);
+						if (sprite_id == 0)
+							++th19_bullets_no_sprite_id;
+						void* sprite = th19_sprite_for_id(sprite_id);
+						saved.sprite = sprite != nullptr
+							? (float*)((char*)sprite + th19_sprite_position)
+							: nullptr;
+						if (saved.sprite == nullptr && sprite_id != 0)
+							++th19_bullets_no_sprite;
+
+						for (int axis = 0; axis < 3; ++axis) {
+							saved.position_value[axis] = position[axis];
+							position[axis] += velocity[axis] * step;
+						}
+						if (saved.sprite != nullptr) {
+							for (int axis = 0; axis < 3; ++axis) {
+								saved.sprite_value[axis] = saved.sprite[axis];
+								saved.sprite[axis] = position[axis];
+							}
+						}
+						++th19_bullets_moved;
+					}
+				}
+				bullet = next;
+			}
+		}
+	}
+}
+
+// Puts the positions back, so the game's own logic sees the state it left behind and not the
+// projected one.
+static void th19_bullets_undo() {
+	for (size_t i = 0; i < th19_saved_bullets_count; ++i) {
+		const Th19SavedBullet& saved = th19_saved_bullets[i];
+		for (int axis = 0; axis < 3; ++axis) {
+			saved.position[axis] = saved.position_value[axis];
+			if (saved.sprite != nullptr)
+				saved.sprite[axis] = saved.sprite_value[axis];
+		}
+	}
+	th19_saved_bullets_count = 0;
+}
+
 // What the scene is drawn with, taken off the device in the render hook (the frame functions never
 // set it, but the menus do, so an extra presentation has to put back whatever the scene that was
 // just drawn used)
@@ -300,6 +539,14 @@ static void th19_diag_dump() {
 	fprintf(file, "configured game frame rate: %u, thprac's frame rate: %.2f\n",
 		Config::GameFPS, th19_external_rate());
 	fprintf(file, "frames recorded: %u\n", count);
+	fprintf(file, "bullets: %u in play, %u projected forward (both sides, last presentation)\n",
+		th19_bullets_in_play, th19_bullets_moved);
+	// Not an error either way: a bullet without a sprite id is drawn from its own position (the
+	// draw walk copies it there itself, see th19_extra_presentation), and a bullet whose sprite
+	// wasn't found is one the game's own update walk doesn't find one for either - it looks the
+	// same id up the same way. Both numbers are here to tell those from a lookup that broke.
+	fprintf(file, "bullets: %u had no sprite id, %u had an id whose sprite wasn't found\n",
+		th19_bullets_no_sprite_id, th19_bullets_no_sprite);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -328,7 +575,10 @@ static void th19_diag_dump() {
 // game is in is drawn and presented again. The game's own presentation is the first one of a frame
 // and the extras are spread over the rest of it, right where the game would otherwise sit and wait
 // for the next one, so they land on the display's refresh evenly.
-static void th19_extra_presentation() {
+//
+// t is where this presentation sits between the game's own one and the next one, i.e. how far the
+// objects it draws are moved forward; t = 0 is the state the game's own presentation showed.
+static void th19_extra_presentation(float t) {
 	IDirect3DDevice9* device = d3d9_hooked_device();
 	if (device == nullptr)
 		return;
@@ -349,10 +599,13 @@ static void th19_extra_presentation() {
 	*th19_render_flag = 0;
 	device->SetRenderState(D3DRS_FOGENABLE, 0);
 
-	// The queue was just reset, so the objects have to be drawn again to fill it - this is where
-	// the projection of stage 1 will go, right before the render
+	// The queue was just reset, so the objects have to be drawn again to fill it. The bullets are
+	// drawn where they will be t frames from now; the render bakes the positions into the sprite
+	// queue, so they can go back right after it.
 	ToolState::ReadyToDraw();
+	th19_bullets_advance(t);
 	th19_render_objects();
+	th19_bullets_undo();
 	th19_draw_sprite_queue(*th19_sprite_manager);
 
 	device->SetTexture(0, nullptr);
@@ -484,7 +737,10 @@ static HRESULT th19_present_hook() {
 						QueryPerformanceCounter(&present_time[presents]);
 					++presents;
 
-					th19_extra_presentation();
+					// Where this presentation sits between the game's own one and the next one:
+					// the frames of one game frame are spread evenly over it, so the k-th of
+					// extras + 1 of them draws the state k/(extras + 1) frames along
+					th19_extra_presentation((float)k / (float)(extras + 1));
 				}
 			}
 		}
