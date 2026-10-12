@@ -25,6 +25,18 @@ public:
 	// the interpolation code calls this where the game's own frame ended.
 	static void MarkFrameWorkEnd();
 
+	// Re-reads the frame rate an external tool (thprac) is asking for, which UpdateTargetFPS
+	// picks up from external_game_fps.
+	//
+	// Tick() and TickUntil() do this on every frame they pace, but a game that paces itself
+	// through TickUntil only reaches it while its own clock still says the next frame is ahead of
+	// it: one that has been pushed to a frame rate it can't keep up with spends every frame behind
+	// its clock, so the limiter is never ticked, the external frame rate is never read again, and
+	// the game stays at the rate it could not keep up with even after the tool brings the value
+	// back down. The interpolation calls this once per frame, next to the game's own present, so
+	// the follow keeps working in that state.
+	static void PollExternalGameFPS();
+
 	// How long one of the limiter's frames is, and what the display is running at
 	static LARGE_INTEGER FrameWait();
 	static unsigned int DisplayRefresh();

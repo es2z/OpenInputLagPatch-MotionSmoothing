@@ -156,6 +156,12 @@ inline void half_spin_wait(__int64 target) {
 	}
 }
 
+// Re-reads the frame rate an external tool is asking for (see limiter.h)
+void Limiter::PollExternalGameFPS() {
+	if (initialized)
+		UpdateTargetFPS();
+}
+
 // TODO: Implement https://blat-blatnik.github.io/computerBear/making-accurate-sleep-function/
 
 // Waits until the given point in time (see limiter.h)
@@ -211,7 +217,14 @@ void Limiter::TickUntil(double seconds) {
 
 	// Calculate how much time it took for the game to process this frame
 	if (frame_start.QuadPart != 0) {
-		__int64 frame_elapsed = now.QuadPart - frame_start.QuadPart;
+		// The games with frame interpolation report where their own part of the frame ended, so
+		// the extra presentations the patch adds - which are the patch's work, not the game's -
+		// don't show up in the frame time the overlay reports. Without this, the readout is the
+		// whole frame including the extras, and so reads about as many times too high as the game
+		// is presented per frame. (Same as Tick() below.)
+		__int64 frame_end_time = frame_work_end.QuadPart != 0 ? frame_work_end.QuadPart : now.QuadPart;
+		frame_work_end.QuadPart = 0;
+		__int64 frame_elapsed = frame_end_time - frame_start.QuadPart;
 		frame_work.QuadPart = frame_elapsed;
 		if (++frame_num % 30 == 0) {
 			char overlay_text[64];
