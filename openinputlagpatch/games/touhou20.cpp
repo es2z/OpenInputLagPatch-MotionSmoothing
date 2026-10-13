@@ -332,6 +332,226 @@ static double th20_present_rate() {
 	return Limiter::game_fps * (double)multiplier;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: project the bullets forward
+// ---------------------------------------------------------------------------
+//
+// The bullet manager is the object the side table holds at 0x5BA568 (one record every 0x30
+// bytes: the record's +0 is the manager and its +4 the player, the same shape th19 has). The
+// thing that builds it is FUN_00480FA0: it loads bullet.anm into it, stores itself into the side
+// record through FUN_004117A0 (which is `*record = this`), makes a pool of 2000 bullets of 0x528
+// bytes at +0x60 (FUN_0047C6A0 is `this + count * 0x528`), and registers the two tasks the game
+// drives it with - the update FUN_004849D0 (id 0x26) and the draw FUN_00485310 (id 0x29).
+//
+// The bullets in play are the ones on the six layer chains the update walk FUN_0047D600 builds
+// every frame: the heads are at manager+0x14 (the tails at +0x2C), one chain per layer, threaded
+// through bullet+0x60, and the layer a bullet belongs to is at +0x44 - all of that read out of
+// FUN_0047D600 itself and confirmed by the draw walk (see below). That walk is the only thing
+// that moves bullets, and the extra presentations only run the render walk, so a bullet is never
+// stepped twice by them.
+//
+// A bullet keeps its position at +0x64 (three floats) and its velocity at +0x70 (three), and
+// FUN_00485B60 (the per bullet update, which the walk reaches through FUN_0047D960) moves it like
+// this:
+//
+//   state 1     position += velocity * the global scale at [0x5AEFE4]
+//   state 2/3   position += velocity / 2
+//
+// The global the first one uses is not the per frame setting th18 had: before it moves a bullet
+// whose state (+0x50) isn't 2, 3 or 4 the update copies that bullet's own two factors into it
+// ([bullet+0x4D8] * [bullet+0x4E8], at the top of FUN_00485B60) and puts the old value back when
+// it is done, so the scale a bullet moves by is the one it carries. The states 2, 3 and 4 never
+// get that copy and divide their velocity by 2 instead, which is the half step the other games'
+// states take - so the state is worked out per bullet here rather than the global being read (a
+// scratch the sub-functions write, not the per frame setting).
+//
+// The sprites are the other half: the draw walk draws each of the six chains (FUN_0047DC90 calls
+// FUN_0047DB70 once per layer) and FUN_0047DB70, for every bullet on its chain, copies
+// bullet+0x64/+0x68/+0x6C into the sprite object it keeps at bullet+0x1C (at sprite+0x5BC). That
+// copy happens inside the render walk the extra presentations replay, so moving the bullet's own
+// position is all an extra presentation has to do, exactly like th19's bullets - there is no
+// second copy to chase.
+
+// In the side table: how far apart its records are, and the most of them to look at (th19 has two
+// sides; this game has one player, but the engine's table is the same one, so the walk below takes
+// every record it finds a manager in rather than assuming an index)
+static char* th20_side_table = (char*)rebase(0x005BA568);
+static const size_t th20_side_stride = 0x30;
+static const size_t th20_side_max = 8;
+
+// In a bullet manager: the six layer chains the update walk builds (heads, then tails) and the
+// number of bullets it walked. In a bullet: where it is, where it is going, what it is doing, the
+// two factors the game copies into the global scale before moving it, and the flags
+static const size_t th20_bullet_layers = 6;
+static const size_t th20_bullet_layer_head = 0x14;
+static const size_t th20_bullet_layer_tail = 0x2C;
+static const size_t th20_bullet_layer_next = 0x60;
+static const size_t th20_bullet_count = 0x44;
+static const size_t th20_bullet_layer = 0x44;
+static const size_t th20_bullet_position = 0x64;
+static const size_t th20_bullet_velocity = 0x70;
+static const size_t th20_bullet_flags = 0x14;     // 0x200 holds it (it is neither moved nor drawn)
+static const size_t th20_bullet_state = 0x50;
+static const size_t th20_bullet_scale_a = 0x4D8;  // the two factors the game copies into the
+static const size_t th20_bullet_scale_b = 0x4E8;  // global scale before it moves the bullet
+static const size_t th20_bullet_pool_max = 2000;  // the pool FUN_00480FA0 makes
+
+// How many of the game's updates it runs per rendered frame, minus one (the game never writes it)
+static unsigned char* th20_frames_per_render = (unsigned char*)rebase(0x005C4F84);
+// The game's own thread/state object, whose flags say whether the picture is held
+static void** th20_game_thread = (void**)rebase(0x005BA828);
+static const size_t th20_thread_flags = 0xE8;
+
+// Whether a pointer looks like something that can be read, so a read that has gone stale can't
+// take the game down
+static bool th20_readable(const void* pointer, size_t size) {
+	const DWORD address = (DWORD)pointer;
+	return address > 0x10000 && address < 0x7FFF0000 && !IsBadReadPtr(pointer, size);
+}
+
+// Whether the picture is held: the bullet tasks stop for these flags (FUN_004849D0 returns early
+// for the low bits, FUN_00485310 for bit 2, and FUN_0047D600 skips a bullet's update for 0x800),
+// and a picture the game is not updating must not be moved forward either
+static bool th20_bullets_held() {
+	void* thread = *th20_game_thread;
+	if (thread == nullptr)
+		return false;
+	const unsigned int flags = *(unsigned int*)((char*)thread + th20_thread_flags);
+	return ((flags | (flags >> 2)) & 1) != 0 || (flags & 4) != 0 || (flags & 0x800) != 0;
+}
+
+// The scale a bullet moves by: the one the game copies into its global scale before moving it, or
+// the half step the states that never get that copy take
+static float th20_bullet_step_scale(const void* bullet) {
+	const int state = *(const int*)((const char*)bullet + th20_bullet_state);
+	if (state == 2 || state == 3 || state == 4)
+		return 0.5f;
+
+	float scale = *(const float*)((const char*)bullet + th20_bullet_scale_a) *
+		*(const float*)((const char*)bullet + th20_bullet_scale_b);
+	if (!(scale > 0.0f) || scale > 2.0f)
+		scale = 1.0f;
+	return scale;
+}
+
+// The side records that hold a bullet manager, for the diagnostics: how many were found and how
+// many bullets they say they walked (the managers' own counts are an independent way to tell a
+// walk that stopped early from an empty stage)
+static char* th20_bullet_managers[th20_side_max];
+static size_t th20_bullet_manager_count;
+static unsigned int th20_bullets_managers_say;
+
+// A manager, if the record holds one that looks like the ones this was written for: its count is
+// within the pool it made, and the layer heads are readable
+static char* th20_bullet_manager(size_t side) {
+	char* manager = *(char**)(th20_side_table + th20_side_stride * side);
+	if (manager == nullptr)
+		return nullptr;
+	if (!th20_readable(manager + th20_bullet_count, 4) ||
+		!th20_readable(manager + th20_bullet_layer_head + th20_bullet_layers * sizeof(DWORD), 4))
+		return nullptr;
+	const unsigned int count = *(const unsigned int*)(manager + th20_bullet_count);
+	if (count > th20_bullet_pool_max + 1)
+		return nullptr;
+	return manager;
+}
+
+// The bullets a presentation moved, where they were, so it can put them back. Both sides together
+// can have 2000 bullets each, so a little more than that is the most this list can hold; only the
+// bullets that were saved are moved, so a list that somehow grew past that would only cost the
+// projection of the bullets at its end.
+static const size_t th20_bullets_saved_max = th20_bullet_pool_max * 2;
+struct Th20SavedBullet {
+	float* position;      // in the bullet: where it is
+	float position_value[3];
+};
+static Th20SavedBullet th20_saved_bullets[th20_bullets_saved_max];
+static size_t th20_saved_bullets_count;
+
+// What the last presentation projected, for the diagnostics (see th20_diag_dump)
+static unsigned int th20_bullets_in_play;
+static unsigned int th20_bullets_moved;
+
+static void th20_bullet_find_managers();
+
+// Moves every bullet in play forward by t frames (t = 0 is the state the game is in) and remembers
+// what it changed, so th20_bullets_undo can put it back.
+static void th20_bullets_advance(float t) {
+	th20_saved_bullets_count = 0;
+	th20_bullets_in_play = 0;
+	th20_bullets_moved = 0;
+
+	// The managers are made when a game starts and the table is rebuilt with it, so which records
+	// hold one is looked up every frame rather than once (eight pointer reads)
+	th20_bullet_find_managers();
+	if (th20_bullets_held())
+		return;
+
+	unsigned int frames_per_render = *th20_frames_per_render;
+	if (frames_per_render > 2) // the game's own setting only goes to 2
+		frames_per_render = 2;
+
+	for (size_t side = 0; side < th20_bullet_manager_count; ++side) {
+		char* manager = th20_bullet_managers[side];
+		if (manager == nullptr)
+			continue;
+
+		for (size_t layer = 0; layer < th20_bullet_layers; ++layer) {
+			void* bullet = *(void**)(manager + th20_bullet_layer_head + layer * 4);
+			// The list is the game's own and this runs where nothing can change it; the bound is
+			// only so a list that got broken some other way can't run away with the frame
+			for (size_t guard = 0; bullet != nullptr && guard < th20_bullets_saved_max * 4; ++guard) {
+				if (!th20_readable(bullet, th20_bullet_velocity + 12))
+					break;
+				void* next = *(void**)((char*)bullet + th20_bullet_layer_next);
+				const unsigned int flags = *(const unsigned int*)((char*)bullet + th20_bullet_flags);
+				// A held bullet is neither moved nor drawn, so there is nothing to project for it
+				if ((flags & 0x200) == 0) {
+					++th20_bullets_in_play;
+					if (th20_saved_bullets_count < th20_bullets_saved_max) {
+						const float step = t * (float)(frames_per_render + 1) * th20_bullet_step_scale(bullet);
+						float* position = (float*)((char*)bullet + th20_bullet_position);
+						const float* velocity = (const float*)((char*)bullet + th20_bullet_velocity);
+						Th20SavedBullet& saved = th20_saved_bullets[th20_saved_bullets_count++];
+						saved.position = position;
+						for (int axis = 0; axis < 3; ++axis) {
+							saved.position_value[axis] = position[axis];
+							position[axis] += velocity[axis] * step;
+						}
+						++th20_bullets_moved;
+					}
+				}
+				bullet = next;
+			}
+		}
+	}
+}
+
+// Puts the positions back, so the game's own logic sees the state it left behind and not the
+// projected one.
+static void th20_bullets_undo() {
+	for (size_t i = 0; i < th20_saved_bullets_count; ++i) {
+		const Th20SavedBullet& saved = th20_saved_bullets[i];
+		for (int axis = 0; axis < 3; ++axis)
+			saved.position[axis] = saved.position_value[axis];
+	}
+	th20_saved_bullets_count = 0;
+}
+
+// Which of the side table's records hold a bullet manager, and how many bullets they say they
+// walked (a second opinion on the walk, for the diagnostics)
+static void th20_bullet_find_managers() {
+	th20_bullet_manager_count = 0;
+	th20_bullets_managers_say = 0;
+	for (size_t side = 0; side < th20_side_max; ++side) {
+		char* manager = th20_bullet_manager(side);
+		if (manager == nullptr)
+			continue;
+		th20_bullet_managers[th20_bullet_manager_count++] = manager;
+		th20_bullets_managers_say += *(unsigned int*)(manager + th20_bullet_count);
+	}
+}
+
 // Diagnostics: press U to write the presentation timing of the last frames to oilp_diag.txt
 static const unsigned int th20_diag_frames_max = 300;
 static const unsigned int th20_diag_presents_max = 8;
@@ -385,6 +605,14 @@ static void th20_diag_dump() {
 	fprintf(file, "taken over: %u of %u render call(s), %u of %u present call(s)\n",
 		th20_render_patched, th20_render_sites, th20_present_patched, th20_present_sites);
 	fprintf(file, "frames recorded: %u\n", count);
+	// The bullets (see th20_bullets_advance). The last line counts them from the other side - out
+	// of each manager's own counter rather than by walking its chains - so a walk that stopped
+	// finding bullets would say so right here: the only difference the two can have is a bullet
+	// the draw walk itself leaves out, which is not on screen to project for
+	fprintf(file, "bullets: %u in play, %u projected forward (last presentation)\n",
+		th20_bullets_in_play, th20_bullets_moved);
+	fprintf(file, "bullets: the managers' own count says %u, %u manager(s) found\n",
+		th20_bullets_managers_say, (unsigned int)th20_bullet_manager_count);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -438,7 +666,9 @@ static void th20_extra_presentation(float t) {
 	// The reset above emptied the queue, exactly the way the game's own block empties it right
 	// before it draws the objects into it - so the objects are drawn again here to fill it
 	ToolState::ReadyToDraw();
+	th20_bullets_advance(t);
 	th20_render_objects(*th20_scene);
+	th20_bullets_undo();
 	th20_draw_sprite_queue(*th20_sprite_manager);
 
 	device->SetTexture(0, nullptr);
