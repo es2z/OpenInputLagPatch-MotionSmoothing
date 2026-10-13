@@ -128,8 +128,8 @@ BltPrepareTime = 2
 ; 0: Basic spinwait (very accurate, but uses lots of CPU), 1: vpatch (slightly higher risk of
 ; skipping a frame depending on PC, but uses way less CPU).
 ;
-; 默认 / Default: 0
-Sleep = 0
+; 默认 / Default: 1
+Sleep = 1
 
 ; 用 Direct3D9Ex 取代 Direct3D9，可以再减少 0~2 帧输入延迟。
 ; th09.5 及以下如果没有用 d3d8to9 则无效。
