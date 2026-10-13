@@ -106,6 +106,73 @@ is also the record of what has actually been verified rather than just what was 
   both extrapolate from the previous frame's step, which is first order for anything that changes
   speed within a frame (a laser in its first frame, or one changing phase).
 
+- **Touhou 20 (Fossilized Wonders) gets frame interpolation too** (`a966e0c`, `7d792cd`, `fb2771f`, `e948913`, `5f5ab65`)
+
+  Fossilized Wonders runs on th19's engine - the one that keeps a clock of its own, and whose frame
+  length comes from a hardcoded 60fps read by a handful of instructions - so the base support is the
+  same shape. What it is not is th19: this is a single player game (only one record of the side table
+  is in use), and none of th19's offsets carried over - every one of them was read out of th20
+  itself, with th19 used only for what the pieces should look like.
+
+  Extra presentations: three render blocks (0x419D3B, 0x419F91, 0x41A10C) and three presents
+  (0x419666, 0x4199B2, 0x419B2E, each a 5 byte device load followed by 34 bytes of arguments that
+  are all skipped, since all five of them are pushed inside). The device is [0x5C4D48], the sprite
+  (animation) manager [0x5C0028], the scene/task manager [0x5B66D8], the dword the render block
+  raises [0x5C5AF8] and the frames-per-render byte [0x5C4F84]. The frame functions set no transform
+  either, so an extra presentation puts the viewport and the two transforms back from the device.
+  Also here: `Limiter::PollExternalGameFPS()` once per frame (without it thprac pushing the logic
+  frame rate up can't be brought back down here either), and a wrong comment about the frame limiter
+  being ticked from the EndScene hook.
+
+  Bullets: the manager is `*(0x5BA568 + n * 0x30)` (the side record's +0; a pool of 2000 bullets of
+  0x528 bytes), and the ones in play are on the six layer chains the update walk rebuilds every
+  frame (heads at +0x14 + i*4, tails at +0x2C + i*4, threaded through bullet+0x60, layer at +0x44).
+  A bullet keeps its position at +0x64 and its velocity at +0x70, its state at +0x50, is held by
+  0x200 of +0x14, and moves by `position += velocity * the global at [0x5AEFE4]` in state 1 and by
+  `position += velocity / 2` (the half step) in states 2 and 3; the scale it moves by is its own
+  two factors, +0x4D8 * +0x4E8, copied into that global before it moves. The drawing reads the
+  bullet's own position (the draw walk copies +0x64 into the sprite at +0x5BC), and that walk is
+  what the extras replay, so moving the position is enough.
+
+  The player: `*(0x5BA568 + 4)` (a PlayerInf whose fields run past +0x14854), with its position at
+  +0x614 - the same point is kept twice more, at +0x5E4 and +0x694, 32 pixels apart in y, and all
+  three are moved. There is no velocity to read, so it is measured, the way the games after th13
+  measure their players. Its own shots are a pool of 256 slots of 0x124 bytes at player+0x22B4
+  (position at +0x50, sprite id at +0x18), measured the same way; and because the game bakes a
+  shot's position into its sprite while it updates it - which the extras don't replay - the sprite's
+  drawn position at +0x5BC is written as well. That sprite is found by reproducing the array branch
+  of the game's own lookup: sprite = [0x5C0028] + 0x710 + (id & 0xFFFF) * 0x600, with the in use byte
+  at +0x5F8 and the id at +0x4C0.
+
+  Straight lasers: the manager is the side record's +0x14, its newest list node is at manager+0x14,
+  a node sits inside the object at +8 (object at +0, next at +4) and the count is at +0x28. Both of
+  the two straight kinds are drawn from fields read where the picture is drawn - position +0x58,
+  angle +0x70, length +0x74 - and the whitelist is by vtable (LaserLineInf 0x571148,
+  LaserInfiniteInf 0x5712E8), since the two kinds do not even share the fields they are moved by,
+  which is why they are measured as well (told apart by the object pointer and the id at +0x8C). The
+  beam kind's update is a stub and the curve one is not a straight line, as on the other games.
+
+  The menus' text: the manager is an AsciiInf (constructor FUN_0046C080), its records are a flat
+  array at +0x11BC (0x140 bytes each, up to 0x140 of them), the count of the ones to draw this frame
+  is at +0x1A1BC and a record's life is at record+0x134 (aged by the update task with id 8). Unlike
+  th19 the manager is not in a global at all - the loading thread builds it and only tests the
+  result - so it is caught where it is constructed (the call at 0x471084). The count is put back
+  before every extra presentation, so the extra presentations append in the same place the game's
+  own pass did instead of on top of its records.
+
+  In game (180Hz, Interpolation = -1): 3 presentations per frame in the steady state, 5.56ms apart;
+  478 of 478 bullets projected, against a manager whose own counter says 478; the player moving
+  4.50px a frame; 118 of 118 shots projected (108 of them through their sprite); 154 of 154 straight
+  lasers projected, with the managers' own counters saying 154 - the walk and the game's own
+  bookkeeping agreeing, which is what says the chains are followed the way the game follows them;
+  and the text list coming out at the same count on both sides of the extra presentations (0 -> 50 ->
+  50), which is what says the same text is no longer drawn twice. The picture and the feel were
+  confirmed by the user.
+
+  Known approximations: the endless laser kind never appeared in the tests (it was only checked in
+  the code), and the shots and the lasers extrapolate from the previous frame's step, which is first
+  order for anything that changes speed within a frame.
+
 ### Changed
 
 - **The shipped config and the built-in default for `Sleep` go back to `1` (the vpatch wait)** (`eb6f481`)
