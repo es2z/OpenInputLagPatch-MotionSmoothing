@@ -7,6 +7,105 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-13
+
+### Added
+
+- **Touhou 19 (Unfinished Dream of All Living Ghost) gets frame interpolation too** (`3262ede`, `4ac58a3`, `3203d04`, `8d5a809`, `3f551be`)
+
+  Unfinished Dream of All Living Ghost is two things the earlier games are not: it is a **versus
+  game** (each side has a set of managers of its own, so the bullets, the lasers, the players and
+  their shots all had to be done twice) and it is the **first build with ASLR** (the executable is
+  relocated, so every address from the disassembly has to be rebased onto where it actually loaded
+  before it is used). It has no replay system, so there is no replay speed control, and its frame
+  pacing is its own: an update only moves the engine's own clock along by one frame's worth and the
+  game's logic (and rendering) only runs once that clock says the next frame is due, with the
+  length of a frame coming from a hardcoded 60fps in a few instructions - so replacing the game's
+  own frame limiter is not enough for `GameFPS` to do anything, and those instructions are pointed
+  at the patch's frame rate as well (the same thing thprac's FPS option does for th11 and up).
+
+  The extra presentations: four render blocks (`0x4B5E32`, `0x4B6189`, `0x4B65E5`, `0x4B76EB` - the
+  last two are in dead code and are taken over anyway) and five presents (`0x4B5EFF`, `0x4B61C4`,
+  `0x4B5D0C`, `0x4B5F86`, `0x4B642E`), each a 6 byte device load plus 14 bytes of arguments with
+  all five of them inside the part that is skipped, the same shape th18's have. The device is
+  `[0x62BB48]`, the sprite (ANM) manager `[0x5D19BC]`, the task manager `[0x5D1A24]`, the dword the
+  block sets to `0xFF` is `[0x62C70C]`, and the byte that says how many of the game's updates a
+  rendered frame covers is `[0x62BDDC]` (read and never written, so it is always 0). There is no
+  camera and no SetTransform anywhere in the frame functions, so an extra presentation restores the
+  viewport and the transforms it read back from the device. Two problems th19 has of its own were
+  fixed along with it: the overlay's "X ms" readout was too high by exactly the interpolation
+  factor (the limiter's TickUntil measured the whole wall clock frame with the extras included in
+  it, and now looks at frame_work_end the way Tick does), and a frame rate pushed to 500-600
+  through thprac could not be brought back down (with a frame of 1.67-2ms the game's own pacing
+  branch is rarely taken, so TickUntil is never called with it and game_fps is never read again;
+  the present hook now polls the external frame rate every frame through
+  Limiter::PollExternalGameFPS).
+
+  The bullets are one manager per side at `[0x5D1A60 + side*0x3C]` (a pool of 2001 of `0x1088`
+  bytes): what is in play is on the six layer chains the update walk rebuilds every frame (heads at
+  `manager+0x14+i*4`, tails at `+0x2C+i*4`, the next bullet at `bullet+0x6B8`, the layer number at
+  `+0x6C0`). The position is `+0x650`, the velocity `+0x65C` (with the angle at `+0x670` and the
+  speed at `+0x668`), the 0x200 flag on `+0x10` holds a bullet, the state is `+0x1044`, the shared
+  slowdown is `[0x5C6418]`, and the picture being held is `[0x5D1A54]+0x140` (the update looks at
+  `((f>>2)|f)&1` and `f&0x800`, the drawing at `f&4`). What is drawn, though, is the bullet's own
+  `+0x62C` - the draw walk copies `+0x650` into it, and the extras do replay the draw walk - so
+  moving the position is all it takes.
+
+  The player is a `PlayerInf` (one per side, `0x14C48` bytes, at `[0x5D1A60+side*0x3C+4]`) with its
+  position at `+0x68C` (three floats). It has no velocity to read - it moves by the input the game
+  processed that frame, in per character code - so it is measured the way the games after th13
+  measure theirs: the step the game's own frame made is kept, and an extra presentation draws it
+  that step's t further along and puts it back right after the render. The player's own shots are
+  not on the bullet manager's chains and the game's class list has no shot class for them, so they
+  were found by what they look like: a pool of 16 slots the player owns (from `player+0x22F8`,
+  `0x128` bytes each, the sprite id at `+0x14` and the position at `+0x54`). They are measured the
+  same way, and both the slot's position and the sprite's copy of it (at `+0x614`) are moved - the
+  picture for a shot is drawn from the copy the game's own update bakes into the sprite, and that
+  update is not replayed.
+
+  The straight lasers are on the side object at `side_record+0x14` (a `LaserInf`): the newest node
+  of the list of lasers in play is at `manager+0x14`, a node sits inside the object it holds at
+  `+8` (the object at `node+0`, the one before it at `node+4`), and how many there are is the
+  manager's `+0x38`. The position (`+0x60`), the angle (`+0x78`) and the length (`+0x7C`) are read
+  where the picture is drawn, so writing them is all an extra presentation has to do. Only the two
+  straight kinds are projected, by vtable: `LaserLineInf` (`0x5A885C`) and `LaserInfiniteInf`
+  (`0x5A873C`) - and the two do not even share the fields they are moved by (the line one grows its
+  length to its own limit at `+0x898` first and only then moves, by its velocity at `+0x6C..+0x74`;
+  the infinite one recomputes its position out of another object's `+0x888` and adds
+  `+0x894..+0x89C` to it, turning by the rate at `+0x8A4`), so these are measured as well: the
+  position, the angle and the length are measured every game frame, an extra presentation writes
+  them that step's t further along, and a laser is identified by its address together with the id
+  its manager gave it (`+0x94`), so that a new laser at a reused address projects nothing. Beams
+  (whose update is a stub) and curves are left alone.
+
+  The menus' text is the same trap th12 to th18 have, with fields of its own: the text manager is
+  `[0x5D1A34]` (an `AsciiInf`), the records are 0x13C bytes each from `+0xC78` (0x140 of them at
+  most), and how many of them the frame has is `+0x19778` (the append is FUN_004E6C30; the aging
+  that drops the records whose life at `+0x130` ran out, compacts the rest and writes the surviving
+  count back is FUN_004E6F00 through FUN_004E5750, registered with the update chain; the drawing is
+  six per layer tasks on the draw chain calling FUN_004E6B60). The render hook keeps that count and
+  every extra presentation puts it back before it renders, so each one appends its records in the
+  same slots the game's own pass used and draws the same text it drew.
+
+  What the test said: on a 180hz display the steady state is `3 present(s)` a frame, 5.56ms apart,
+  and the stage test averaged `2.983 presents per frame, 179.0 presentations per second`; the menu
+  test, which is where the text was checked, averaged 2.847. The frames that come out below 3 are
+  the ones where an extra presentation would not have finished before the next game frame was due
+  and was dropped, which is the patch's own rule from th17 and th18 rather than anything new. The
+  bullets were `125 in play, 125 projected`; the player `2 of 2 moved` at 3.44px a frame; the shots
+  `7 in play`; the straight lasers `8 in play, 8 projected` with the managers' own counters saying
+  8 as well, two independent numbers agreeing; `0 restore(s) wrong`, so no extra presentation ever
+  left a position behind for the game's own logic to walk on top of; and the text list counted
+  `0 -> 2 -> 2` records (before the game's own pass of the walk, after it, and at the end of the
+  frame), the last two being equal, which is what says the same text is not drawn twice any more.
+  Both the picture and the text were confirmed on screen.
+
+  Two known approximations are left: the endless laser (`LaserInfiniteInf`) never showed up in the
+  tests, so its branch is verified from the code only (its drawing reads the same position and
+  angle the line one does, and it goes through the same measuring), and the shots and the lasers
+  both extrapolate from the previous frame's step, which is first order for anything that changes
+  speed within a frame (a laser in its first frame, or one changing phase).
+
 ## 2026-10-12
 
 ### Added
