@@ -488,18 +488,15 @@ struct Th19PlayerMotion {
 static Th19PlayerMotion th19_player_motion[2];
 
 // What the presentation being drawn moved, so it can be put back (one per side: a presentation
-// draws both players). The position the game's own logic moves is the player's; the sprite that
-// draws the player keeps a copy of it, and that copy is what the drawing code reads - the game's
-// own update writes it there (at 0x540DF3: movq [sprite+614h], player's +68C), and that update is
-// not replayed, so the copy has to be moved as well or the picture doesn't move at all.
+// draws both players). The position is the player's own (PlayerInf+0x68C), which is what the
+// game's own drawing reads - the drawing helpers all over 0x41xxxx read an object's position from
+// there and the player's is one of those - so writing it is all an extra presentation has to do.
+//
+// There is no sprite of the player's own to write as well: the only id that looks like one is
+// pushed from the aura object following it (at 0x540DD1, and the object that call reads it from is
+// the aura's, not the player's), and looking that id up found no sprite in play at any point.
 static float* th19_player_written[2];
 static float th19_player_written_value[2][3];
-static float* th19_player_sprite_written[2];
-static float th19_player_sprite_written_value[2][3];
-// In the player: the id of the sprite that draws it (pushed at 0x540DD1)
-static const size_t th19_player_sprite_id = 0x7C;
-static unsigned int th19_players_with_sprite;
-static unsigned int th19_players_without_sprite;
 static const size_t th19_players_saved_max = 2;
 static unsigned int th19_players_moved;
 static float th19_player_movement; // the largest step seen since the last dump, in pixels
@@ -559,11 +556,8 @@ static void th19_player_measure() {
 static void th19_player_advance(float t) {
 	for (size_t side = 0; side < 2; ++side) {
 		th19_player_written[side] = nullptr;
-		th19_player_sprite_written[side] = nullptr;
 	}
 	th19_players_moved = 0;
-	th19_players_with_sprite = 0;
-	th19_players_without_sprite = 0;
 
 	if (th19_bullets_held())
 		return;
@@ -581,21 +575,6 @@ static void th19_player_advance(float t) {
 		}
 		th19_player_written[side] = position;
 		++th19_players_moved;
-
-		// ...and the copy the drawing code reads (see above)
-		void* sprite = th19_sprite_for_id(
-			*(const unsigned int*)((char*)motion.player + th19_player_sprite_id));
-		if (sprite != nullptr) {
-			float* drawn = (float*)((char*)sprite + th19_sprite_position);
-			for (int axis = 0; axis < 3; ++axis) {
-				th19_player_sprite_written_value[side][axis] = drawn[axis];
-				drawn[axis] = position[axis];
-			}
-			th19_player_sprite_written[side] = drawn;
-			++th19_players_with_sprite;
-		} else {
-			++th19_players_without_sprite;
-		}
 	}
 }
 
@@ -605,11 +584,6 @@ static void th19_player_undo() {
 			for (int axis = 0; axis < 3; ++axis)
 				th19_player_written[side][axis] = th19_player_written_value[side][axis];
 			th19_player_written[side] = nullptr;
-		}
-		if (th19_player_sprite_written[side] != nullptr) {
-			for (int axis = 0; axis < 3; ++axis)
-				th19_player_sprite_written[side][axis] = th19_player_sprite_written_value[side][axis];
-			th19_player_sprite_written[side] = nullptr;
 		}
 	}
 }
@@ -633,199 +607,6 @@ static void th19_player_check_restored() {
 				++th19_player_restore_mismatch;
 				break;
 			}
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Frame interpolation, stage 1, the player: a read-only probe (diagnostics only)
-// ---------------------------------------------------------------------------
-//
-// The player is where th19 differs the most from the games before it: it is a C++ class of its
-// own (PlayerInf, 0x14C48 bytes, one per side, at side table + 4), it is drawn through a virtual
-// call its own ANM manager makes, and there is one set of those calls per character - pl00func.cpp
-// alone brings BombReimuInf, AuraReimuInf, EXOnmyoInf, EXReigekiInf and EXReimuInf, and every
-// character has its own ECL. What the projection needs out of all that is where the player is and
-// where it is drawn, and rather than read the per character draw code for each of them, this
-// reports it. The drawing helpers all over 0x41xxxx read an object's own position from +0x68C
-// (hundreds of "movq xmm0, [eax+68Ch]" sites), so a candidate object whose +0x68C keeps moving is
-// the player, or something following it - and the diagnostics say which candidate that is, where
-// it is and how far it moves. Reads only, and only behind a readability check, so it can't take
-// the game down; it is here to be replaced by the projection once the candidates are known.
-
-static const size_t th19_player_probe_max = 10;
-struct Th19PlayerProbe {
-	const char* what;
-	void* object;
-	bool seen;
-	float value[2];
-	float max_move;
-};
-static Th19PlayerProbe th19_player_probe[2][th19_player_probe_max];
-
-static void th19_player_probe_frame() {
-	for (size_t side = 0; side < 2; ++side) {
-		char* record = th19_side_table + th19_side_stride * side;
-		void* player = *(void**)(record + 4);
-
-		void* candidates[th19_player_probe_max];
-		const char* what[th19_player_probe_max];
-		size_t count = 0;
-		candidates[count] = player; what[count] = "player"; ++count;
-		if (th19_readable((char*)player + 0x3C, 4)) {
-			void* inner = *(void**)((char*)player + 0x3C);
-			candidates[count] = inner; what[count] = "player->3C"; ++count;
-			if (th19_readable((char*)inner + 4, 4)) {
-				candidates[count] = *(void**)((char*)inner + 4);
-				what[count] = "player->3C->4"; ++count;
-			}
-		}
-		if (th19_readable((char*)player + 0x2238, 4)) {
-			candidates[count] = *(void**)((char*)player + 0x2238);
-			what[count] = "player->2238"; ++count;
-		}
-		candidates[count] = *(void**)(record + 0x14); what[count] = "side+14"; ++count;
-		candidates[count] = *(void**)(record + 0x18); what[count] = "side+18"; ++count;
-		candidates[count] = *(void**)(record + 0x20); what[count] = "side+20"; ++count;
-		candidates[count] = *(void**)(record + 0x2C); what[count] = "side+2C"; ++count;
-
-		for (size_t i = 0; i < count; ++i) {
-			Th19PlayerProbe& probe = th19_player_probe[side][i];
-			probe.what = what[i];
-			probe.object = candidates[i];
-			if (!th19_readable((char*)candidates[i] + th19_player_position, 8)) {
-				probe.seen = false;
-				continue;
-			}
-			const float* position = (const float*)((char*)candidates[i] + th19_player_position);
-			const float x = position[0];
-			const float y = position[1];
-			if (probe.seen) {
-						const float dx = x - probe.value[0];
-						const float dy = y - probe.value[1];
-						const float move = sqrtf(dx * dx + dy * dy);
-				if (move > probe.max_move && move < 64.0f) // ignore teleports and object churn
-					probe.max_move = move;
-			}
-			probe.value[0] = x;
-			probe.value[1] = y;
-			probe.seen = true;
-		}
-	}
-}
-
-static void th19_player_probe_dump(FILE* file) {
-	for (size_t side = 0; side < 2; ++side) {
-		for (size_t i = 0; i < th19_player_probe_max; ++i) {
-			Th19PlayerProbe& probe = th19_player_probe[side][i];
-			if (probe.what == nullptr)
-				break;
-			if (!probe.seen) {
-				fprintf(file, "side %u %-13s: 0x%08x (no readable position)\n",
-					(unsigned int)side, probe.what, (unsigned int)probe.object);
-				continue;
-			}
-			fprintf(file, "side %u %-13s: 0x%08x at (%.2f, %.2f), moves up to %.2f px a frame\n",
-				(unsigned int)side, probe.what, (unsigned int)probe.object,
-				probe.value[0], probe.value[1], probe.max_move);
-			// So that "up to" means since the last dump, like the player's own lines do (a
-			// maximum that never resets can't say anything about how fast the player is going now)
-			probe.max_move = 0.0f;
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Frame interpolation, stage 1: whatever else the player puts on screen (probe)
-// ---------------------------------------------------------------------------
-//
-// The player's own shots, the things its ability cards put out and the rest of what it draws are
-// objects of their own, and the objects a side keeps are on the lists its own scene walks (the
-// side object at side table + 0x14, walked by FUN_00530760: a chain of slots, each {object,
-// next}, whose head is at the side object's +0x14). Every object that is drawn keeps its own
-// position at +0x68C - that is where the drawing helpers all over 0x41xxxx read it from, and it
-// is where the player's own position turned out to be - so listing what is on those lists, with
-// the class each object belongs to (its vtable) and how far it moves, says which of them belong
-// to the player and what their classes are called (the classes' RTTI is looked up in the
-// disassembly the same way LaserLineInf and the rest were). Reads only, behind a readability
-// check, and it goes away once the classes are known and projected.
-
-static const size_t th19_objects_probe_max = 16;
-struct Th19ObjectProbe {
-	void* object;
-	unsigned int vtable;
-	bool on_list;
-	float value[2];
-	float max_move;
-};
-static Th19ObjectProbe th19_objects_probe[2][th19_objects_probe_max];
-
-static void th19_objects_probe_frame() {
-	for (size_t side = 0; side < 2; ++side) {
-		Th19ObjectProbe* probes = th19_objects_probe[side];
-		for (size_t i = 0; i < th19_objects_probe_max; ++i)
-			probes[i].on_list = false;
-
-		char* side_object = *(char**)(th19_side_table + th19_side_stride * side + 0x14);
-		if (!th19_readable(side_object + 0x14, 4))
-			continue;
-
-		void* slot = *(void**)(side_object + 0x14);
-		for (size_t guard = 0; slot != nullptr && guard < 256; ++guard) {
-			if (!th19_readable(slot, 8))
-				break;
-			void* object = *(void**)slot;
-			void* next = *(void**)((char*)slot + 4);
-			if (th19_readable(object, 4) &&
-				th19_readable((char*)object + th19_player_position, 8)) {
-				Th19ObjectProbe* probe = nullptr;
-				Th19ObjectProbe* free_probe = nullptr;
-				for (size_t i = 0; i < th19_objects_probe_max; ++i) {
-					if (probes[i].object == object) {
-						probe = &probes[i];
-						break;
-					}
-					if (free_probe == nullptr && !probes[i].on_list)
-						free_probe = &probes[i];
-				}
-				if (probe == nullptr) {
-					probe = free_probe;
-					if (probe != nullptr) {
-						probe->object = object;
-						probe->vtable = *(unsigned int*)object;
-						probe->max_move = 0.0f;
-					}
-				}
-				if (probe != nullptr) {
-					const float* position = (const float*)((char*)object + th19_player_position);
-					const float x = position[0];
-					const float y = position[1];
-					if (probe->on_list) {
-						const float dx = x - probe->value[0];
-						const float dy = y - probe->value[1];
-						const float move = sqrtf(dx * dx + dy * dy);
-						if (move > probe->max_move && move < 64.0f) // ignore teleports and churn
-							probe->max_move = move;
-					}
-					probe->value[0] = x;
-					probe->value[1] = y;
-					probe->on_list = true;
-				}
-			}
-			slot = next;
-		}
-	}
-}
-
-static void th19_objects_probe_dump(FILE* file) {
-	for (size_t side = 0; side < 2; ++side) {
-		for (size_t i = 0; i < th19_objects_probe_max; ++i) {
-			const Th19ObjectProbe& probe = th19_objects_probe[side][i];
-			if (probe.object == nullptr || !probe.on_list)
-				continue;
-			fprintf(file, "side %u object %2u: class 0x%08x at (%.2f, %.2f), moves up to %.2f px a frame\n",
-				(unsigned int)side, (unsigned int)i, probe.vtable,
-				probe.value[0], probe.value[1], probe.max_move);
 		}
 	}
 }
@@ -982,98 +763,256 @@ static void th19_shots_undo() {
 }
 
 // ---------------------------------------------------------------------------
-// Frame interpolation, stage 1: finding the player's own shots (probe, diagnostics only)
+// Frame interpolation, stage 1: the straight lasers
 // ---------------------------------------------------------------------------
 //
-// The player's own shots are not on the bullet manager's six layer chains - the projection covers
-// those and the shots are still not smoothed - and the game's class list has no shot class of its
-// own, so rather than guess which container they live in this reports where they are by what they
-// do: the player's own object is scanned for float pairs whose value is a place in the field and
-// whose value changed by a plausible step since the last frame, which is what a position looks
-// like. Any offset found that way is a position something is moving by, the shots' positions among
-// them, and the offsets they arrive at say how the container they live in is laid out (they repeat
-// with its stride). Reads only, behind a readability check, and it goes away once the shots are
-// projected.
+// Lasers are the other half of what a stage is made of, and they are kept the way bullets are:
+// one manager per side, with the lasers in play on a list of its own. The manager is the object
+// the side table keeps at +0x14 (FUN_00530AE0 builds it, loads laser.anm into it and stores it
+// there), and the individual lasers are made by FUN_00530DF0 out of a side's manager - its first
+// argument picks the kind (0 is LaserLineInf, 1 LaserInfiniteInf, 2 LaserCurveInf, 3
+// LaserBeamInf) and every kind starts from the same LaserInf fields, the list node among them.
+// Only the two straight kinds are projected below: the endless one's own update is a stub and the
+// curve one is not a straight beam at all, so neither is in the whitelist (which is by vtable,
+// i.e. by the object's class, not by anything about how it looks in play).
+//
+// The list header is the manager's +0x10, its newest node is at manager+0x14, and the number of
+// objects on it is at manager+0x38 (the maker refuses to add any past 0x200). A node sits inside
+// the object it holds, at object+8: the object is at node+0 and the node before it at node+4,
+// which is the field the game's own draw walk follows (0x5304C0 takes the node at manager+0x14
+// and asks each one for its +4 until there is none left).
+//
+// Where a laser is and which way it points is read out of it where the picture is drawn, in the
+// render walk the extra presentations replay, so writing those fields is all an extra
+// presentation has to do - the same as the player, and unlike the bullets and the shots, whose
+// positions the game's own update copies into a sprite. A LaserLineInf's draw (0x52DA40) reads
+// its position from +0x60 (three floats), its angle from +0x78 and its length from +0x7C, and
+// draws the near end at the position and the far end at position + (cos, sin) * length; a
+// LaserInfiniteInf's draw (0x52AFF0) reads the very same three fields.
+//
+// How they move is measured rather than read, for the reason the player's and the shots' motion
+// is: there is no one place that moves a laser. A LaserLineInf grows its length while it is
+// shorter than its own limit (+0x898) and only moves its position once it has reached it, by its
+// own velocity at +0x6C..+0x74; a LaserInfiniteInf recomputes its position out of another
+// object's (+0x888) and adds its own velocity at +0x894..+0x89C to it, and turns by its own rate
+// at +0x8A4. The two kinds do not even share the fields they are moved by - but they do share the
+// ones the picture is drawn from, and what the game's own last frame did to those is what an
+// extra presentation projects forward, which is true of every kind without knowing any of the
+// above.
 
-static const size_t th19_scan_first = 0x1000;
-static const size_t th19_scan_last = 0x14C40;
-static const size_t th19_scan_offsets = (th19_scan_last - th19_scan_first) / 4;
-static const size_t th19_scan_max = 32;
-struct Th19ScanHit {
-	size_t offset;
-	float value[2];
-	float max_move;
+// In a side's record: the manager its lasers are in. In a manager: the newest node of the list of
+// lasers in play, the field a node keeps the one before it in, and how many are on the list
+static const size_t th19_laser_manager = 0x14;
+static const size_t th19_laser_newest = 0x14;
+static const size_t th19_laser_previous = 0x4;
+static const size_t th19_laser_manager_count = 0x38;
+
+// In a laser object: the three floats it is drawn at, the angle and the length it is drawn with,
+// the id its manager gave it, and the state the draw walk leaves out
+static const size_t th19_laser_position = 0x60;
+static const size_t th19_laser_angle = 0x78;
+static const size_t th19_laser_length = 0x7C;
+static const size_t th19_laser_id = 0x94;
+static const size_t th19_laser_state = 0x1C;
+
+// How far one game frame can move a laser before it is not a step any more but a laser that was
+// replaced or whose picture jumped: a laser moves a few pixels a frame at most, turns far slower
+// than a radian a frame, and grows by less than its own length at once
+static const float th19_laser_step_max = 48.0f;
+static const float th19_laser_turn_max = 1.0f;
+static const float th19_laser_growth_max = 256.0f;
+
+// Whether an object is one of the two kinds this projects, by its vtable: LaserLineInf or
+// LaserInfiniteInf (the two other kinds are the endless one, whose update is a stub, and the
+// curve one, which is not a straight beam)
+static bool th19_laser_straight(const void* object) {
+	if (!th19_readable(object, 4))
+		return false;
+	const DWORD vtable = *(const DWORD*)object;
+	return vtable == rebase(0x005A885C) || vtable == rebase(0x005A873C);
+}
+
+// One entry per laser in play: where the game's own presentation showed it and how far the game's
+// own frame moved it. Both sides' managers together can hold 0x200 lasers each (the cap the maker
+// checks), so a little more than that is the most this list can hold; a list that somehow grew
+// past that would only cost the projection of the lasers at its end.
+static const size_t th19_lasers_max = 0x200 * 2;
+struct Th19LaserMotion {
+	void* object;      // the laser this was measured from
+	unsigned int id;   // ...and the id it had, so an address reused by a new laser is told apart
+	bool seen;         // whether the measurement being made found it again
+	bool written;      // whether the presentation being drawn moved it
+	float position[3]; // where the game's own presentation showed it
+	float angle;
+	float length;
+	float delta[3];    // the step the last game frame moved it by
+	float angle_delta;
+	float length_delta;
 };
-static float th19_scan_last_value[2][th19_scan_offsets];
-static bool th19_scan_started[2];
-static Th19ScanHit th19_scan_hits[2][th19_scan_max];
+static Th19LaserMotion th19_laser_motion[th19_lasers_max];
+static size_t th19_laser_motions;
 
-static void th19_player_scan_frame() {
+// What the last measurement and the last presentation saw, for the diagnostics
+static unsigned int th19_lasers_in_play;
+static unsigned int th19_lasers_managers_say;
+static unsigned int th19_lasers_projected;
+static unsigned int th19_lasers_line;
+static unsigned int th19_lasers_infinite;
+
+// Measures one laser: what the game's own frame did to the fields the picture is drawn from. The
+// first frame a laser is seen in has no step to project, so it starts at 0 the way the player's
+// and the shots' measurements do.
+static void th19_laser_track(void* object) {
+	const unsigned int id = *(const unsigned int*)((char*)object + th19_laser_id);
+
+	Th19LaserMotion* motion = nullptr;
+	for (size_t i = 0; i < th19_laser_motions; ++i) {
+		if (th19_laser_motion[i].object == object && th19_laser_motion[i].id == id) {
+			motion = &th19_laser_motion[i];
+			break;
+		}
+	}
+	const bool fresh = motion == nullptr;
+	if (fresh) {
+		if (th19_laser_motions >= th19_lasers_max)
+			return;
+		motion = &th19_laser_motion[th19_laser_motions++];
+		motion->object = object;
+		motion->id = id;
+		motion->written = false;
+	}
+	motion->seen = true;
+
+	const float* position = (const float*)((char*)object + th19_laser_position);
+	const float angle = *(const float*)((char*)object + th19_laser_angle);
+	const float length = *(const float*)((char*)object + th19_laser_length);
+
+	for (int axis = 0; axis < 3; ++axis) {
+		float delta = fresh ? 0.0f : position[axis] - motion->position[axis];
+		if (!(fabsf(delta) <= th19_laser_step_max))
+			delta = 0.0f;
+		motion->delta[axis] = delta;
+		motion->position[axis] = position[axis];
+	}
+	float angle_delta = fresh ? 0.0f : angle - motion->angle;
+	if (!(fabsf(angle_delta) <= th19_laser_turn_max))
+		angle_delta = 0.0f;
+	motion->angle_delta = angle_delta;
+	motion->angle = angle;
+	float length_delta = fresh ? 0.0f : length - motion->length;
+	if (!(fabsf(length_delta) <= th19_laser_growth_max))
+		length_delta = 0.0f;
+	motion->length_delta = length_delta;
+	motion->length = length;
+}
+
+// Measures every laser both sides have in play, once per game frame, where the game has finished
+// its own (in the present before the extra presentations run, next to the player's own measuring)
+static void th19_lasers_measure() {
+	th19_lasers_in_play = 0;
+	th19_lasers_managers_say = 0;
+	for (size_t i = 0; i < th19_laser_motions; ++i)
+		th19_laser_motion[i].seen = false;
+
+	// A picture the game is not updating is not moving its lasers either, so there is no step to
+	// measure for it (the same flags the game's own laser tasks stop for)
+	if (th19_bullets_held())
+		return;
+
 	for (size_t side = 0; side < 2; ++side) {
-		char* player = *(char**)(th19_side_table + th19_side_stride * side + 4);
-		if (!th19_readable(player + th19_scan_last, 4)) {
-			th19_scan_started[side] = false;
+		char* manager = *(char**)(th19_side_table + th19_side_stride * side + th19_laser_manager);
+		if (!th19_readable(manager + th19_laser_manager_count, 4))
 			continue;
-		}
 
-		const float* fields = (const float*)(player + th19_scan_first);
-		if (!th19_scan_started[side]) {
-			for (size_t i = 0; i < th19_scan_offsets; ++i)
-				th19_scan_last_value[side][i] = fields[i];
-			th19_scan_started[side] = true;
+		// The manager's own count is what the game keeps up to date as lasers are made and
+		// released, so it is the bound this walk uses; the slack is only so a count that was off
+		// by a frame can't hide a laser
+		const unsigned int count = *(const unsigned int*)(manager + th19_laser_manager_count);
+		th19_lasers_managers_say += count;
+
+		void* node = *(void**)(manager + th19_laser_newest);
+		for (unsigned int guard = 0; node != nullptr && guard < count + 8 && guard < th19_lasers_max;
+			++guard) {
+			if (!th19_readable(node, 8))
+				break;
+			void* object = *(void**)node;
+			void* previous = *(void**)((char*)node + th19_laser_previous);
+
+			// The draw walk leaves out a laser whose state says so, so there is nothing on screen
+			// to project for it; every other field read here is behind a readability check
+			if (th19_laser_straight(object) &&
+				*(const int*)((char*)object + th19_laser_state) != 1 &&
+				th19_readable((char*)object + th19_laser_position, 12)) {
+				++th19_lasers_in_play;
+				th19_laser_track(object);
+			}
+			node = previous;
+		}
+	}
+
+	// Lasers that are gone keep no entry, so the list holds this frame's lasers and only them
+	size_t kept = 0;
+	for (size_t i = 0; i < th19_laser_motions; ++i) {
+		if (!th19_laser_motion[i].seen)
 			continue;
-		}
+		if (kept != i)
+			th19_laser_motion[kept] = th19_laser_motion[i];
+		++kept;
+	}
+	th19_laser_motions = kept;
+}
 
-		for (size_t i = 0; i + 1 < th19_scan_offsets; ++i) {
-			const float x = fields[i];
-			const float y = fields[i + 1];
-			// A place in the field: the field's x is centred on each side, and y runs down it
-			if (!(x >= -256.0f && x <= 256.0f && y >= -64.0f && y <= 512.0f))
-				continue;
-			const float dx = x - th19_scan_last_value[side][i];
-			const float dy = y - th19_scan_last_value[side][i + 1];
-			const float move = sqrtf(dx * dx + dy * dy);
-			// Something that moved, by more than a timer ticks and less than a teleport
-			if (!(move > 1.5f && move < 48.0f))
-				continue;
+// Moves every laser t of the last game frame's step ahead of where the game's own presentation
+// left it. What is written is what the drawing reads, and the values it writes over are the ones
+// measured, so th19_lasers_undo can put them back out of the same entries.
+static void th19_lasers_advance(float t) {
+	th19_lasers_projected = 0;
+	th19_lasers_line = 0;
+	th19_lasers_infinite = 0;
+	if (th19_bullets_held())
+		return;
 
-			Th19ScanHit* hit = nullptr;
-			Th19ScanHit* free_hit = nullptr;
-			for (size_t h = 0; h < th19_scan_max; ++h) {
-				if (th19_scan_hits[side][h].max_move > 0.0f &&
-					th19_scan_hits[side][h].offset == th19_scan_first + i * 4) {
-					hit = &th19_scan_hits[side][h];
-					break;
-				}
-				if (free_hit == nullptr && th19_scan_hits[side][h].max_move == 0.0f)
-					free_hit = &th19_scan_hits[side][h];
-			}
-			if (hit == nullptr)
-				hit = free_hit;
-			if (hit != nullptr) {
-				if (move > hit->max_move)
-					hit->max_move = move;
-				hit->offset = th19_scan_first + i * 4;
-				hit->value[0] = x;
-				hit->value[1] = y;
-			}
-		}
+	for (size_t i = 0; i < th19_laser_motions; ++i) {
+		Th19LaserMotion& motion = th19_laser_motion[i];
+		motion.written = false;
+		if (motion.object == nullptr || !th19_laser_straight(motion.object) ||
+			!th19_readable((char*)motion.object + th19_laser_position, 12))
+			continue;
 
-		for (size_t i = 0; i < th19_scan_offsets; ++i)
-			th19_scan_last_value[side][i] = fields[i];
+		float* position = (float*)((char*)motion.object + th19_laser_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = motion.position[axis] + motion.delta[axis] * t;
+		*(float*)((char*)motion.object + th19_laser_angle) = motion.angle + motion.angle_delta * t;
+		// A length the drawing read as negative would point the beam backwards, so it never is one
+		const float length = motion.length + motion.length_delta * t;
+		*(float*)((char*)motion.object + th19_laser_length) = length > 0.0f ? length : 0.0f;
+
+		motion.written = true;
+		++th19_lasers_projected;
+		if (*(const DWORD*)motion.object == rebase(0x005A885C))
+			++th19_lasers_line;
+		else
+			++th19_lasers_infinite;
 	}
 }
 
-static void th19_player_scan_dump(FILE* file) {
-	for (size_t side = 0; side < 2; ++side) {
-		for (size_t h = 0; h < th19_scan_max; ++h) {
-			Th19ScanHit& hit = th19_scan_hits[side][h];
-			if (hit.max_move <= 0.0f)
-				continue;
-			fprintf(file, "side %u moves at +0x%05x: (%.2f, %.2f) up to %.2f px a frame\n",
-				(unsigned int)side, (unsigned int)hit.offset, hit.value[0], hit.value[1], hit.max_move);
-			hit.max_move = 0.0f;
-		}
+// Puts the lasers back, so the game's own logic sees the state it left behind and not the
+// projected one.
+static void th19_lasers_undo() {
+	for (size_t i = 0; i < th19_laser_motions; ++i) {
+		Th19LaserMotion& motion = th19_laser_motion[i];
+		if (!motion.written)
+			continue;
+		motion.written = false;
+		if (motion.object == nullptr || !th19_laser_straight(motion.object) ||
+			!th19_readable((char*)motion.object + th19_laser_position, 12))
+			continue;
+
+		float* position = (float*)((char*)motion.object + th19_laser_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = motion.position[axis];
+		*(float*)((char*)motion.object + th19_laser_angle) = motion.angle;
+		*(float*)((char*)motion.object + th19_laser_length) = motion.length;
 	}
 }
 
@@ -1190,15 +1129,9 @@ static void th19_diag_dump() {
 		th19_players_moved, (unsigned int)th19_players_saved_max,
 		th19_player_step_frames != 0 ? th19_player_step_sum / (float)th19_player_step_frames : 0.0f,
 		th19_player_step_frames);
-	// The sprite is the copy the picture is drawn from, so a player without one is a player that
-	// was projected but drawn where it was (see th19_player_advance)
-	fprintf(file, "player: %u of %u had the sprite that draws them (%u without)\n",
-		th19_players_with_sprite, (unsigned int)th19_players_saved_max, th19_players_without_sprite);
 	th19_player_movement = 0.0f;
 	th19_player_step_sum = 0.0f;
 	th19_player_step_frames = 0;
-	th19_players_with_sprite = 0;
-	th19_players_without_sprite = 0;
 	// If this isn't 0 the game's own logic saw a projected position, which would make the player
 	// move further per frame than it should
 	fprintf(file, "player: %u restore(s) wrong (should stay 0)\n", th19_player_restore_mismatch);
@@ -1208,6 +1141,13 @@ static void th19_diag_dump() {
 		th19_shots_in_play, th19_shots_moved);
 	fprintf(file, "shots: %u of the projected had the sprite that draws them (%u without)\n",
 		th19_shots_with_sprite, th19_shots_without_sprite);
+	// The lasers (see th19_lasers_measure). The last line counts the same objects from the other
+	// side - out of each manager's own counter rather than by walking its list - so a walk that
+	// stopped finding lasers would say so right here: the only difference the two can have is a
+	// laser the draw walk itself leaves out, which is not on screen to project for
+	fprintf(file, "lasers: %u in play, %u projected forward, %u line and %u endless (both sides)\n",
+		th19_lasers_in_play, th19_lasers_projected, th19_lasers_line, th19_lasers_infinite);
+	fprintf(file, "lasers: the managers' own count says %u\n", th19_lasers_managers_say);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -1261,13 +1201,17 @@ static void th19_extra_presentation(float t) {
 	device->SetRenderState(D3DRS_FOGENABLE, 0);
 
 	// The queue was just reset, so the objects have to be drawn again to fill it. The bullets are
-	// drawn where they will be t frames from now; the render bakes the positions into the sprite
-	// queue, so they can go back right after it.
+	// drawn where they will be t frames from now, and so are the player, its shots and the lasers;
+	// the ones whose position is baked into the sprite queue go back right after the render (the
+	// ones the drawing reads itself are put back then just the same, so the game's own logic never
+	// sees a projected one).
 	ToolState::ReadyToDraw();
 	th19_bullets_advance(t);
 	th19_player_advance(t);
 	th19_shots_advance(t);
+	th19_lasers_advance(t);
 	th19_render_objects();
+	th19_lasers_undo();
 	th19_shots_undo();
 	th19_player_undo();
 	th19_bullets_undo();
@@ -1325,10 +1269,12 @@ static HRESULT th19_present_hook() {
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
 
-	// Where the players and their own shots are, and how far they moved - once per game frame,
-	// where the game's own work for it has finished (see th19_player_measure, th19_shots_measure)
+	// Where the players, their own shots and both sides' lasers are, and how far they moved - once
+	// per game frame, where the game's own work for it has finished (see th19_player_measure,
+	// th19_shots_measure and th19_lasers_measure)
 	th19_player_measure();
 	th19_shots_measure();
+	th19_lasers_measure();
 
 	// Where the game's own part of this frame started, so the extras can tell whether they still
 	// fit before the next frame is due. The limiter's own FrameWork() can't be used here: th19 is
