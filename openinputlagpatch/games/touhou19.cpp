@@ -1033,6 +1033,55 @@ static bool th19_scene_transforms = false;
 static unsigned char* th19_tool_frame_address = (unsigned char*)rebase(0x004D715F);
 static unsigned char* th19_tool_draw_address = (unsigned char*)rebase(0x004D72C0);
 
+// ---------------------------------------------------------------------------
+// Frame interpolation: the menus' text
+// ---------------------------------------------------------------------------
+//
+// The menus draw their text through a list of records the game keeps in the manager it holds at
+// [0x5D1A34] (thprac's ASCII_MANAGER_PTR; the object is an AsciiInf). Drawing a string appends a
+// record - 0x13C bytes each, at +0xC78, and the append (FUN_004E6C30) refuses to add any past
+// 0x140 of them - and bumps how many of them there are (+0x19778); the manager's draw tasks (one
+// per text layer, 0x4E6D60 and its neighbours, registered with the draw chain) then walk the
+// records that count covers and draw the ones whose layer (record+0x12C) they are for. The
+// appends happen while the frame is being drawn, so an extra presentation that draws the same
+// screen appends its own records after the ones the game's own pass left behind and draws both -
+// the same text twice, which the alpha blending these screens use turns into text that looks a
+// little denser than the game's own frame shows, or, where the second batch lands somewhere else,
+// into a second copy of it.
+//
+// The count is put back to what the game's own pass started from before every extra presentation:
+// each one then appends its own records from the start of the list, exactly the way the game's own
+// frame did, and what it leaves behind is what the game's own pass left - so both have to come out
+// the same, which is what the diagnostics below count. The count being aged every frame is the
+// other half of it: that happens in the update pass, which the extra presentations don't replay
+// (the manager's aging task FUN_004E6F00 is registered with the update chain at 0x4E7496 with id
+// 8, and it is what drops the records whose life at +0x130 ran out, compacts the rest and writes
+// the surviving count back at 0x4E57E6).
+//
+// The other values the appends touch (the style at manager+0x1977C and up) are copied into each
+// record as it is appended; an extra presentation runs the same drawing code and copies the same
+// values again, so the count is all that has to go back.
+static void** th19_text_object = (void**)rebase(0x005D1A34);
+static const size_t th19_text_record_count = 0x19778;
+static unsigned int th19_text_records;        // when the game's own pass of the walk started
+static unsigned int th19_text_records_after;  // ...and what that pass left behind
+static unsigned int th19_text_records_end;    // ...and what the whole frame left behind
+
+static unsigned int th19_text_count() {
+	void* text = *th19_text_object;
+	return text != nullptr ? *(unsigned int*)((char*)text + th19_text_record_count) : 0;
+}
+
+static void th19_text_records_save() {
+	th19_text_records = th19_text_count();
+}
+
+static void th19_text_records_restore() {
+	void* text = *th19_text_object;
+	if (text != nullptr)
+		*(unsigned int*)((char*)text + th19_text_record_count) = th19_text_records;
+}
+
 // Remembers what the scene is about to be drawn with, then lets the game's own render run exactly
 // as it always did
 static void th19_render_hook() {
@@ -1047,7 +1096,12 @@ static void th19_render_hook() {
 	// not drawn yet (that happens on the return of the render below): the point to watch it from
 	ToolState::WatchFrameReady(th19_tool_frame_address, th19_tool_draw_address);
 
+	// How much text the list holds before the game's own pass of the walk appends anything, and
+	// what it holds once that pass has run - the extra presentations put the first back and have to
+	// come out at the second (see th19_text_record_count above)
+	th19_text_records_save();
 	th19_render_objects();
+	th19_text_records_after = th19_text_count();
 }
 
 // The number of presentations per second the config asks for. 0 means interpolation is off.
@@ -1148,6 +1202,13 @@ static void th19_diag_dump() {
 	fprintf(file, "lasers: %u in play, %u projected forward, %u line and %u endless (both sides)\n",
 		th19_lasers_in_play, th19_lasers_projected, th19_lasers_line, th19_lasers_infinite);
 	fprintf(file, "lasers: the managers' own count says %u\n", th19_lasers_managers_say);
+	// The menus' text (see th19_text_record_count): what the list held when the game's own pass of
+	// the render walk started, what that pass left behind, and what the whole frame left behind.
+	// The last two are the same when the extra presentations put their records where the game's own
+	// pass put its own (which is the point of putting the count back); the third being the bigger
+	// one is them appending on top of the game's records, which draws the same text twice.
+	fprintf(file, "text: %u record(s) at the game's own pass, %u after it, %u at the end of the frame\n",
+		th19_text_records, th19_text_records_after, th19_text_records_end);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -1210,6 +1271,10 @@ static void th19_extra_presentation(float t) {
 	th19_player_advance(t);
 	th19_shots_advance(t);
 	th19_lasers_advance(t);
+	// The text list goes back to how the game's own pass of the walk found it, so this
+	// presentation appends its records where that pass put its own and draws the same text it drew
+	// (see th19_text_record_count above)
+	th19_text_records_restore();
 	th19_render_objects();
 	th19_lasers_undo();
 	th19_shots_undo();
@@ -1361,6 +1426,12 @@ static HRESULT th19_present_hook() {
 			}
 		}
 	}
+
+	// What the frame's presentations left the text list at. The game's own pass is what it is
+	// supposed to end at (see th19_text_record_count above), so a bigger number than that is the
+	// extra presentations having appended on top of the game's records instead of in their place,
+	// which is the text being drawn twice
+	th19_text_records_end = th19_text_count();
 
 	// The extra presentations have put the player's position back by now, and this says whether
 	// they really did (see th19_player_check_restored)
