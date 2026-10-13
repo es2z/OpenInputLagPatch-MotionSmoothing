@@ -293,6 +293,16 @@ static IDirect3DDevice9* th20_device() {
 	return device;
 }
 
+// The menus' text manager and its record count (defined below, after the comment that explains
+// what they are); the render hook needs them before the game's own pass of the walk
+static void* th20_text_object;
+static const size_t th20_text_record_count = 0x1A1BC;
+static unsigned int th20_text_records;        // when the game's own pass of the walk started
+static unsigned int th20_text_records_after;  // ...and what that pass left behind
+static unsigned int th20_text_records_end;    // ...and what the whole frame left behind
+static unsigned int th20_text_count();
+static void th20_text_records_save();
+
 // Remembers what the scene is about to be drawn with, then lets the game's own render run exactly
 // as it always did
 static void __fastcall th20_render_hook(void* scene) {
@@ -307,7 +317,12 @@ static void __fastcall th20_render_hook(void* scene) {
 	// drawn yet (that happens on the return of the render below): the point to watch it from
 	ToolState::WatchFrameReady(th20_tool_frame_address, th20_tool_draw_address);
 
+	// How much text the manager holds before the game's own pass of the walk appends anything, and
+	// what it holds once that pass has run - the extra presentations put the first back and have to
+	// come out at the second (see the menus' text above)
+	th20_text_records_save();
 	th20_render_objects(scene);
+	th20_text_records_after = th20_text_count();
 }
 
 // The number of presentations per second the config asks for. 0 means interpolation is off.
@@ -769,6 +784,59 @@ static void th20_shots_undo() {
 }
 
 // ---------------------------------------------------------------------------
+// Frame interpolation: the menus' text
+// ---------------------------------------------------------------------------
+//
+// th20's text manager is an AsciiInf, the same class th19 has (its RTTI name is at 0x5B45D8 and
+// its constructor FUN_0046C080, which picks ascii.anm, ascii_960.anm or ascii1280.anm by the
+// resolution). Drawing a string appends a record: the records are a flat array at manager+0x11BC,
+// 0x140 bytes each (FUN_0046B7F0 moves them around with 0x140 and the appends FUN_0046CA40 and
+// FUN_0046CE90 write at `manager + 0x11BC + count * 0x140`), the count is at manager+0x1A1BC and
+// the append refuses to add any past 0x140 of them (0x46CA4C `cmp [eax+1A1BCh], 140h`). How long a
+// record lives is at record+0x134, aged every frame by the manager's update task (id 8,
+// FUN_00470300 -> FUN_0046B7F0, which drops what ran out and compacts the rest).
+//
+// The appends happen while the frame is being drawn, so an extra presentation that draws the same
+// screen appends its own records after the ones the game's own pass left behind and draws both -
+// the same text twice, which these screens' alpha blending turns into text that looks a little
+// denser than the game's own frame shows, or, where the second batch lands somewhere else, into a
+// second copy of it.
+//
+// The count is put back to what the game's own pass started from before every extra presentation:
+// each one then appends its own records from the start of the array, exactly the way the game's own
+// frame did, and what it leaves behind is what the game's own pass left - so both have to come out
+// the same, which is what the diagnostics below count. The aging is the other half of it, and that
+// happens in the update pass, which the extra presentations don't replay.
+//
+// Where the manager lives is the one thing th19 could read out of a global and th20 cannot: this
+// game builds it on its loading thread (FUN_00471060 makes the object and calls the constructor at
+// 0x471084, and nothing stores the result - the loader only tests it), so it is caught where it is
+// constructed instead, by taking over that one call.
+static auto th20_text_constructor = (int(__fastcall*)(void*))rebase(0x0046C080);
+
+static int __fastcall th20_text_constructor_hook(void* text) {
+	th20_text_object = text;
+	return th20_text_constructor(text);
+}
+
+static unsigned int th20_text_count() {
+	if (th20_text_object == nullptr ||
+		!th20_readable((char*)th20_text_object + th20_text_record_count, 4))
+		return 0;
+	return *(unsigned int*)((char*)th20_text_object + th20_text_record_count);
+}
+
+static void th20_text_records_save() {
+	th20_text_records = th20_text_count();
+}
+
+static void th20_text_records_restore() {
+	if (th20_text_object != nullptr &&
+		th20_readable((char*)th20_text_object + th20_text_record_count, 4))
+		*(unsigned int*)((char*)th20_text_object + th20_text_record_count) = th20_text_records;
+}
+
+// ---------------------------------------------------------------------------
 // Frame interpolation, stage 1: the straight lasers
 // ---------------------------------------------------------------------------
 //
@@ -1038,6 +1106,14 @@ static void th20_lasers_undo() {
 	}
 }
 
+// What the frame's presentations left the text list at. The game's own pass is what it is supposed
+// to end at (see the menus' text above), so a bigger number than that is the extra presentations
+// having appended on top of the game's records instead of in their place, which is the text being
+// drawn twice.
+static void th20_text_records_end_check() {
+	th20_text_records_end = th20_text_count();
+}
+
 // Moves every bullet in play forward by t frames (t = 0 is the state the game is in) and remembers
 // what it changed, so th20_bullets_undo can put it back.
 static void th20_bullets_advance(float t) {
@@ -1195,6 +1271,13 @@ static void th20_diag_dump() {
 	fprintf(file, "lasers: %u in play, %u projected forward, %u line and %u endless\n",
 		th20_lasers_in_play, th20_lasers_projected, th20_lasers_line, th20_lasers_infinite);
 	fprintf(file, "lasers: the managers' own count says %u\n", th20_lasers_managers_say);
+	// The menus' text (see the menus' text above): what the array held when the game's own pass of
+	// the render walk started, what that pass left behind, and what the whole frame left behind. The
+	// last two are the same when the extra presentations put their records where the game's own pass
+	// put its own (which is the point of putting the count back); the third being the bigger one is
+	// them appending on top of the game's records, which draws the same text twice.
+	fprintf(file, "text: %u record(s) at the game's own pass, %u after it, %u at the end of the frame\n",
+		th20_text_records, th20_text_records_after, th20_text_records_end);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -1252,6 +1335,9 @@ static void th20_extra_presentation(float t) {
 	th20_player_advance(t);
 	th20_shots_advance(t);
 	th20_lasers_advance(t);
+	// The text list goes back to how the game's own pass of the walk found it, so this
+	// presentation appends its records where that pass put its own and draws the same text it drew
+	th20_text_records_restore();
 	th20_render_objects(*th20_scene);
 	th20_lasers_undo();
 	th20_shots_undo();
@@ -1407,6 +1493,9 @@ static HRESULT th20_present_hook() {
 		}
 	}
 
+	// What the frame's presentations left the text list at (see the menus' text above)
+	th20_text_records_end_check();
+
 	// Record the frame for the diagnostics
 	{
 		Th20DiagFrame& frame = th20_diag_frames[th20_diag_count % th20_diag_frames_max];
@@ -1502,6 +1591,18 @@ static void th20_install_interpolation() {
 		} else {
 			printf("th20 render call at 0x%x doesn't look like a known one, skipping!\n", address);
 		}
+	}
+
+	// Catch the text manager where the loading thread builds it (see the menus' text above): the
+	// call at 0x471084 is the one that hands the new object to FUN_0046C080, so taking that over is
+	// what puts the object somewhere this can reach it
+	{
+		BYTE* site = (BYTE*)rebase(0x00471084);
+		if (site[0] == 0xE8 &&
+			*(DWORD*)(site + 1) == rebase(0x0046C080) - (rebase(0x00471084) + 5))
+			patch_call(rebase(0x00471084), (void*)th20_text_constructor_hook);
+		else
+			printf("th20 text constructor call at 0x471084 doesn't look like a known one, skipping!\n");
 	}
 
 	// Take over the presents in the frame functions (see th20_hook_present)
