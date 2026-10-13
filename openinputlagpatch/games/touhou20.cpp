@@ -768,6 +768,276 @@ static void th20_shots_undo() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the straight lasers
+// ---------------------------------------------------------------------------
+//
+// The lasers live in a manager of their own, in the side table's +0x14 (the same slot th19 keeps
+// its laser manager in): the manager's constructor is FUN_004D3CA0, which the side record stores
+// through FUN_0041DE50 - `*(record + 0x14) = manager`. That constructor loads bullet.anm into
+// +0x48, registers the update task FUN_004D5B10 as 0x25 and the draw task FUN_004D5BB0 as 0x27,
+// and makes the list its lasers go on at +0x10 (FUN_0044A640(manager + 0x10, 0)); the object
+// itself is the 0x58 bytes FUN_004C80E0 allocates.
+//
+// The individual lasers are made by FUN_004D47F0(manager, kind, parameters), whose kinds are 0
+// LaserLineInf, 1 LaserInfiniteInf, 2 LaserBeamInf and 3 LaserCurveInf (the four debug strings in
+// laser.cpp name them, one per case). It refuses to add any past 0x200 (the count at manager+0x28),
+// numbers them from 0x10000 up (manager+0x2C, written into the object at +0x8C), calls the object's
+// Init through its vtable's +0x14 and then threads it onto the list with FUN_004C9300, which is
+//
+//   FUN_0044A670(object + 8, object);          the node lives inside the object, at +8
+//   FUN_0044A6B0(manager + 0x10, object + 8);  ...and is what goes on the list
+//   ++manager[0x28];
+//
+// A node is {object, next} - FUN_0044A670 writes the object at +0 and zeroes +4 - and FUN_0040FF90
+// is `*(this + 4)`, which is the field both the game's own walks and this one follow. So the list
+// is walked from the newest node at manager+0x14 by following node+4 until there is none, taking
+// the object from node+0, with the manager's own count at +0x28 as the bound. That is the same
+// shape th19's lasers have, and it is what the game's own draw walk FUN_004D00C0 does (it begins
+// the list at manager+0x10 and lets each object draw itself through vtable+0x20).
+//
+// Where a laser is and which way it points is read out of it where the picture is drawn, in the
+// render walk the extra presentations replay, so writing those fields is all an extra presentation
+// has to do - the same as the player, and unlike the shots. Both of the straight kinds draw from
+// the same fields: their draw functions (FUN_004D0290 for LaserLineInf, FUN_004D01D0 for
+// LaserInfiniteInf, both reached through vtable+0x20) set their animation's position from object+0x58
+// and its angle from object+0x70, and the line kind asks FUN_004D6BD0 for its far end, which is
+// `position + (cos, sin) * object+0x74` - so the position is at +0x58, the angle at +0x70 and the
+// length at +0x74. The kind that draws nothing but a beam and the curve one are left alone: the
+// beam's own update is a stub (it is not moved at all), and the curve one is not a straight line.
+//
+// How they move is measured rather than read, for the reason the player's and the shots' motion is:
+// the kinds do not share the fields they are moved by, and the line kind grows its length before it
+// moves. What the game's own last frame did to the three drawn fields is what an extra presentation
+// projects forward, which is true of both kinds without knowing either one's movement.
+
+static const size_t th20_laser_manager = 0x14;         // in a side record
+static const size_t th20_laser_newest = 0x14;          // in the manager: the newest node of the list
+static const size_t th20_laser_manager_count = 0x28;   // ...and how many are on it
+
+// In a node: the object it holds and the node before it. In an object: the state the draw walk
+// leaves out, and the three fields the picture is drawn from
+static const size_t th20_laser_node_object = 0x0;
+static const size_t th20_laser_node_next = 0x4;
+static const size_t th20_laser_state = 0x20;
+static const size_t th20_laser_position = 0x58;
+static const size_t th20_laser_angle = 0x70;
+static const size_t th20_laser_length = 0x74;
+static const size_t th20_laser_id = 0x8C;
+static const unsigned int th20_laser_max = 0x200;      // the cap the maker checks
+
+// How far one game frame can move a laser before it is not a step any more but a laser that was
+// replaced or whose picture jumped: a laser moves a few pixels a frame at most, turns far slower
+// than a radian a frame, and grows by less than its own length at once
+static const float th20_laser_step_max = 48.0f;
+static const float th20_laser_turn_max = 1.0f;
+static const float th20_laser_growth_max = 256.0f;
+
+// Whether an object is one of the two kinds this projects, by its vtable (read out of the two
+// constructors: FUN_004C88E0 writes 0x571148 into a LaserLineInf, FUN_004C8880 0x5712E8 into a
+// LaserInfiniteInf)
+static bool th20_laser_straight(const void* object) {
+	if (!th20_readable(object, 4))
+		return false;
+	const DWORD vtable = *(const DWORD*)object;
+	return vtable == rebase(0x00571148) || vtable == rebase(0x005712E8);
+}
+
+// One entry per laser in play: where the game's own presentation showed it and how far the game's
+// own frame moved it
+static const size_t th20_lasers_max = th20_laser_max * 2;
+struct Th20LaserMotion {
+	void* object;      // the laser this was measured from
+	unsigned int id;   // ...and the id it had, so an address reused by a new laser is told apart
+	bool seen;         // whether the measurement being made found it again
+	bool written;      // whether the presentation being drawn moved it
+	float position[3]; // where the game's own presentation showed it
+	float angle;
+	float length;
+	float delta[3];    // the step the last game frame moved it by
+	float angle_delta;
+	float length_delta;
+};
+static Th20LaserMotion th20_laser_motion[th20_lasers_max];
+static size_t th20_laser_motions;
+
+// What the last measurement and the last presentation saw, for the diagnostics
+static unsigned int th20_lasers_in_play;
+static unsigned int th20_lasers_managers_say;
+static unsigned int th20_lasers_projected;
+static unsigned int th20_lasers_line;
+static unsigned int th20_lasers_infinite;
+
+// The manager a side record holds, if it looks like the one this was written for: its count is
+// within the cap the maker checks, and the fields around the list are readable
+static char* th20_laser_manager_at(size_t side) {
+	char* manager = *(char**)(th20_side_table + th20_side_stride * side + th20_laser_manager);
+	if (manager == nullptr)
+		return nullptr;
+	if (!th20_readable(manager + th20_laser_manager_count, 4) ||
+		!th20_readable(manager + th20_laser_newest, 4))
+		return nullptr;
+	if (*(unsigned int*)(manager + th20_laser_manager_count) > th20_laser_max)
+		return nullptr;
+	return manager;
+}
+
+// Measures one laser: what the game's own frame did to the fields the picture is drawn from. The
+// first frame a laser is seen in has no step to project, so it starts at 0.
+static void th20_laser_track(void* object) {
+	const unsigned int id = *(const unsigned int*)((char*)object + th20_laser_id);
+
+	Th20LaserMotion* motion = nullptr;
+	for (size_t i = 0; i < th20_laser_motions; ++i) {
+		if (th20_laser_motion[i].object == object && th20_laser_motion[i].id == id) {
+			motion = &th20_laser_motion[i];
+			break;
+		}
+	}
+	const bool fresh = motion == nullptr;
+	if (fresh) {
+		if (th20_laser_motions >= th20_lasers_max)
+			return;
+		motion = &th20_laser_motion[th20_laser_motions++];
+		motion->object = object;
+		motion->id = id;
+		motion->written = false;
+	}
+	motion->seen = true;
+
+	const float* position = (const float*)((char*)object + th20_laser_position);
+	const float angle = *(const float*)((char*)object + th20_laser_angle);
+	const float length = *(const float*)((char*)object + th20_laser_length);
+
+	for (int axis = 0; axis < 3; ++axis) {
+		float delta = fresh ? 0.0f : position[axis] - motion->position[axis];
+		if (!(fabsf(delta) <= th20_laser_step_max))
+			delta = 0.0f;
+		motion->delta[axis] = delta;
+		motion->position[axis] = position[axis];
+	}
+	float angle_delta = fresh ? 0.0f : angle - motion->angle;
+	if (!(fabsf(angle_delta) <= th20_laser_turn_max))
+		angle_delta = 0.0f;
+	motion->angle_delta = angle_delta;
+	motion->angle = angle;
+	float length_delta = fresh ? 0.0f : length - motion->length;
+	if (!(fabsf(length_delta) <= th20_laser_growth_max))
+		length_delta = 0.0f;
+	motion->length_delta = length_delta;
+	motion->length = length;
+}
+
+// Measures every laser the game has in play, once per game frame, where the game has finished its
+// own (in the present before the extra presentations run, next to the player's own measuring)
+static void th20_lasers_measure() {
+	th20_lasers_in_play = 0;
+	th20_lasers_managers_say = 0;
+	for (size_t i = 0; i < th20_laser_motions; ++i)
+		th20_laser_motion[i].seen = false;
+
+	// A picture the game is not updating is not moving its lasers either, so there is no step to
+	// measure for it (the same flags the game's own laser tasks stop for)
+	if (th20_bullets_held())
+		return;
+
+	for (size_t side = 0; side < th20_side_max; ++side) {
+		char* manager = th20_laser_manager_at(side);
+		if (manager == nullptr)
+			continue;
+
+		// The manager's own count is what the game keeps up to date as lasers are made and
+		// released, so it is the bound this walk uses; the slack is only so a count that was off by
+		// a frame can't hide a laser
+		const unsigned int count = *(unsigned int*)(manager + th20_laser_manager_count);
+		th20_lasers_managers_say += count;
+
+		void* node = *(void**)(manager + th20_laser_newest);
+		for (unsigned int guard = 0; node != nullptr && guard < count + 8 && guard < th20_lasers_max;
+			++guard) {
+			if (!th20_readable(node, 8))
+				break;
+			void* object = *(void**)((char*)node + th20_laser_node_object);
+			void* next = *(void**)((char*)node + th20_laser_node_next);
+
+			// The draw walk leaves out a laser whose state says so, so there is nothing on screen
+			// to project for it; every other field read here is behind a readability check
+			if (th20_laser_straight(object) &&
+				*(const int*)((char*)object + th20_laser_state) != 1 &&
+				th20_readable((char*)object + th20_laser_position, 12)) {
+				++th20_lasers_in_play;
+				th20_laser_track(object);
+			}
+			node = next;
+		}
+	}
+
+	// Lasers that are gone keep no entry, so the list holds this frame's lasers and only them
+	size_t kept = 0;
+	for (size_t i = 0; i < th20_laser_motions; ++i) {
+		if (!th20_laser_motion[i].seen)
+			continue;
+		if (kept != i)
+			th20_laser_motion[kept] = th20_laser_motion[i];
+		++kept;
+	}
+	th20_laser_motions = kept;
+}
+
+// Moves every laser t of the last game frame's step ahead of where the game's own presentation left
+// it. What is written is what the drawing reads, and the values it writes over are the ones
+// measured, so th20_lasers_undo can put them back out of the same entries.
+static void th20_lasers_advance(float t) {
+	th20_lasers_projected = 0;
+	th20_lasers_line = 0;
+	th20_lasers_infinite = 0;
+	if (th20_bullets_held())
+		return;
+
+	for (size_t i = 0; i < th20_laser_motions; ++i) {
+		Th20LaserMotion& motion = th20_laser_motion[i];
+		motion.written = false;
+		if (motion.object == nullptr || !th20_laser_straight(motion.object) ||
+			!th20_readable((char*)motion.object + th20_laser_position, 12))
+			continue;
+
+		float* position = (float*)((char*)motion.object + th20_laser_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = motion.position[axis] + motion.delta[axis] * t;
+		*(float*)((char*)motion.object + th20_laser_angle) = motion.angle + motion.angle_delta * t;
+		// A length the drawing read as negative would point the beam backwards, so it never is one
+		const float length = motion.length + motion.length_delta * t;
+		*(float*)((char*)motion.object + th20_laser_length) = length > 0.0f ? length : 0.0f;
+
+		motion.written = true;
+		++th20_lasers_projected;
+		if (*(const DWORD*)motion.object == rebase(0x00571148))
+			++th20_lasers_line;
+		else
+			++th20_lasers_infinite;
+	}
+}
+
+// Puts the lasers back, so the game's own logic sees the state it left behind and not the projected
+// one.
+static void th20_lasers_undo() {
+	for (size_t i = 0; i < th20_laser_motions; ++i) {
+		Th20LaserMotion& motion = th20_laser_motion[i];
+		if (!motion.written)
+			continue;
+		motion.written = false;
+		if (motion.object == nullptr || !th20_laser_straight(motion.object) ||
+			!th20_readable((char*)motion.object + th20_laser_position, 12))
+			continue;
+
+		float* position = (float*)((char*)motion.object + th20_laser_position);
+		for (int axis = 0; axis < 3; ++axis)
+			position[axis] = motion.position[axis];
+		*(float*)((char*)motion.object + th20_laser_angle) = motion.angle;
+		*(float*)((char*)motion.object + th20_laser_length) = motion.length;
+	}
+}
+
 // Moves every bullet in play forward by t frames (t = 0 is the state the game is in) and remembers
 // what it changed, so th20_bullets_undo can put it back.
 static void th20_bullets_advance(float t) {
@@ -918,6 +1188,13 @@ static void th20_diag_dump() {
 		th20_shots_in_play, th20_shots_moved);
 	fprintf(file, "shots: %u of the projected had the sprite that draws them (%u without)\n",
 		th20_shots_with_sprite, th20_shots_without_sprite);
+	// The lasers (see th20_lasers_measure). The last line counts the same objects from the other
+	// side - out of each manager's own counter rather than by walking its list - so a walk that
+	// stopped finding lasers would say so right here: the only difference the two can have is a
+	// laser the draw walk itself leaves out, which is not on screen to project for
+	fprintf(file, "lasers: %u in play, %u projected forward, %u line and %u endless\n",
+		th20_lasers_in_play, th20_lasers_projected, th20_lasers_line, th20_lasers_infinite);
+	fprintf(file, "lasers: the managers' own count says %u\n", th20_lasers_managers_say);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -974,7 +1251,9 @@ static void th20_extra_presentation(float t) {
 	th20_bullets_advance(t);
 	th20_player_advance(t);
 	th20_shots_advance(t);
+	th20_lasers_advance(t);
 	th20_render_objects(*th20_scene);
+	th20_lasers_undo();
 	th20_shots_undo();
 	th20_player_undo();
 	th20_bullets_undo();
@@ -1007,6 +1286,7 @@ static HRESULT th20_present_hook() {
 	// it has finished (see th20_player_measure)
 	th20_player_measure();
 	th20_shots_measure();
+	th20_lasers_measure();
 
 	static bool freq_queried = false;
 	if (!freq_queried) {
