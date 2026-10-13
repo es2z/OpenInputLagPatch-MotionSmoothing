@@ -106,6 +106,10 @@ is also the record of what has actually been verified rather than just what was 
   both extrapolate from the previous frame's step, which is first order for anything that changes
   speed within a frame (a laser in its first frame, or one changing phase).
 
+### Changed
+
+- **The shipped config and the built-in default for `Sleep` go back to `1` (the vpatch wait)** (`eb6f481`)
+
 ## 2026-10-12
 
 ### Added
