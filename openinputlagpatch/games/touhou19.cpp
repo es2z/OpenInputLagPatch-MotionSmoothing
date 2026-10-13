@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "patch_util.h"
 #include "limiter.h"
 #include "d3d9_hook.h"
@@ -442,6 +443,640 @@ static void th19_bullets_undo() {
 	th19_saved_bullets_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player
+// ---------------------------------------------------------------------------
+//
+// The player is a class of its own (PlayerInf, one per side, at side table + 4) and it is drawn
+// through one set of virtual calls per character, so its position was found by reading the
+// game's own code where it uses one: the barrier, when it breaks, spawns its effect at the
+// player's position by handing "player->0x3C->4 + 0x68C" to the effect spawner - and the object
+// that chain ends at is the player itself, so the player's position is at PlayerInf+0x68C (x, y
+// and z as three floats; the field's coordinates have their origin at the middle of each side's
+// own field, which is why the two sides' players sit at different x).
+//
+// Unlike the bullets the player has no velocity to read: what it moves by comes out of the input
+// the game processed that frame, in per character code. It is measured instead, the way the games
+// after th13 measure their players: the position the game's own presentation showed is kept, and
+// so is how far the player moved to reach it, and an extra presentation draws the player that
+// same position moved t of that step further along - extrapolation, so the picture is ahead of
+// the game's own frame rather than behind it. A step larger than 48px isn't a step: the player
+// died, respawned or the stage changed, and 0 is used for the frame the measurement starts on.
+//
+// The position the game draws the player from is read by its own drawing code, which runs in the
+// render walk the extra presentations replay, so writing the position is all an extra
+// presentation needs - and it puts it back right after the walk, so the game's logic never sees
+// the projected one.
+
+// Every object the game draws keeps its own position at +0x68C - that is where the drawing
+// helpers all over 0x41xxxx read it from - and the player's own position is one of those
+static const size_t th19_player_position = 0x68C;
+
+// Whether a pointer looks like something that can be read, so a read that has gone stale can't
+// take the game down
+static bool th19_readable(const void* pointer, size_t size) {
+	const DWORD address = (DWORD)pointer;
+	return address > 0x10000 && address < 0x7FFF0000 && !IsBadReadPtr(pointer, size);
+}
+
+struct Th19PlayerMotion {
+	void* player;      // the player object this was measured from
+	bool tracked;
+	float position[3]; // where the game's own presentation showed it
+	float delta[3];    // how far it moved to get there (the last game frame's step)
+};
+static Th19PlayerMotion th19_player_motion[2];
+
+// What the presentation being drawn moved, so it can be put back (one per side: a presentation
+// draws both players). The position the game's own logic moves is the player's; the sprite that
+// draws the player keeps a copy of it, and that copy is what the drawing code reads - the game's
+// own update writes it there (at 0x540DF3: movq [sprite+614h], player's +68C), and that update is
+// not replayed, so the copy has to be moved as well or the picture doesn't move at all.
+static float* th19_player_written[2];
+static float th19_player_written_value[2][3];
+static float* th19_player_sprite_written[2];
+static float th19_player_sprite_written_value[2][3];
+// In the player: the id of the sprite that draws it (pushed at 0x540DD1)
+static const size_t th19_player_sprite_id = 0x7C;
+static unsigned int th19_players_with_sprite;
+static unsigned int th19_players_without_sprite;
+static const size_t th19_players_saved_max = 2;
+static unsigned int th19_players_moved;
+static float th19_player_movement; // the largest step seen since the last dump, in pixels
+static float th19_player_step_sum; // the steps added up, over the frames that had one
+static unsigned int th19_player_step_frames;
+
+// Measures where the player is and how far it moved, once per game frame, where the game has
+// finished its own (in the present before the extra presentations run)
+static void th19_player_measure() {
+	if (th19_bullets_held())
+		return;
+
+	for (size_t side = 0; side < 2; ++side) {
+		Th19PlayerMotion& motion = th19_player_motion[side];
+		void* player = *(void**)(th19_side_table + th19_side_stride * side + 4);
+		if (player == nullptr || !th19_readable((char*)player + th19_player_position, 12)) {
+			motion.tracked = false;
+			continue;
+		}
+
+		const float* position = (const float*)((char*)player + th19_player_position);
+		float move_x = 0.0f;
+		float move_y = 0.0f;
+		float move_z = 0.0f;
+		for (int axis = 0; axis < 3; ++axis) {
+			// A player that wasn't this object a frame ago has no step to project
+			float delta = 0.0f;
+			if (motion.tracked && motion.player == player) {
+				delta = position[axis] - motion.position[axis];
+				if (!(fabsf(delta) <= 48.0f))
+					delta = 0.0f;
+			}
+			motion.delta[axis] = delta;
+			motion.position[axis] = position[axis];
+			if (axis == 0)
+				move_x = delta;
+			else if (axis == 1)
+				move_y = delta;
+			else
+				move_z = delta;
+		}
+		// How far the player actually moved in the frame, not how far it moved along one axis:
+		// a step that goes diagonally is the same speed as one that goes straight
+		const float move = sqrtf(move_x * move_x + move_y * move_y + move_z * move_z);
+		if (move > th19_player_movement)
+			th19_player_movement = move;
+		if (move > 0.0f) {
+			th19_player_step_sum += move;
+			++th19_player_step_frames;
+		}
+		motion.player = player;
+		motion.tracked = true;
+	}
+}
+
+// Moves both players t of the last frame's step ahead of where the game's presentation left them
+static void th19_player_advance(float t) {
+	for (size_t side = 0; side < 2; ++side) {
+		th19_player_written[side] = nullptr;
+		th19_player_sprite_written[side] = nullptr;
+	}
+	th19_players_moved = 0;
+	th19_players_with_sprite = 0;
+	th19_players_without_sprite = 0;
+
+	if (th19_bullets_held())
+		return;
+
+	for (size_t side = 0; side < 2; ++side) {
+		const Th19PlayerMotion& motion = th19_player_motion[side];
+		if (!motion.tracked || motion.player == nullptr ||
+			!th19_readable((char*)motion.player + th19_player_position, 12))
+			continue;
+
+		float* position = (float*)((char*)motion.player + th19_player_position);
+		for (int axis = 0; axis < 3; ++axis) {
+			th19_player_written_value[side][axis] = position[axis];
+			position[axis] += motion.delta[axis] * t;
+		}
+		th19_player_written[side] = position;
+		++th19_players_moved;
+
+		// ...and the copy the drawing code reads (see above)
+		void* sprite = th19_sprite_for_id(
+			*(const unsigned int*)((char*)motion.player + th19_player_sprite_id));
+		if (sprite != nullptr) {
+			float* drawn = (float*)((char*)sprite + th19_sprite_position);
+			for (int axis = 0; axis < 3; ++axis) {
+				th19_player_sprite_written_value[side][axis] = drawn[axis];
+				drawn[axis] = position[axis];
+			}
+			th19_player_sprite_written[side] = drawn;
+			++th19_players_with_sprite;
+		} else {
+			++th19_players_without_sprite;
+		}
+	}
+}
+
+static void th19_player_undo() {
+	for (size_t side = 0; side < 2; ++side) {
+		if (th19_player_written[side] != nullptr) {
+			for (int axis = 0; axis < 3; ++axis)
+				th19_player_written[side][axis] = th19_player_written_value[side][axis];
+			th19_player_written[side] = nullptr;
+		}
+		if (th19_player_sprite_written[side] != nullptr) {
+			for (int axis = 0; axis < 3; ++axis)
+				th19_player_sprite_written[side][axis] = th19_player_sprite_written_value[side][axis];
+			th19_player_sprite_written[side] = nullptr;
+		}
+	}
+}
+
+// Whether the positions the extra presentations moved really were put back. They always should
+// be, but it is an assumption until something counts the times they weren't: an extra
+// presentation that left the player moved would be a step the game's own logic then walks on top
+// of, which would show up as the player moving further per frame than it should.
+static unsigned int th19_player_restore_mismatch;
+
+static void th19_player_check_restored() {
+	for (size_t side = 0; side < 2; ++side) {
+		const Th19PlayerMotion& motion = th19_player_motion[side];
+		if (!motion.tracked || motion.player == nullptr)
+			continue;
+		if (!th19_readable((char*)motion.player + th19_player_position, 12))
+			continue;
+		const float* position = (const float*)((char*)motion.player + th19_player_position);
+		for (int axis = 0; axis < 3; ++axis) {
+			if (position[axis] != motion.position[axis]) {
+				++th19_player_restore_mismatch;
+				break;
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1, the player: a read-only probe (diagnostics only)
+// ---------------------------------------------------------------------------
+//
+// The player is where th19 differs the most from the games before it: it is a C++ class of its
+// own (PlayerInf, 0x14C48 bytes, one per side, at side table + 4), it is drawn through a virtual
+// call its own ANM manager makes, and there is one set of those calls per character - pl00func.cpp
+// alone brings BombReimuInf, AuraReimuInf, EXOnmyoInf, EXReigekiInf and EXReimuInf, and every
+// character has its own ECL. What the projection needs out of all that is where the player is and
+// where it is drawn, and rather than read the per character draw code for each of them, this
+// reports it. The drawing helpers all over 0x41xxxx read an object's own position from +0x68C
+// (hundreds of "movq xmm0, [eax+68Ch]" sites), so a candidate object whose +0x68C keeps moving is
+// the player, or something following it - and the diagnostics say which candidate that is, where
+// it is and how far it moves. Reads only, and only behind a readability check, so it can't take
+// the game down; it is here to be replaced by the projection once the candidates are known.
+
+static const size_t th19_player_probe_max = 10;
+struct Th19PlayerProbe {
+	const char* what;
+	void* object;
+	bool seen;
+	float value[2];
+	float max_move;
+};
+static Th19PlayerProbe th19_player_probe[2][th19_player_probe_max];
+
+static void th19_player_probe_frame() {
+	for (size_t side = 0; side < 2; ++side) {
+		char* record = th19_side_table + th19_side_stride * side;
+		void* player = *(void**)(record + 4);
+
+		void* candidates[th19_player_probe_max];
+		const char* what[th19_player_probe_max];
+		size_t count = 0;
+		candidates[count] = player; what[count] = "player"; ++count;
+		if (th19_readable((char*)player + 0x3C, 4)) {
+			void* inner = *(void**)((char*)player + 0x3C);
+			candidates[count] = inner; what[count] = "player->3C"; ++count;
+			if (th19_readable((char*)inner + 4, 4)) {
+				candidates[count] = *(void**)((char*)inner + 4);
+				what[count] = "player->3C->4"; ++count;
+			}
+		}
+		if (th19_readable((char*)player + 0x2238, 4)) {
+			candidates[count] = *(void**)((char*)player + 0x2238);
+			what[count] = "player->2238"; ++count;
+		}
+		candidates[count] = *(void**)(record + 0x14); what[count] = "side+14"; ++count;
+		candidates[count] = *(void**)(record + 0x18); what[count] = "side+18"; ++count;
+		candidates[count] = *(void**)(record + 0x20); what[count] = "side+20"; ++count;
+		candidates[count] = *(void**)(record + 0x2C); what[count] = "side+2C"; ++count;
+
+		for (size_t i = 0; i < count; ++i) {
+			Th19PlayerProbe& probe = th19_player_probe[side][i];
+			probe.what = what[i];
+			probe.object = candidates[i];
+			if (!th19_readable((char*)candidates[i] + th19_player_position, 8)) {
+				probe.seen = false;
+				continue;
+			}
+			const float* position = (const float*)((char*)candidates[i] + th19_player_position);
+			const float x = position[0];
+			const float y = position[1];
+			if (probe.seen) {
+						const float dx = x - probe.value[0];
+						const float dy = y - probe.value[1];
+						const float move = sqrtf(dx * dx + dy * dy);
+				if (move > probe.max_move && move < 64.0f) // ignore teleports and object churn
+					probe.max_move = move;
+			}
+			probe.value[0] = x;
+			probe.value[1] = y;
+			probe.seen = true;
+		}
+	}
+}
+
+static void th19_player_probe_dump(FILE* file) {
+	for (size_t side = 0; side < 2; ++side) {
+		for (size_t i = 0; i < th19_player_probe_max; ++i) {
+			Th19PlayerProbe& probe = th19_player_probe[side][i];
+			if (probe.what == nullptr)
+				break;
+			if (!probe.seen) {
+				fprintf(file, "side %u %-13s: 0x%08x (no readable position)\n",
+					(unsigned int)side, probe.what, (unsigned int)probe.object);
+				continue;
+			}
+			fprintf(file, "side %u %-13s: 0x%08x at (%.2f, %.2f), moves up to %.2f px a frame\n",
+				(unsigned int)side, probe.what, (unsigned int)probe.object,
+				probe.value[0], probe.value[1], probe.max_move);
+			// So that "up to" means since the last dump, like the player's own lines do (a
+			// maximum that never resets can't say anything about how fast the player is going now)
+			probe.max_move = 0.0f;
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: whatever else the player puts on screen (probe)
+// ---------------------------------------------------------------------------
+//
+// The player's own shots, the things its ability cards put out and the rest of what it draws are
+// objects of their own, and the objects a side keeps are on the lists its own scene walks (the
+// side object at side table + 0x14, walked by FUN_00530760: a chain of slots, each {object,
+// next}, whose head is at the side object's +0x14). Every object that is drawn keeps its own
+// position at +0x68C - that is where the drawing helpers all over 0x41xxxx read it from, and it
+// is where the player's own position turned out to be - so listing what is on those lists, with
+// the class each object belongs to (its vtable) and how far it moves, says which of them belong
+// to the player and what their classes are called (the classes' RTTI is looked up in the
+// disassembly the same way LaserLineInf and the rest were). Reads only, behind a readability
+// check, and it goes away once the classes are known and projected.
+
+static const size_t th19_objects_probe_max = 16;
+struct Th19ObjectProbe {
+	void* object;
+	unsigned int vtable;
+	bool on_list;
+	float value[2];
+	float max_move;
+};
+static Th19ObjectProbe th19_objects_probe[2][th19_objects_probe_max];
+
+static void th19_objects_probe_frame() {
+	for (size_t side = 0; side < 2; ++side) {
+		Th19ObjectProbe* probes = th19_objects_probe[side];
+		for (size_t i = 0; i < th19_objects_probe_max; ++i)
+			probes[i].on_list = false;
+
+		char* side_object = *(char**)(th19_side_table + th19_side_stride * side + 0x14);
+		if (!th19_readable(side_object + 0x14, 4))
+			continue;
+
+		void* slot = *(void**)(side_object + 0x14);
+		for (size_t guard = 0; slot != nullptr && guard < 256; ++guard) {
+			if (!th19_readable(slot, 8))
+				break;
+			void* object = *(void**)slot;
+			void* next = *(void**)((char*)slot + 4);
+			if (th19_readable(object, 4) &&
+				th19_readable((char*)object + th19_player_position, 8)) {
+				Th19ObjectProbe* probe = nullptr;
+				Th19ObjectProbe* free_probe = nullptr;
+				for (size_t i = 0; i < th19_objects_probe_max; ++i) {
+					if (probes[i].object == object) {
+						probe = &probes[i];
+						break;
+					}
+					if (free_probe == nullptr && !probes[i].on_list)
+						free_probe = &probes[i];
+				}
+				if (probe == nullptr) {
+					probe = free_probe;
+					if (probe != nullptr) {
+						probe->object = object;
+						probe->vtable = *(unsigned int*)object;
+						probe->max_move = 0.0f;
+					}
+				}
+				if (probe != nullptr) {
+					const float* position = (const float*)((char*)object + th19_player_position);
+					const float x = position[0];
+					const float y = position[1];
+					if (probe->on_list) {
+						const float dx = x - probe->value[0];
+						const float dy = y - probe->value[1];
+						const float move = sqrtf(dx * dx + dy * dy);
+						if (move > probe->max_move && move < 64.0f) // ignore teleports and churn
+							probe->max_move = move;
+					}
+					probe->value[0] = x;
+					probe->value[1] = y;
+					probe->on_list = true;
+				}
+			}
+			slot = next;
+		}
+	}
+}
+
+static void th19_objects_probe_dump(FILE* file) {
+	for (size_t side = 0; side < 2; ++side) {
+		for (size_t i = 0; i < th19_objects_probe_max; ++i) {
+			const Th19ObjectProbe& probe = th19_objects_probe[side][i];
+			if (probe.object == nullptr || !probe.on_list)
+				continue;
+			fprintf(file, "side %u object %2u: class 0x%08x at (%.2f, %.2f), moves up to %.2f px a frame\n",
+				(unsigned int)side, (unsigned int)i, probe.vtable,
+				probe.value[0], probe.value[1], probe.max_move);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player's own shots
+// ---------------------------------------------------------------------------
+//
+// The shots live in a pool the player owns: 16 slots of 0x128 bytes whose position is at
+// slot+0x650. The game's own code says so at 0x54EAF4, where it indexes them - the pool is
+// [player+0x124]'s +4, the slot is idx * 0x128, the position is read at slot+0x650, and the index
+// is masked with 0xF, which is where the 16 comes from. The holder's +4 is the pool itself, at
+// player+0x1CFC (the same back reference shape +0x3C and +0xC4 have), which puts the first slot's
+// position at player+0x234C - exactly where the scan that found them reported the first one, with
+// the same 0x128 between them.
+//
+// There is no velocity to read - a shot moves by whatever the per character code makes it move by
+// - so they are measured the way the player is: the step the game's own frame made is kept, and an
+// extra presentation draws them that step's t further along.
+
+static const size_t th19_shot_pool = 0x1CFC;  // in the player: the first of 16 slots of 0x128
+static const size_t th19_shot_slots = 16;
+static const size_t th19_shot_stride = 0x128;
+static const size_t th19_shot_position = 0x650; // in a slot: its position, 3 floats
+static const size_t th19_shot_sprite_id = 0x14; // ...and the id of the sprite that draws it
+
+struct Th19ShotMotion {
+	char* player;
+	bool tracked;
+	float position[3];
+	float delta[3];
+};
+static Th19ShotMotion th19_shot_motion[2][th19_shot_slots];
+static float* th19_shot_written[2][th19_shot_slots];
+static float th19_shot_written_value[2][th19_shot_slots][3];
+static float* th19_shot_sprite_written[2][th19_shot_slots];
+static float th19_shot_sprite_written_value[2][th19_shot_slots][3];
+static unsigned int th19_shots_in_play;
+static unsigned int th19_shots_moved;
+static unsigned int th19_shots_with_sprite;
+static unsigned int th19_shots_without_sprite;
+
+static float* th19_shot_position_at(char* player, size_t slot) {
+	char* position = player + th19_shot_pool + th19_shot_stride * slot + th19_shot_position;
+	return th19_readable(position, 12) ? (float*)position : nullptr;
+}
+
+// Measures where each shot is and how far it moved, once per game frame (see th19_player_measure)
+static void th19_shots_measure() {
+	th19_shots_in_play = 0;
+	if (th19_bullets_held())
+		return;
+
+	for (size_t side = 0; side < 2; ++side) {
+		char* player = *(char**)(th19_side_table + th19_side_stride * side + 4);
+		for (size_t slot = 0; slot < th19_shot_slots; ++slot) {
+			Th19ShotMotion& motion = th19_shot_motion[side][slot];
+			const float* position = th19_shot_position_at(player, slot);
+			if (position == nullptr) {
+				motion.tracked = false;
+				continue;
+			}
+
+			float move = 0.0f;
+			for (int axis = 0; axis < 3; ++axis) {
+				float delta = 0.0f;
+				if (motion.tracked && motion.player == player) {
+					delta = position[axis] - motion.position[axis];
+					if (!(fabsf(delta) <= 48.0f))
+						delta = 0.0f;
+				}
+				motion.delta[axis] = delta;
+				motion.position[axis] = position[axis];
+				move += delta * delta;
+			}
+			motion.player = player;
+			motion.tracked = true;
+			if (sqrtf(move) > 0.0f)
+				++th19_shots_in_play;
+		}
+	}
+}
+
+static void th19_shots_advance(float t) {
+	for (size_t side = 0; side < 2; ++side)
+		for (size_t slot = 0; slot < th19_shot_slots; ++slot) {
+			th19_shot_written[side][slot] = nullptr;
+			th19_shot_sprite_written[side][slot] = nullptr;
+		}
+	th19_shots_moved = 0;
+	th19_shots_with_sprite = 0;
+	th19_shots_without_sprite = 0;
+
+	if (th19_bullets_held())
+		return;
+
+	for (size_t side = 0; side < 2; ++side) {
+		for (size_t slot = 0; slot < th19_shot_slots; ++slot) {
+			const Th19ShotMotion& motion = th19_shot_motion[side][slot];
+			if (!motion.tracked || motion.player == nullptr)
+				continue;
+			float* position = th19_shot_position_at(motion.player, slot);
+			if (position == nullptr)
+				continue;
+			for (int axis = 0; axis < 3; ++axis) {
+				th19_shot_written_value[side][slot][axis] = position[axis];
+				position[axis] += motion.delta[axis] * t;
+			}
+			th19_shot_written[side][slot] = position;
+			++th19_shots_moved;
+
+			// The sprite that draws the shot keeps its own copy of the position, and it is the
+			// copy the drawing code reads (the game's own update writes it there, at 0x54EFF1:
+			// movq [sprite+614h], [object+54h]) - so it has to be moved too, the same way the
+			// bullets' and the aura's sprites do
+			// The id is 0x40 before the position: a shot is one element of the pool (the pool's
+			// base, player+0x22F8, is what the shot's own constructor stores at [shot+0x120]),
+			// and an element has the id at +0x14 and the position at +0x54 (the code that reads it
+			// pushes [element+14h] and reads [element+54h], at 0x54ED93 and 0x54EFEC)
+			const unsigned int id = *(const unsigned int*)((char*)position - 0x40);
+			void* sprite = th19_sprite_for_id(id);
+			if (sprite != nullptr) {
+				float* drawn = (float*)((char*)sprite + th19_sprite_position);
+				for (int axis = 0; axis < 3; ++axis) {
+					th19_shot_sprite_written_value[side][slot][axis] = drawn[axis];
+					drawn[axis] = position[axis];
+				}
+				th19_shot_sprite_written[side][slot] = drawn;
+				++th19_shots_with_sprite;
+			} else {
+				++th19_shots_without_sprite;
+			}
+		}
+	}
+}
+
+static void th19_shots_undo() {
+	for (size_t side = 0; side < 2; ++side) {
+		for (size_t slot = 0; slot < th19_shot_slots; ++slot) {
+			float* position = th19_shot_written[side][slot];
+			if (position == nullptr)
+				continue;
+			for (int axis = 0; axis < 3; ++axis)
+				position[axis] = th19_shot_written_value[side][slot][axis];
+			th19_shot_written[side][slot] = nullptr;
+			float* drawn = th19_shot_sprite_written[side][slot];
+			if (drawn != nullptr) {
+				for (int axis = 0; axis < 3; ++axis)
+					drawn[axis] = th19_shot_sprite_written_value[side][slot][axis];
+				th19_shot_sprite_written[side][slot] = nullptr;
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: finding the player's own shots (probe, diagnostics only)
+// ---------------------------------------------------------------------------
+//
+// The player's own shots are not on the bullet manager's six layer chains - the projection covers
+// those and the shots are still not smoothed - and the game's class list has no shot class of its
+// own, so rather than guess which container they live in this reports where they are by what they
+// do: the player's own object is scanned for float pairs whose value is a place in the field and
+// whose value changed by a plausible step since the last frame, which is what a position looks
+// like. Any offset found that way is a position something is moving by, the shots' positions among
+// them, and the offsets they arrive at say how the container they live in is laid out (they repeat
+// with its stride). Reads only, behind a readability check, and it goes away once the shots are
+// projected.
+
+static const size_t th19_scan_first = 0x1000;
+static const size_t th19_scan_last = 0x14C40;
+static const size_t th19_scan_offsets = (th19_scan_last - th19_scan_first) / 4;
+static const size_t th19_scan_max = 32;
+struct Th19ScanHit {
+	size_t offset;
+	float value[2];
+	float max_move;
+};
+static float th19_scan_last_value[2][th19_scan_offsets];
+static bool th19_scan_started[2];
+static Th19ScanHit th19_scan_hits[2][th19_scan_max];
+
+static void th19_player_scan_frame() {
+	for (size_t side = 0; side < 2; ++side) {
+		char* player = *(char**)(th19_side_table + th19_side_stride * side + 4);
+		if (!th19_readable(player + th19_scan_last, 4)) {
+			th19_scan_started[side] = false;
+			continue;
+		}
+
+		const float* fields = (const float*)(player + th19_scan_first);
+		if (!th19_scan_started[side]) {
+			for (size_t i = 0; i < th19_scan_offsets; ++i)
+				th19_scan_last_value[side][i] = fields[i];
+			th19_scan_started[side] = true;
+			continue;
+		}
+
+		for (size_t i = 0; i + 1 < th19_scan_offsets; ++i) {
+			const float x = fields[i];
+			const float y = fields[i + 1];
+			// A place in the field: the field's x is centred on each side, and y runs down it
+			if (!(x >= -256.0f && x <= 256.0f && y >= -64.0f && y <= 512.0f))
+				continue;
+			const float dx = x - th19_scan_last_value[side][i];
+			const float dy = y - th19_scan_last_value[side][i + 1];
+			const float move = sqrtf(dx * dx + dy * dy);
+			// Something that moved, by more than a timer ticks and less than a teleport
+			if (!(move > 1.5f && move < 48.0f))
+				continue;
+
+			Th19ScanHit* hit = nullptr;
+			Th19ScanHit* free_hit = nullptr;
+			for (size_t h = 0; h < th19_scan_max; ++h) {
+				if (th19_scan_hits[side][h].max_move > 0.0f &&
+					th19_scan_hits[side][h].offset == th19_scan_first + i * 4) {
+					hit = &th19_scan_hits[side][h];
+					break;
+				}
+				if (free_hit == nullptr && th19_scan_hits[side][h].max_move == 0.0f)
+					free_hit = &th19_scan_hits[side][h];
+			}
+			if (hit == nullptr)
+				hit = free_hit;
+			if (hit != nullptr) {
+				if (move > hit->max_move)
+					hit->max_move = move;
+				hit->offset = th19_scan_first + i * 4;
+				hit->value[0] = x;
+				hit->value[1] = y;
+			}
+		}
+
+		for (size_t i = 0; i < th19_scan_offsets; ++i)
+			th19_scan_last_value[side][i] = fields[i];
+	}
+}
+
+static void th19_player_scan_dump(FILE* file) {
+	for (size_t side = 0; side < 2; ++side) {
+		for (size_t h = 0; h < th19_scan_max; ++h) {
+			Th19ScanHit& hit = th19_scan_hits[side][h];
+			if (hit.max_move <= 0.0f)
+				continue;
+			fprintf(file, "side %u moves at +0x%05x: (%.2f, %.2f) up to %.2f px a frame\n",
+				(unsigned int)side, (unsigned int)hit.offset, hit.value[0], hit.value[1], hit.max_move);
+			hit.max_move = 0.0f;
+		}
+	}
+}
+
 // What the scene is drawn with, taken off the device in the render hook (the frame functions never
 // set it, but the menus do, so an extra presentation has to put back whatever the scene that was
 // just drawn used)
@@ -547,6 +1182,32 @@ static void th19_diag_dump() {
 	// same id up the same way. Both numbers are here to tell those from a lookup that broke.
 	fprintf(file, "bullets: %u had no sprite id, %u had an id whose sprite wasn't found\n",
 		th19_bullets_no_sprite_id, th19_bullets_no_sprite);
+	// The player: what the last presentation moved, and how far the step it projects from was
+	fprintf(file, "player movement: up to %.2f px per frame since the last dump\n", th19_player_movement);
+	// ...and the same steps averaged over the frames that had one: "up to" is a maximum and only
+	// ever goes up, so it can't say how fast the player is going while it is being moved slowly
+	fprintf(file, "player: %u of %u moved, %.2f px a frame on average over %u moving frame(s)\n",
+		th19_players_moved, (unsigned int)th19_players_saved_max,
+		th19_player_step_frames != 0 ? th19_player_step_sum / (float)th19_player_step_frames : 0.0f,
+		th19_player_step_frames);
+	// The sprite is the copy the picture is drawn from, so a player without one is a player that
+	// was projected but drawn where it was (see th19_player_advance)
+	fprintf(file, "player: %u of %u had the sprite that draws them (%u without)\n",
+		th19_players_with_sprite, (unsigned int)th19_players_saved_max, th19_players_without_sprite);
+	th19_player_movement = 0.0f;
+	th19_player_step_sum = 0.0f;
+	th19_player_step_frames = 0;
+	th19_players_with_sprite = 0;
+	th19_players_without_sprite = 0;
+	// If this isn't 0 the game's own logic saw a projected position, which would make the player
+	// move further per frame than it should
+	fprintf(file, "player: %u restore(s) wrong (should stay 0)\n", th19_player_restore_mismatch);
+	th19_player_restore_mismatch = 0;
+	// The player's own shots (see th19_shots_measure): 16 slots, both sides
+	fprintf(file, "shots: %u in play, %u projected (both sides, last presentation)\n",
+		th19_shots_in_play, th19_shots_moved);
+	fprintf(file, "shots: %u of the projected had the sprite that draws them (%u without)\n",
+		th19_shots_with_sprite, th19_shots_without_sprite);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -604,7 +1265,11 @@ static void th19_extra_presentation(float t) {
 	// queue, so they can go back right after it.
 	ToolState::ReadyToDraw();
 	th19_bullets_advance(t);
+	th19_player_advance(t);
+	th19_shots_advance(t);
 	th19_render_objects();
+	th19_shots_undo();
+	th19_player_undo();
 	th19_bullets_undo();
 	th19_draw_sprite_queue(*th19_sprite_manager);
 
@@ -659,6 +1324,11 @@ static HRESULT th19_present_hook() {
 
 	LARGE_INTEGER base;
 	QueryPerformanceCounter(&base);
+
+	// Where the players and their own shots are, and how far they moved - once per game frame,
+	// where the game's own work for it has finished (see th19_player_measure, th19_shots_measure)
+	th19_player_measure();
+	th19_shots_measure();
 
 	// Where the game's own part of this frame started, so the extras can tell whether they still
 	// fit before the next frame is due. The limiter's own FrameWork() can't be used here: th19 is
@@ -745,6 +1415,10 @@ static HRESULT th19_present_hook() {
 			}
 		}
 	}
+
+	// The extra presentations have put the player's position back by now, and this says whether
+	// they really did (see th19_player_check_restored)
+	th19_player_check_restored();
 
 	// Record the frame for the diagnostics
 	{
