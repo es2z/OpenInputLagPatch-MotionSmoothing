@@ -474,6 +474,300 @@ static unsigned int th20_bullets_moved;
 
 static void th20_bullet_find_managers();
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player
+// ---------------------------------------------------------------------------
+//
+// The player is the object the side table holds at +4 (0x5BA56C, thprac's PLAYER_PTR), and it is a
+// big one, the same kind of object as th19's PlayerInf: its own fields go past +0x14854, and
+// thprac's th20 module reaches a per character timer at player+0x22B4+0x12580 and the per
+// character cycle at player+0x684+0x12C*i, neither of which makes sense for anything else.
+//
+// Where it keeps its position was measured rather than read: while it was being played the whole
+// object was watched for floats that move, and three x's came out with the same value and the same
+// largest step of 4.5 pixels a frame (the player's speed - th19's player moves 4.5 as well):
+// +0x614, +0x5E4 and +0x694. Two of them are the same point in the coordinates other parts of the
+// game want: the y at +0x5E4 is 32 more than the y at +0x614 and the one at +0x694 is 32 less,
+// which is the field's own offset from the top of the picture. The function at 0x4F7430 - the one
+// thprac's th20 module hooks as its player state - writes the position as a vec3 at +0x614
+// (0x4F74D1 adds 614h to the player and the three stores after it write the vector), which is what
+// says that one is the player's own.
+//
+// Unlike the bullets there is no velocity to read: what the player moves by comes out of the input
+// the game processed that frame, in per character code. It is measured instead, the way the games
+// after th13 measure their players: the position the game's own presentation showed is kept, and so
+// is how far the player moved to reach it, and an extra presentation draws the player that same
+// position moved t of that step further along - extrapolation, so the picture is ahead of the
+// game's own frame rather than behind it. A step larger than 48px isn't a step: the player died,
+// respawned or the stage changed, and 0 is used for the frame the measurement starts on.
+//
+// All three copies of the position are moved - a presentation that moved only one of them would
+// leave whichever one the drawing reads behind - and all three are put back right after the render
+// walk, so the game's own logic never sees a projected position.
+
+static const size_t th20_player_position = 0x614;
+static const size_t th20_player_copies[] = { 0x614, 0x5E4, 0x694 };
+static const size_t th20_player_copies_count = 3;
+
+struct Th20PlayerMotion {
+	void* player;      // the player object this was measured from
+	bool tracked;
+	float position[3]; // where the game's own presentation showed it
+	float delta[3];    // how far it moved to get there (the last game frame's step)
+};
+static Th20PlayerMotion th20_player_motion;
+static float* th20_player_written[th20_player_copies_count];
+static float th20_player_written_value[th20_player_copies_count][3];
+static unsigned int th20_players_moved;
+static float th20_player_movement; // the largest step seen since the last dump, in pixels
+
+// The player object, or null while there is none
+static void* th20_player() {
+	void* player = *(void**)(th20_side_table + 4);
+	if (player == nullptr || !th20_readable((char*)player + th20_player_position, 12))
+		return nullptr;
+	return player;
+}
+
+// Measures where the player is and how far it moved, once per game frame, where the game has
+// finished its own (in the present before the extra presentations run)
+static void th20_player_measure() {
+	Th20PlayerMotion& motion = th20_player_motion;
+	void* player = th20_player();
+	if (player == nullptr) {
+		motion.tracked = false;
+		return;
+	}
+
+	const float* position = (const float*)((char*)player + th20_player_position);
+	float move_squared = 0.0f;
+	for (int axis = 0; axis < 3; ++axis) {
+		// A player that wasn't this object a frame ago has no step to project
+		float delta = 0.0f;
+		if (motion.tracked && motion.player == player) {
+			delta = position[axis] - motion.position[axis];
+			if (!(fabsf(delta) <= 48.0f))
+				delta = 0.0f;
+		}
+		motion.delta[axis] = delta;
+		motion.position[axis] = position[axis];
+		move_squared += delta * delta;
+	}
+	// How far the player actually moved in the frame, not how far it moved along one axis: a step
+	// that goes diagonally is the same speed as one that goes straight
+	const float move = sqrtf(move_squared);
+	if (move > th20_player_movement)
+		th20_player_movement = move;
+	motion.player = player;
+	motion.tracked = true;
+}
+
+// Moves the player t of the last frame's step ahead of where the game's presentation left it
+static void th20_player_advance(float t) {
+	for (size_t i = 0; i < th20_player_copies_count; ++i)
+		th20_player_written[i] = nullptr;
+	th20_players_moved = 0;
+
+	const Th20PlayerMotion& motion = th20_player_motion;
+	if (!motion.tracked || motion.player == nullptr || th20_bullets_held())
+		return;
+
+	for (size_t i = 0; i < th20_player_copies_count; ++i) {
+		float* position = (float*)((char*)motion.player + th20_player_copies[i]);
+		if (!th20_readable(position, 12))
+			continue;
+		for (int axis = 0; axis < 3; ++axis) {
+			th20_player_written_value[i][axis] = position[axis];
+			position[axis] += motion.delta[axis] * t;
+		}
+		th20_player_written[i] = position;
+	}
+	++th20_players_moved;
+}
+
+static void th20_player_undo() {
+	for (size_t i = 0; i < th20_player_copies_count; ++i) {
+		if (th20_player_written[i] == nullptr)
+			continue;
+		for (int axis = 0; axis < 3; ++axis)
+			th20_player_written[i][axis] = th20_player_written_value[i][axis];
+		th20_player_written[i] = nullptr;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player's own shots
+// ---------------------------------------------------------------------------
+//
+// The shots live in a pool the player owns: 256 entries of 0x124 bytes starting at player+0x22B4.
+// The player's own constructor says so - it calls FUN_004F4B80 on player+0x22B4 (0x4F4968), and
+// that function clears the block's tail at +0x12580, which is exactly the
+// player+0x22B4+0x12580 thprac's th20 module keeps its per character timers in. What makes the
+// pool itself is FUN_004F41D0: FUN_0040BC20(pool, 0x124, 0x100, FUN_004F4CB0), a pool of 0x100
+// (256) entries of 0x124 bytes, each handed to FUN_004F4CB0 to be initialized. The pool's per
+// frame pass is FUN_00504950 (called on player+0x22B4 at 0x4F5383).
+//
+// An entry keeps its position at +0x50 (three floats) - the same offset the objects of this kind
+// are drawn from: their drawing code hands obj+0x50 to FUN_0040BDA0 (which is `return this`) and
+// copies the three floats it gets back into the sprite's drawn position at sprite+0x5BC
+// (0x5046C2, 0x504B86 and 0x5059ED all do that). Those copies happen in whatever walk draws them,
+// which is the one the extra presentations replay, so moving the entry's own position is all an
+// extra presentation has to do - there is no second copy to chase.
+//
+// There is no velocity to read and no list to walk from here: the pool's entries are all in one
+// array, and which of them are in play is worked out by measuring, the way the player itself is.
+// An entry that is not in use doesn't move, so it has no step to project and is left alone; one
+// that was just handed a new shot jumps, so its step is thrown away for that frame (anything past
+// 48px is a respawn rather than a step). That also means no state has to be kept about which
+// entries the game considers live.
+
+static const size_t th20_shot_pool = 0x22B4;   // in the player: the first of 256 slots of 0x124
+static const size_t th20_shot_slots = 0x100;
+static const size_t th20_shot_stride = 0x124;
+static const size_t th20_shot_position = 0x50; // in a slot: its position, 3 floats
+static const size_t th20_shot_sprite_id = 0x18; // ...and the id of the sprite that draws it
+
+// In the sprite (animation) manager: how to find a sprite by id, and where its drawn position is.
+// The game looks a sprite up in FUN_0044CD00, whose array branch is reproduced here:
+// sprite = [0x5C0028] + 0x710 + (id & 0xFFFF) * 0x600 (FUN_004494D0 is `this + n * 0x600`),
+// the id it is for is at +0x4C0 (FUN_00449460 compares it), the in use byte is at +0x5F8, and the
+// three floats the drawing puts on screen are at +0x5BC.
+static const size_t th20_sprite_stride = 0x600;
+static const size_t th20_sprite_base = 0x710;
+static const size_t th20_sprite_in_use = 0x5F8;
+static const size_t th20_sprite_id = 0x4C0;
+static const size_t th20_sprite_position = 0x5BC;
+
+static char* th20_sprite_for_id(unsigned int id) {
+	char* manager = (char*)*th20_sprite_manager;
+	if (manager == nullptr || id == 0 || (id & 0xFFFF) == 0xFFFF)
+		return nullptr;
+	char* sprite = manager + th20_sprite_base + (size_t)(id & 0xFFFF) * th20_sprite_stride;
+	if (!th20_readable(sprite + th20_sprite_position, th20_sprite_in_use - th20_sprite_position + 1) ||
+		sprite[th20_sprite_in_use] == 0 || *(unsigned int*)(sprite + th20_sprite_id) != id)
+		return nullptr;
+	return sprite;
+}
+
+struct Th20ShotMotion {
+	void* player;
+	bool tracked;
+	float position[3];
+	float delta[3];
+};
+static Th20ShotMotion th20_shot_motion[th20_shot_slots];
+static float* th20_shot_written[th20_shot_slots];
+static float th20_shot_written_value[th20_shot_slots][3];
+static float* th20_shot_sprite_written[th20_shot_slots];
+static float th20_shot_sprite_written_value[th20_shot_slots][3];
+static unsigned int th20_shots_in_play;
+static unsigned int th20_shots_moved;
+static unsigned int th20_shots_with_sprite;
+static unsigned int th20_shots_without_sprite;
+
+static float* th20_shot_position_at(char* player, size_t slot) {
+	char* position = player + th20_shot_pool + th20_shot_stride * slot + th20_shot_position;
+	return th20_readable(position, 12) ? (float*)position : nullptr;
+}
+
+// Measures where each shot is and how far it moved, once per game frame (see th20_player_measure)
+static void th20_shots_measure() {
+	th20_shots_in_play = 0;
+	char* player = (char*)th20_player();
+	for (size_t slot = 0; slot < th20_shot_slots; ++slot) {
+		Th20ShotMotion& motion = th20_shot_motion[slot];
+		const float* position = player != nullptr ? th20_shot_position_at(player, slot) : nullptr;
+		if (position == nullptr) {
+			motion.tracked = false;
+			continue;
+		}
+
+		float move_squared = 0.0f;
+		for (int axis = 0; axis < 3; ++axis) {
+			float delta = 0.0f;
+			if (motion.tracked && motion.player == player) {
+				delta = position[axis] - motion.position[axis];
+				if (!(fabsf(delta) <= 48.0f))
+					delta = 0.0f;
+			}
+			motion.delta[axis] = delta;
+			motion.position[axis] = position[axis];
+			move_squared += delta * delta;
+		}
+		motion.player = player;
+		motion.tracked = true;
+		// An entry the game isn't using stayed where it was, which is what tells the two apart
+		if (move_squared > 0.0f)
+			++th20_shots_in_play;
+	}
+}
+
+static void th20_shots_advance(float t) {
+	for (size_t slot = 0; slot < th20_shot_slots; ++slot) {
+		th20_shot_written[slot] = nullptr;
+		th20_shot_sprite_written[slot] = nullptr;
+	}
+	th20_shots_moved = 0;
+	th20_shots_with_sprite = 0;
+	th20_shots_without_sprite = 0;
+
+	if (th20_bullets_held())
+		return;
+
+	for (size_t slot = 0; slot < th20_shot_slots; ++slot) {
+		const Th20ShotMotion& motion = th20_shot_motion[slot];
+		if (!motion.tracked || motion.player == nullptr)
+			continue;
+		// An entry the game isn't using is one that didn't move; there is nothing to project for it
+		if (motion.delta[0] == 0.0f && motion.delta[1] == 0.0f && motion.delta[2] == 0.0f)
+			continue;
+		float* position = th20_shot_position_at((char*)motion.player, slot);
+		if (position == nullptr)
+			continue;
+		for (int axis = 0; axis < 3; ++axis) {
+			th20_shot_written_value[slot][axis] = position[axis];
+			position[axis] += motion.delta[axis] * t;
+		}
+		th20_shot_written[slot] = position;
+		++th20_shots_moved;
+
+		// The sprite the shot is drawn through keeps its own copy of the position, and the game
+		// writes it while it updates the shot - which the extra presentations don't replay, so it
+		// has to be moved here as well (see th20_sprite_for_id and the comment above)
+		const size_t offset = th20_shot_pool + th20_shot_stride * slot;
+		const unsigned int id = *(const unsigned int*)((char*)motion.player + offset + th20_shot_sprite_id);
+		char* sprite = th20_sprite_for_id(id);
+		if (sprite == nullptr) {
+			++th20_shots_without_sprite;
+			continue;
+		}
+		float* drawn = (float*)(sprite + th20_sprite_position);
+		for (int axis = 0; axis < 3; ++axis) {
+			th20_shot_sprite_written_value[slot][axis] = drawn[axis];
+			drawn[axis] = position[axis];
+		}
+		th20_shot_sprite_written[slot] = drawn;
+		++th20_shots_with_sprite;
+	}
+}
+
+static void th20_shots_undo() {
+	for (size_t slot = 0; slot < th20_shot_slots; ++slot) {
+		float* position = th20_shot_written[slot];
+		if (position != nullptr) {
+			for (int axis = 0; axis < 3; ++axis)
+				position[axis] = th20_shot_written_value[slot][axis];
+			th20_shot_written[slot] = nullptr;
+		}
+		float* drawn = th20_shot_sprite_written[slot];
+		if (drawn != nullptr) {
+			for (int axis = 0; axis < 3; ++axis)
+				drawn[axis] = th20_shot_sprite_written_value[slot][axis];
+			th20_shot_sprite_written[slot] = nullptr;
+		}
+	}
+}
+
 // Moves every bullet in play forward by t frames (t = 0 is the state the game is in) and remembers
 // what it changed, so th20_bullets_undo can put it back.
 static void th20_bullets_advance(float t) {
@@ -613,6 +907,17 @@ static void th20_diag_dump() {
 		th20_bullets_in_play, th20_bullets_moved);
 	fprintf(file, "bullets: the managers' own count says %u, %u manager(s) found\n",
 		th20_bullets_managers_say, (unsigned int)th20_bullet_manager_count);
+	// The player (see th20_player_measure): what the last presentation moved, and how far the step
+	// it projects from was
+	fprintf(file, "player: %u moved, up to %.2f px a frame since the last dump\n",
+		th20_players_moved, th20_player_movement);
+	th20_player_movement = 0.0f;
+	// The player's own shots (see th20_shots_measure): 256 slots, of which the ones in play are the
+	// ones that moved
+	fprintf(file, "shots: %u in play, %u projected (last presentation)\n",
+		th20_shots_in_play, th20_shots_moved);
+	fprintf(file, "shots: %u of the projected had the sprite that draws them (%u without)\n",
+		th20_shots_with_sprite, th20_shots_without_sprite);
 
 	double presents = 0.0;
 	double first = 0.0;
@@ -667,7 +972,11 @@ static void th20_extra_presentation(float t) {
 	// before it draws the objects into it - so the objects are drawn again here to fill it
 	ToolState::ReadyToDraw();
 	th20_bullets_advance(t);
+	th20_player_advance(t);
+	th20_shots_advance(t);
 	th20_render_objects(*th20_scene);
+	th20_shots_undo();
+	th20_player_undo();
 	th20_bullets_undo();
 	th20_draw_sprite_queue(*th20_sprite_manager);
 
@@ -693,6 +1002,11 @@ static HRESULT th20_present_hook() {
 	IDirect3DDevice9* device = th20_device();
 	if (device == nullptr)
 		return E_FAIL;
+
+	// Where the player is and how far it moved - once per game frame, where the game's own work for
+	// it has finished (see th20_player_measure)
+	th20_player_measure();
+	th20_shots_measure();
 
 	static bool freq_queried = false;
 	if (!freq_queried) {
