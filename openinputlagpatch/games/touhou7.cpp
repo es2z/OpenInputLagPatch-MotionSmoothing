@@ -43,6 +43,64 @@ int __fastcall th7_window_update_hook() {
     return CWindowManager__Update(CWindowManager::Instance);
 }
 
+// ---------------------------------------------------------------------------
+// Input handling, ported from vpatch (the same design as the one in touhou8.cpp).
+//
+// Perfect Cherry Blossom reads the keyboard into a slot of its own (the call to
+// Controller::GetInput at 0x00437D80 and the store at 0x00437D85), and the player reads a copy of
+// that input - 0x004B9E50, with 0x004B9E58 as its previous frame - which the game only advances in
+// a job of its own: 0x00442CD0 tests [0x0062F648] & 4 at 0x00442CD9 and does the "previous = copy;
+// copy = raw" pair at 0x00442CF2. That job runs after the player has already used the copy, so the
+// player saw the previous frame's input: the extra frame of input lag vpatch's readme lists for
+// this game beside the drawing one, and the one its rev4 took out.
+//
+// vpatch's four patches are what does that, and they are applied here the way vpatch applies them:
+// unconditionally, not behind a config option (a vpatched game always behaves this way).
+//
+//   1. the call to Controller::GetInput at 0x00437D80 goes to the wrapper below, so the copy is
+//      advanced at the moment the input is read - and left alone while a replay is playing
+//      ([0x0062F648] & 8), because there the replay manager feeds it;
+//   2. the top of the game's own copy job (0x00442CD9) is taken over and spends the flag below:
+//      the frame the flag is up that job returns 1 straight away;
+//   3. the copy pair at 0x00442CF2 is skipped (jmp 0x00442D0E), so the copy is advanced once per
+//      frame, by the wrapper;
+//   4. the function that ends at 0x004433A5 gets its ret replaced by a store, so returning from it
+//      raises that flag.
+// ---------------------------------------------------------------------------
+static DWORD th7_input_discard;
+
+// Where the game calls Controller::GetInput (0x00437D80)
+static __int16 th7_input_hook() {
+    __int16 input = get_input();
+    if ((*(volatile BYTE*)0x0062F648 & 8) == 0) {
+        *(volatile WORD*)0x004B9E58 = *(volatile WORD*)0x004B9E50;
+        *(volatile WORD*)0x004B9E50 = (WORD)input;
+    }
+    return input;
+}
+
+// The ret at 0x004433A5 of the function that ends there
+static __declspec(naked) void th7_input_flag_setter() {
+    __asm { mov dword ptr [th7_input_discard], edx }
+    __asm { ret }
+}
+
+// 0x00442CD9, the top of the game's own copy job
+static __declspec(naked) void th7_input_flag_consumer() {
+    __asm { mov eax, dword ptr [th7_input_discard] }
+    __asm { test eax, eax }
+    __asm { jne spend }
+    __asm { mov eax, dword ptr [0062F648h] }
+    __asm { mov ecx, 00442CDEh }
+    __asm { jmp ecx }
+spend:
+    __asm { xor eax, eax }
+    __asm { mov dword ptr [th7_input_discard], eax }
+    __asm { inc eax }
+    __asm { mov ecx, 00442E46h }
+    __asm { jmp ecx }
+}
+
 void th7_install_patches() {
     {
         // Skip the original frame limiter
@@ -63,6 +121,17 @@ void th7_install_patches() {
         // Hook window updating
         // Avoid eating up CPU time while minimized
         patch_call(0x004341F7, th7_window_update_hook);
+    }
+    {
+        // The input handling above, the way vpatch applies it: always
+        patch_call(0x00437D80, th7_input_hook);
+        patch_jmp(0x00442CD9, th7_input_flag_consumer);
+        {
+            // jmp 00442D0E over the copy pair, and what the five bytes it skips held
+            BYTE patch[] = { 0xEB, 0x1A, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patch_bytes(0x00442CF2, patch, sizeof(patch));
+        }
+        patch_jmp(0x004433A5, th7_input_flag_setter);
     }
     if (Config::FixInputGlitching) {
         // Fix input glitching

@@ -28,6 +28,17 @@ void patch_call(DWORD target, void* func) {
     patch_call((void*)target, func);
 }
 
+void patch_jmp(void* target, void* func) {
+    BYTE patch[5];
+    patch[0] = 0xE9;
+    *(DWORD*)(patch + 1) = (DWORD)func - (DWORD)target - 5;
+    patch_bytes(target, patch, sizeof(patch));
+}
+
+void patch_jmp(DWORD target, void* func) {
+    patch_jmp((void*)target, func);
+}
+
 void* iat_hook(LPCWSTR target, LPCSTR dll, LPCSTR func, void* hook) {
     // Get a pointer to the module
     auto pe = (char*)GetModuleHandleW(target);

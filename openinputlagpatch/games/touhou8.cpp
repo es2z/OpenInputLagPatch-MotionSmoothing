@@ -82,15 +82,6 @@ spend:
     __asm { jmp ecx }
 }
 
-// patch_bytes' counterpart for a site that has to be jumped to rather than called (the target is
-// our own code, so the relative offset can be worked out here)
-static void th8_patch_jmp(DWORD site, void* func) {
-    BYTE patch[5];
-    patch[0] = 0xE9;
-    *(DWORD*)(patch + 1) = (DWORD)func - site - 5;
-    patch_bytes(site, patch, sizeof(patch));
-}
-
 void th8_install_patches() {
     {
         // Skip the original frame limiter
@@ -106,15 +97,18 @@ void th8_install_patches() {
         // Hook window update
         patch_call(0x00441B15, th8_window_update_hook);
     }
-    if (Config::FixInputGlitching) {
-        // vpatch's input handling for this game (see the note above)
+    {
+        // vpatch's input handling for this game (see the note above), applied the way vpatch
+        // applies it: always, not behind a config option. It is what takes this game's frame of
+        // input lag out, and it is also what keeps keys from being left held when the window
+        // loses focus - a vpatched game has both, so this one has to as well.
         {
             // The call to Controller::GetInput in Supervisor::OnUpdate
             patch_call(0x004455F0, th8_input_hook);
         }
         {
             // The updater's flag check: return early instead of updating the copy
-            th8_patch_jmp(0x00452319, th8_input_flag_consumer);
+            patch_jmp(0x00452319, th8_input_flag_consumer);
         }
         {
             // Its branch target moves one step on, so the copy work is skipped
@@ -123,7 +117,7 @@ void th8_install_patches() {
         }
         {
             // The function that fills the state copy raises the flag where it returns
-            th8_patch_jmp(0x00452D52, th8_input_flag_setter);
+            patch_jmp(0x00452D52, th8_input_flag_setter);
         }
     }
 }

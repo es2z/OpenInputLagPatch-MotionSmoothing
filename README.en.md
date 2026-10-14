@@ -176,23 +176,20 @@ DebugConsole = 0
 ; 默认 / Default: 0
 DebugWait = 0
 
-; 修掉这几作原本就有的输入问题（相当于 vpatch 的 FixInputGlitching；永夜抄上就是它 AlwaysBlt
-; 背后那套输入补丁）。
+; 修掉红魔乡/妖妖梦里「窗口不在前台时 DirectInput 拒绝给状态，游戏却只把『设备丢失』当失败，
+; 于是继续读一份从没被填过的缓冲区」造成的乱按键、按键卡住（相当于 vpatch 的 FixInputGlitching；
+; vpatch 是在它的 AlwaysBlt 里一起做的）。
 ;
-; 红魔乡/妖妖梦：窗口不在前台时 DirectInput 拒绝给状态，游戏却只把「设备丢失」当失败，
-; 于是继续拿一份没被填过的缓冲区当键盘状态 —— 会凭空冒出各种按键，按键也会卡住。
-; 永夜抄：自机的输入来自一份"算完才更新"的副本，这里让副本跟着实时输入走 —— 顺带消掉
-; 1 帧输入延迟，并修掉窗口失去焦点后按键被"留在按下状态"的问题。
+; 永夜抄与妖妖梦那种「自机读的是上一帧输入副本」的 1 帧输入延迟**不在这个选项里**：那两处是
+; vpatch 无条件生效的代码，oilp 现在也一样无条件生效，与本选项无关。
 ;
-; Fixes input problems the game already has (the same thing vpatch's FixInputGlitching does; for
-; Touhou 8 it is the input patches behind its AlwaysBlt option).
+; Fixes the keyboard state EoSD and PCB read while their window is not in the foreground: the
+; device refuses to hand the state over, but the game only treats "device lost" as a failure and
+; goes on reading a buffer that was never filled in - keys show up as pressed out of nowhere, and
+; they can stay stuck (vpatch does this as part of its AlwaysBlt).
 ;
-; EoSD / PCB: while the window is not in the foreground DirectInput refuses to hand over the state,
-; but the game only treats "device lost" as a failure and goes on reading a buffer that was never
-; filled in - keys show up as pressed out of nowhere, and they can stay stuck as well.
-; IN: the player's input comes from a copy the game only refreshes at the end of the frame. This
-; keeps that copy in step with the live input, which removes a frame of input lag and also fixes
-; keys staying held after the window loses focus.
+; The input-timing fix for PCB and IN - the player reading a copy of the input that the game only
+; advances later - is NOT this option: vpatch applies it unconditionally, and so does oilp now.
 ;
 ; 默认 / Default: 1
 FixInputGlitching = 1
