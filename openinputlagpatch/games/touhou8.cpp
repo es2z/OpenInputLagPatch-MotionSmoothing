@@ -275,6 +275,91 @@ static void th8_fps_state_restore(const Th8FpsState* state) {
 static unsigned char* th8_tool_frame_address = (unsigned char*)0x0043CB37;
 static unsigned char* th8_tool_draw_address = (unsigned char*)0x0043CC45;
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the bullets
+// ---------------------------------------------------------------------------
+//
+// The bullets the game draws live in g_BulletManager (0x00F54E90). The manager keeps six layer
+// chains (layerListHeads at manager+0x6BA554, a bullet's nextInLayer at bullet+0xDC0) and its own
+// draw walks them one layer after the other: BulletManager::OnDraw (0x432B50) takes each layer head
+// (0x432EC3), calls BulletManager::DrawSingleBullet (0x432F20) down the chain (0x432EDE) for as
+// long as there is a next one, and that draws the bullet's sprite at the bullet's own position
+// (bullet+0xD44, plus the screen shake the game adds there at 0x432F9A/0x432FC6). Walking those six
+// chains is therefore walking exactly what the frame's draw pass puts on screen, at the position
+// the sprite is drawn at - not a pool or a guess at one.
+//
+// A bullet moves by its velocity added to its position once a frame: the movers are handed the two
+// fields by address (`add ecx,0D50h` / `add ecx,0D44h`, 0x43149E and on) and what they run into is
+// a three-float add (0x410A70: `fld [pos.x] / fadd [vel.x] / fstp [pos.x]`, and the same for y and
+// z). So an extra presentation puts the bullets where the frame's own step will put them t frames
+// on: position += velocity * t, drawn, and put straight back again - the game's own logic and its
+// collision code still see the positions they last read. What it costs is that a bullet whose
+// velocity changes within the step (an accelerating or turning one) is drawn a little off the path
+// it will actually take, an error the fraction of a frame it is drawn a fraction of does not show.
+
+// The manager's fields (see the comment above), and the pool size the manager's own chains can't
+// hold more than
+static const unsigned int th8_bullet_layers = 6;
+static const unsigned int th8_bullet_layer_heads_offset = 0x6BA554;
+static const unsigned int th8_bullet_count_offset = 0x6BA538; // the manager's own numActiveBullets
+static const unsigned int th8_bullet_next_in_layer_offset = 0xDC0;
+static const unsigned int th8_bullet_pos_offset = 0xD44;
+static const unsigned int th8_bullet_velocity_offset = 0xD50;
+static const unsigned int th8_bullets_max = 0x601; // MAX_ENEMY_BULLETS + 1
+static unsigned char* th8_bullet_manager = (unsigned char*)0x00F54E90;
+
+// What the last extra presentation moved, for the diagnostics (see th8_diag_dump)
+static unsigned int th8_bullets_in_play;
+static unsigned int th8_bullets_projected;
+static unsigned int th8_bullets_managers_say;
+
+// Where the bullets' positions were before they were moved, so they can be put back exactly (not
+// worked out backwards - the positions have to come out bit for bit what the game left there)
+static unsigned char* th8_projected_bullets[th8_bullets_max];
+static float th8_projected_positions[th8_bullets_max][3];
+static unsigned int th8_projected_count;
+
+static void th8_bullets_advance(float t) {
+    th8_projected_count = 0;
+
+    for (unsigned int layer = 0; layer < th8_bullet_layers; ++layer) {
+        unsigned char* bullet = *(unsigned char**)(th8_bullet_manager + th8_bullet_layer_heads_offset + layer * 4);
+        while (bullet != nullptr) {
+            if (th8_projected_count >= th8_bullets_max)
+                break;
+
+            float* pos = (float*)(bullet + th8_bullet_pos_offset);
+            const float* velocity = (const float*)(bullet + th8_bullet_velocity_offset);
+
+            th8_projected_bullets[th8_projected_count] = bullet;
+            th8_projected_positions[th8_projected_count][0] = pos[0];
+            th8_projected_positions[th8_projected_count][1] = pos[1];
+            th8_projected_positions[th8_projected_count][2] = pos[2];
+            ++th8_projected_count;
+
+            pos[0] = pos[0] + velocity[0] * t;
+            pos[1] = pos[1] + velocity[1] * t;
+            pos[2] = pos[2] + velocity[2] * t;
+
+            bullet = *(unsigned char**)(bullet + th8_bullet_next_in_layer_offset);
+        }
+    }
+
+    th8_bullets_in_play = th8_projected_count;
+    th8_bullets_projected = th8_projected_count;
+    th8_bullets_managers_say = *(unsigned int*)(th8_bullet_manager + th8_bullet_count_offset);
+}
+
+static void th8_bullets_undo() {
+    for (unsigned int i = 0; i < th8_projected_count; ++i) {
+        float* pos = (float*)(th8_projected_bullets[i] + th8_bullet_pos_offset);
+        pos[0] = th8_projected_positions[i][0];
+        pos[1] = th8_projected_positions[i][1];
+        pos[2] = th8_projected_positions[i][2];
+    }
+    th8_projected_count = 0;
+}
+
 // Runs where the game's own draw pass starts: remembers what the scene is drawn with, watches for
 // the tool's frame (its overlay is built by now, from the calc chain's return, and drawn on the
 // return of the chain below), and then draws exactly the way the game always did.
@@ -323,6 +408,10 @@ static void th8_extra_presentation(float t) {
     // Whatever was left bound (see th8_forget_anm_texture) is not what the manager thinks it is
     th8_forget_anm_texture();
 
+    // Where the bullets are a fraction of a frame on from here; put back right after the pass drew
+    // them (see the stage 1 comment above)
+    th8_bullets_advance(t);
+
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it: the extras draw the same frame rate text the game's own pass drew, and the
     // game's own accounting never sees them
@@ -330,6 +419,8 @@ static void th8_extra_presentation(float t) {
     th8_fps_state_save(&fps);
     th8_run_draw_chain(th8_chain);
     th8_fps_state_restore(&fps);
+
+    th8_bullets_undo();
 
     th8_flush_vertex_buffer(*th8_anm_manager);
     device->SetTexture(0, nullptr);
@@ -389,6 +480,18 @@ static void th8_diag_dump() {
             (int)*(short*)0x017CE8F0, (char*)0x017CF3B8, *(float*)0x017CE8E8);
     fprintf(file, "frameskip config: %u, loading (Supervisor::unk178): %u\n",
             (unsigned int)*(unsigned char*)0x017CE893, (unsigned int)*(DWORD*)0x017CE8D0);
+    // The bullets (see the stage 1 comment above): what the walk through the game's own layer
+    // chains found, and what the manager's own counter says. A walk that stopped finding bullets
+    // would say so right here. The counter reads a few higher than the chains hold, and that is the
+    // update loop's own doing: it counts a bullet as active when it looks at it (0x4312CA), before
+    // it notices that the bullet's despawn effect has finished, and those it turns off there
+    // (0x432170 sets the bullet's state back to 0 and it is never linked into a layer) are still in
+    // the count it leaves behind. The chains are the ones the frame's draw pass walks
+    // (BulletManager::OnDraw, 0x432EA5), which is what the extras project.
+    fprintf(file, "bullets: %u in play, %u projected forward (last presentation)\n",
+            th8_bullets_in_play, th8_bullets_projected);
+    fprintf(file, "bullets: the manager's own count says %u (the update's count, taken before it "
+                  "turns the finished ones off)\n", th8_bullets_managers_say);
 
     double presents = 0.0;
     double first = 0.0;
