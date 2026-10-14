@@ -191,7 +191,9 @@ void D3D8Overlay::SetupAtlasUVTable() {
     char_height = (12.0f / (float)FONT_ATLAS_HEIGHT) * (FONT_ATLAS_HEIGHT / (float)FONT_ATLAS_HEIGHT_P2);
 }
 
-int D3D8Overlay::UpdateBuffers(char* text) {
+// Writes the geometry of one line of text, with its background, into the overlay's buffers, with
+// its left edge at x_offset (same as the D3D9 overlay's version)
+int D3D8Overlay::UpdateBuffers(char* text, D3DCOLOR color, float x_offset) {
     // Get the length of the string
     auto text_len = strlen(text);
     if (text_len > OVERLAY_MAX_CHARS)
@@ -205,7 +207,6 @@ int D3D8Overlay::UpdateBuffers(char* text) {
 
     // Calculate the offsets
     float padding = 1.0f;
-    float x_offset = 0;
     float y_offset = (float)window_height - 12.0f - padding * 2.0f;
 
     // Write the background geometry
@@ -253,22 +254,22 @@ int D3D8Overlay::UpdateBuffers(char* text) {
         float v = atlas_uvs[text[i] - 32][1];
         vertex_data[cur_vertex + 0] = CUSTOMVERTEX{
             {x_offset + cur_xpos + padding + 8.0f, y_offset + padding * 2.0f + 12.0f, 0.5f},
-            text_color,
+            color,
             {u + char_width, v + char_height}
         };
         vertex_data[cur_vertex + 1] = CUSTOMVERTEX{
             {x_offset + cur_xpos + padding + 8.0f, y_offset + padding * 2.0f, 0.5},
-            text_color,
+            color,
             {u + char_width, v}
         };
         vertex_data[cur_vertex + 2] = CUSTOMVERTEX{
             {x_offset + cur_xpos + padding, y_offset + padding * 2.0f, 0.5},
-            text_color,
+            color,
             {u, v}
         };
         vertex_data[cur_vertex + 3] = CUSTOMVERTEX{
             {x_offset + cur_xpos + padding, y_offset + padding * 2.0f + 12.0f, 0.5},
-            text_color,
+            color,
             {u, v + char_height}
         };
         index_data[cur_index + 0] = (uint16_t)cur_vertex + 0;
@@ -304,13 +305,25 @@ void D3D8Overlay::Draw() {
     SetupViewportAndTransforms();
 
     // Draw shit
-    auto rect_count = UpdateBuffers(text_buffer);
+    auto rect_count = UpdateBuffers(text_buffer, text_color, 0.0f);
 
     d3d8_device->SetStreamSource(0, d3d8_vertex_buf, sizeof(CUSTOMVERTEX));
     d3d8_device->SetIndices(d3d8_index_buf, 0);
     d3d8_device->SetVertexShader(D3DFVF_CUSTOMVERTEX);
     d3d8_device->SetTexture(0, d3d8_font_tex);
     d3d8_device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, rect_count * 2 * 3, 0, rect_count * 2);
+
+    // The frame rate the frames are actually presented at, right after that line (see overlay.h).
+    // The D3D8 overlay's text always sits in the bottom left corner, so the rate goes next to it -
+    // which is also where the games that use this (th08 and up) have room for it.
+    if (overlay_present_rate_enabled()) {
+        char rate_text[32];
+        sprintf_s(rate_text, "%.1f fps", overlay_present_rate());
+        float rate_x = (float)strlen(text_buffer) * 7.0f + 2.0f + 6.0f;
+
+        rect_count = UpdateBuffers(rate_text, D3DCOLOR_COLORVALUE(1.0, 1.0, 1.0, 0.9), rate_x);
+        d3d8_device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, rect_count * 2 * 3, 0, rect_count * 2);
+    }
 
     // Restore the original render state
     d3d8_device->ApplyStateBlock(original_state);

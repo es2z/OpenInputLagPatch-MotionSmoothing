@@ -20,6 +20,7 @@ namespace {
 	Present_t Present_orig = nullptr;
 	Direct3DCreate8_t Direct3DCreate8_orig = nullptr;
 	IDirect3D8* d3d8_interface = nullptr;
+	IDirect3DDevice8* d3d8_device = nullptr;
 	bool device_hooks_installed = false;
 	bool create8_hooked = false;
 
@@ -117,18 +118,28 @@ namespace {
 		// COPY_VSYNC with vsync on) is what it expects to read back.
 	}
 
+	// The overlay is drawn by the D3D9 hook's EndScene hook whenever there is a D3D9 device. For
+	// D3D8 games whose wrapper never goes through D3D9 (dgVoodoo2 translates straight to D3D11)
+	// there is none, so those draw it with their D3D8 device instead, right where the game's own
+	// frame ends - which is also where the frame interpolation's extra presentations need it.
+	void draw_overlay() {
+		if (D3D8Overlay::Instance)
+			D3D8Overlay::Instance->Draw();
+	}
+
 	HRESULT __stdcall Present_hook(IDirect3DDevice8* device, const RECT* src_rect, const RECT* dst_rect,
 	                               HWND dst_window, const RGNDATA* dirty_region) {
 		if (!Limiter::ShouldPresent())
 			return D3D_OK;
 
-		// The overlay is drawn by the D3D9 hooks whenever there is a D3D9 device. For D3D8
-		// games whose wrapper never goes through D3D9 (dgVoodoo2 translates straight to
-		// D3D11) there is none, so those draw it with their D3D8 device instead
-		if (D3D8Overlay::Instance)
-			D3D8Overlay::Instance->Draw();
+		draw_overlay();
 
-		return Present_orig(device, src_rect, dst_rect, dst_window, dirty_region);
+		auto result = Present_orig(device, src_rect, dst_rect, dst_window, dirty_region);
+
+		// One presentation reached the display (see overlay.h; the rate readout is only drawn by
+		// the games that turn it on)
+		overlay_mark_presentation();
+		return result;
 	}
 
 	HRESULT __stdcall Reset_hook(IDirect3DDevice8* device, D3DPRESENT_PARAMETERS* present_params) {
@@ -213,7 +224,14 @@ namespace {
 }
 
 void D3D8Hook::Install(IDirect3DDevice8* device) {
-	if (device_hooks_installed || device == nullptr)
+	if (device == nullptr)
+		return;
+
+	// Remembered before the hooks are installed, so a device that is recreated later still presents
+	// through the same path (see d3d8_present_bypassing_hooks)
+	d3d8_device = device;
+
+	if (device_hooks_installed)
 		return;
 
 	DWORD* vtbl = *(DWORD**)device;
@@ -227,6 +245,20 @@ void D3D8Hook::Install(IDirect3DDevice8* device) {
 	patch_bytes(&vtbl[15], &present_hook, sizeof(DWORD));
 
 	device_hooks_installed = true;
+}
+
+// Presents without going through the hooks other patches and tools put on the device (see the
+// comment in d3d9_hook.cpp for why the frame interpolation wants that). The patch's own overlay is
+// drawn here, the same way the Present hook draws it - this path goes around that hook, and the
+// overlay has to stay on every presentation.
+HRESULT d3d8_present_bypassing_hooks() {
+	if (Present_orig == nullptr || d3d8_device == nullptr)
+		return E_FAIL;
+
+	draw_overlay();
+	auto result = Present_orig(d3d8_device, nullptr, nullptr, nullptr, nullptr);
+	overlay_mark_presentation();
+	return result;
 }
 
 void D3D8Hook::HookDirect3DCreate8() {

@@ -20,3 +20,9 @@ namespace D3D8Hook {
 	// installs the hook once.
 	void Install(IDirect3DDevice8* device);
 }
+
+// Presents with the Present that was in place when the device was created, i.e. without the hooks
+// that other patches and tools put in front of it (the frame interpolation presents its extra
+// frames with this, see the comment in d3d9_hook.cpp). The patch's own overlay is drawn from here
+// as well, since this path goes around the Present hook that normally draws it.
+HRESULT d3d8_present_bypassing_hooks();

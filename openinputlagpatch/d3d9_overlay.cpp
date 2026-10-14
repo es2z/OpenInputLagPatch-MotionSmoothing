@@ -30,6 +30,14 @@ void overlay_show_present_rate(bool show) {
 	present_rate_shown = show;
 }
 
+bool overlay_present_rate_enabled() {
+	return present_rate_shown;
+}
+
+double overlay_present_rate() {
+	return present_rate;
+}
+
 void overlay_set_present_rate_anchor(int picture_right, int picture_width) {
 	present_rate_right = picture_right;
 	present_rate_width = picture_width;

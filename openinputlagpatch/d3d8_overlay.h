@@ -29,7 +29,7 @@ private:
 	void SetupAtlasUVTable();
 	void SetupViewportAndTransforms();
 
-	int UpdateBuffers(char* text);
+	int UpdateBuffers(char* text, D3DCOLOR color, float x_offset);
 
 	IDirect3DDevice8* d3d8_device;
 	// D3D8 state blocks are tokens instead of objects like in D3D9

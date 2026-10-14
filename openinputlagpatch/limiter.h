@@ -64,6 +64,30 @@ public:
 	// See touhou19.cpp for the games that use it.
 	static double game_fps;
 
+	// The number of presentations per second the frame interpolation should be putting on the
+	// display, worked out from the two interpolation settings. 0 means there is nothing to
+	// interpolate:
+	//   Interpolation = -1     the largest multiple of the game's frame rate the display can show
+	//                          (a 180hz display and a 60fps game give 3)
+	//   Interpolation = N      present N times per game frame
+	//   InterpolationFPS = R   present at R frames per second (e.g. *144)
+	//
+	// The games that had frame interpolation before this worked it out in their own file; the ones
+	// that come after can call this instead.
+	static double PresentRate();
+
+	// How many extra presentations the frame that just presented should get, and how far apart they
+	// should sit (in performance counter units, 0 when there is no room for any). A rate that isn't
+	// a multiple of the game's frame rate has its remainder carried over from frame to frame, so
+	// the presentations still average out ("*144" with 60fps logic presents 2 and 3 alternately).
+	static unsigned int ExtraPresentations(double rate, LARGE_INTEGER& spacing);
+
+	// Whether the patch is presenting every Nth frame instead of every one, because the target
+	// frame rate is above what the display can show (see ShouldPresent). The frame interpolation
+	// must not add presentations while it is: the thinning is what keeps the presents from
+	// throttling the logic, and extra presentations would undo it.
+	static bool PresentingEveryNthFrame();
+
 	// Those same games are the ones external tools hook to change the frame rate: thprac, for
 	// example, points the engine's clock at a variable of its own. The per game code reports
 	// whatever frame rate is in use there through this, so the limiter follows it instead of

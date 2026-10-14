@@ -24,10 +24,16 @@ void d3d8_overlay_set_text(const char* text, unsigned long color);
 // frames per second are actually reaching the display.
 void overlay_mark_presentation();
 
+// That frame rate, and whether the game asked for it to be shown (see overlay_show_present_rate).
+// The D3D9 overlay lays its own display of it out; the D3D8 overlay draws it right after its own
+// text line, which is where the games that use it there have room for it.
+double overlay_present_rate();
+bool overlay_present_rate_enabled();
+
 // Whether the overlay shows that frame rate along the bottom of the screen. It is off by default,
-// and the interpolation turns it on (together with the overlay itself). The D3D9 overlay is the
-// one that draws it: the games that interpolate are D3D9 ones, and a game that never gets a D3D9
-// device can't have it on.
+// and the interpolation turns it on (together with the overlay itself). Both overlays draw it:
+// the D3D9 one at the right edge of the window (or of the game's own picture, see the anchor
+// below) and the D3D8 one right after the render time line in the bottom left corner.
 void overlay_show_present_rate(bool show);
 
 // Where along the bottom that frame rate is drawn. It sits at the right edge of the window by

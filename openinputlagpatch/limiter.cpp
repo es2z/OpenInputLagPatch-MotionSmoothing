@@ -33,6 +33,60 @@ bool Limiter::ShouldPresent() {
 	return (frame_num % present_every) == 0;
 }
 
+bool Limiter::PresentingEveryNthFrame() {
+	return present_every > 1;
+}
+
+// The rate the frame interpolation should be presenting at (see limiter.h). This is what the games
+// that had interpolation before this worked out for themselves; the ones that come after call it.
+double Limiter::PresentRate() {
+	if (Config::InterpolationFPS)
+		return (double)Config::InterpolationFPS;
+
+	// "-1" picks the largest multiple of the game's frame rate the display can show, a positive
+	// value is that multiple (and 1, the off setting, leaves nothing to present)
+	int multiplier = Config::Interpolation;
+	if (multiplier < 0) {
+		UINT display = display_refresh;
+		UINT logic = (UINT)(game_fps + 0.5);
+		if (display == 0 || logic == 0)
+			return 0.0;
+		multiplier = (int)(display / logic);
+	}
+	if (multiplier < 2)
+		return 0.0;
+
+	return game_fps * (double)multiplier;
+}
+
+// How many extra presentations the frame gets, and how far apart they sit (see limiter.h)
+unsigned int Limiter::ExtraPresentations(double rate, LARGE_INTEGER& spacing) {
+	spacing.QuadPart = 0;
+	if (rate <= 0.0 || game_fps <= 0.0)
+		return 0;
+
+	// The game's own presentation is one of the frame's presentations, and the fraction is carried
+	// over to the next frame so a rate that isn't a multiple of the game's frame rate still
+	// averages out. One game runs per process, so the carry can live here rather than in each game.
+	static double presentations_owed = 0.0;
+	presentations_owed += rate / game_fps - 1.0;
+
+	unsigned int extras = 0;
+	while (presentations_owed >= 1.0 - 1e-9 && extras < 32) {
+		presentations_owed -= 1.0;
+		++extras;
+	}
+	if (extras == 0)
+		return 0;
+
+	// In the steady state the game's own presents are one frame apart, so spreading the extras
+	// this far apart from the one that just happened puts them evenly between this frame and the
+	// next. Evenly spaced presentations are what keeps the motion looking even, since each one
+	// draws the state a little further along than the one before it.
+	spacing.QuadPart = wait_amount.QuadPart / (LONGLONG)(extras + 1);
+	return extras;
+}
+
 // Initializes the limiter's timers, settings, etc
 void Limiter::Initialize(ReplayCallback callback) {
 	replay_callback = callback;
