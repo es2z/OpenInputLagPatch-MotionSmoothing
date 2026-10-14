@@ -106,8 +106,15 @@ namespace {
 			params->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
 		}
 
-		params->SwapEffect = D3DSWAPEFFECT_DISCARD;
-		params->BackBufferCount = 0;
+		// The swap effect and the back buffer count are left alone, deliberately. The games read
+		// back buffer 0 right after presenting - GameWindow::Present calls Present() and then
+		// AnmManager::TakeScreencaptures, which does GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO) and
+		// copies that into the surface their afterimage effects (and the pause screen) draw from -
+		// and D3DSWAPEFFECT_DISCARD means exactly "the back buffer's contents are undefined after
+		// a present". Forcing it (and a back buffer count of 0) made those captures read something
+		// other than the frame that was just drawn, which showed up as the afterimage trail in
+		// Touhou 8's stage 6A intro looking different. What the game asks for (COPY, or FLIP /
+		// COPY_VSYNC with vsync on) is what it expects to read back.
 	}
 
 	HRESULT __stdcall Present_hook(IDirect3DDevice8* device, const RECT* src_rect, const RECT* dst_rect,
