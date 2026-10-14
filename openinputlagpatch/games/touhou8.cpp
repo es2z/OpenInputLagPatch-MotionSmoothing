@@ -387,6 +387,105 @@ static __declspec(naked) void th8_player_sprite_hook() {
 }
 
 // ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the familiars
+// ---------------------------------------------------------------------------
+//
+// The familiars are four slots of 0x2F4 bytes at player+0x40C. Each slot carries its own update
+// callback (+0x6F8 within the player) and draw callback (+0x6FC): the draw walks them and calls the
+// callback each slot has (0x44D60E), the update does the same with the update one (0x44BD79). Both
+// pointers are written at runtime, which is why the diagnostics name them - and the draw of one of
+// them (0x44E9E0, for the callbacks the diagnostics printed) does what the player's own draw does:
+// it copies the familiar's own position (slot+0x2A4, three floats) plus the screen shake into the
+// position of the sprite VM the slot holds (slot+0x208, 0x44E9E5..0x44EA16), and then draws that.
+//
+// So a familiar moves the way a shot does: its own position is moved before the pass and put back
+// after, and the step is measured over a frame - what moves a familiar is its update, which follows
+// the player rather than reading a velocity. A slot only exists while its draw callback is set
+// (the game's own check at 0x44D5E2): the solo characters have no familiars at all, which is what
+// the diagnostics read as four zeroes.
+
+static const unsigned int th8_familiars_max = 4;
+static const unsigned int th8_familiar_size = 0x2F4;
+static const unsigned int th8_familiar_pos_offset = 0x2A4;  // the draw copies this into the sprite
+
+static float th8_familiars_last_pos[th8_familiars_max][3];
+static float th8_familiars_step[th8_familiars_max][3];
+static bool th8_familiars_used_last[th8_familiars_max];
+
+static unsigned char* th8_familiar_slot(unsigned int index) {
+    return th8_player + 0x40C + (size_t)index * th8_familiar_size;
+}
+
+static unsigned char** th8_familiar_draw_callback(unsigned int index) {
+    return (unsigned char**)(th8_player + 0x6FC + (size_t)index * th8_familiar_size);
+}
+
+// Called once a frame, from the frame's first draw pass, next to th8_shots_measure. The same
+// "nothing moves this far in a frame" guard as the shots have is used here: a slot can be given to
+// a different familiar between two samples.
+static const float th8_familiars_max_step = 48.0f;
+
+static unsigned int th8_familiars_in_play;
+
+static void th8_familiars_measure() {
+    th8_familiars_in_play = 0;
+
+    for (unsigned int i = 0; i < th8_familiars_max; ++i) {
+        const bool in_use = *th8_familiar_draw_callback(i) != nullptr;
+        const float* pos = (const float*)(th8_familiar_slot(i) + th8_familiar_pos_offset);
+
+        const float step_x = pos[0] - th8_familiars_last_pos[i][0];
+        const float step_y = pos[1] - th8_familiars_last_pos[i][1];
+        const bool reused = (step_x * step_x + step_y * step_y) >
+                            th8_familiars_max_step * th8_familiars_max_step;
+
+        if (in_use)
+            ++th8_familiars_in_play;
+
+        for (int c = 0; c < 3; ++c) {
+            th8_familiars_step[i][c] = in_use && th8_familiars_used_last[i] && !reused
+                                           ? pos[c] - th8_familiars_last_pos[i][c]
+                                           : 0.0f;
+            th8_familiars_last_pos[i][c] = pos[c];
+        }
+        th8_familiars_used_last[i] = in_use;
+    }
+}
+
+static unsigned int th8_familiars_projected;
+static unsigned int th8_familiars_moved[th8_familiars_max];
+static float th8_familiars_saved_pos[th8_familiars_max][3];
+static unsigned int th8_familiars_moved_count;
+
+static void th8_familiars_advance(float t) {
+    th8_familiars_moved_count = 0;
+
+    for (unsigned int i = 0; i < th8_familiars_max; ++i) {
+        if (*th8_familiar_draw_callback(i) == nullptr)
+            continue;
+
+        float* pos = (float*)(th8_familiar_slot(i) + th8_familiar_pos_offset);
+        for (int c = 0; c < 3; ++c) {
+            th8_familiars_saved_pos[th8_familiars_moved_count][c] = pos[c];
+            pos[c] = pos[c] + th8_familiars_step[i][c] * t;
+        }
+        th8_familiars_moved[th8_familiars_moved_count] = i;
+        ++th8_familiars_moved_count;
+    }
+
+    th8_familiars_projected = th8_familiars_moved_count;
+}
+
+static void th8_familiars_undo() {
+    for (unsigned int n = 0; n < th8_familiars_moved_count; ++n) {
+        float* pos = (float*)(th8_familiar_slot(th8_familiars_moved[n]) + th8_familiar_pos_offset);
+        for (int c = 0; c < 3; ++c)
+            pos[c] = th8_familiars_saved_pos[n][c];
+    }
+    th8_familiars_moved_count = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Frame interpolation, stage 1: the player's own shots
 // ---------------------------------------------------------------------------
 //
@@ -596,6 +695,7 @@ static void __fastcall th8_render_hook(void* chain) {
     if (!th8_drew_frame) {
         th8_player_measure();
         th8_shots_measure();
+        th8_familiars_measure();
     }
 
     th8_drew_frame = true;
@@ -637,6 +737,7 @@ static void th8_extra_presentation(float t) {
     // them (see the stage 1 comment above)
     th8_bullets_advance(t);
     th8_shots_advance(t);
+    th8_familiars_advance(t);
 
     // The player's sprite, the familiars and the player's own shots are drawn from positions the
     // game's own code writes while drawing, so those are nudged where they are drawn instead - this
@@ -655,6 +756,7 @@ static void th8_extra_presentation(float t) {
 
     th8_bullets_undo();
     th8_shots_undo();
+    th8_familiars_undo();
 
     th8_flush_vertex_buffer(*th8_anm_manager);
     device->SetTexture(0, nullptr);
@@ -733,6 +835,10 @@ static void th8_diag_dump() {
     // many of those the last presentation moved
     fprintf(file, "shots: %u in play, %u projected forward (last presentation)\n", th8_shots_in_play,
             th8_shots_projected);
+    // The familiars (see their stage 1 comment above): the slots whose draw callback is set are the
+    // ones the game itself draws, so that is what counts as one
+    fprintf(file, "familiars: %u in play, %u projected forward (last presentation)\n",
+            th8_familiars_in_play, th8_familiars_projected);
     // The familiars' callbacks are set at runtime, so the diagnostics name them: the code behind
     // them is what says where a familiar's own position lives (its slot is at player+0x40C+i*0x2F4,
     // its update callback at +0x6F8 and its draw callback at +0x6FC within the player)
