@@ -7,6 +7,58 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-15
+
+### Added
+
+- **Touhou 8 gets frame interpolation** (`b16284a`, `1cb0da0`, `6966ba0`, `4f95ade`, `0479b21`)
+
+  Imperishable Night runs on the earlier engine, where a frame is one call into GameWindow::Render
+  (`0x441E70`): the input is read at the head of the calc chain (`0x441F48`), the whole frame is drawn
+  in one block (`0x441FB4..0x442027`) and presented once (`0x44203D`). The patch paces that frame from
+  the window update hook, so the extra presentations go between the game's own present and the next
+  frame - the shape th19 and th20 have. What is new here is that the rate and the number of extras are
+  worked out in the limiter itself; the per-game copies th10 to th20 each carry are left alone.
+
+  What this game needs on top of that shape is that almost everything it draws is drawn from state the
+  draw pass itself writes: the player's sprite is placed in its VM from the player's own position while
+  that sprite is drawn (0x44D568..0x44D5B9), and the shots and the familiars the same way. So the
+  extras move the player at the call that draws it, and move the shots' and the familiars' own
+  positions before the pass - the way the bullets work, which the game's own movers also move by
+  adding a velocity (`pos += velocity`, 0x410A70). The player's sprite draw turned out to be shaped
+  like the AnmManager's own draws: the manager in ECX and the VM as the one argument the caller
+  pushed, which the function takes off with `ret 4` (0x462FF0). Hooking it as anything else left it
+  drawing from whatever ECX held, with the stack four bytes off, and the player's sprite disappeared
+  outright - which is why that hook is written out by hand, and why the source now says to read a hook
+  target's prologue and its `ret` before taking it over.
+
+  The player's own shots, the familiars and the straight lasers have no velocity to read (the shots
+  and the lasers are driven by scripts, the familiars follow the player), so how far each of them
+  moves in a frame is measured in the game's own pass and the extras project by their fraction of it -
+  which also means nothing that is not moving can be moved. A slot the game reuses for a new shot or
+  laser between two samples is not projected across the jump, since that reads as a step no shot
+  could take in a frame; the misalignment that showed up in the player's shots during this round was
+  exactly that. The familiars are four slots whose draw callback is set at runtime, and it is the same
+  function for every team (all five of them were checked), which is what the diagnostics name.
+
+  The menus and the pause screen needed nothing at all: this game's string list is drawn and cleared
+  inside the same draw pass (the low priority ascii pass runs OnDrawLowPrioImpl and then
+  ResetStrings), with the HUD appending to it earlier in that same pass, so an extra presentation
+  cannot draw any of that text twice.
+
+  The D3D8 overlay can show the rate the frames are actually presented at as well now, next to the
+  render time line in the bottom left corner, and the D3D8 hook is what counts the presentations.
+  That is what the D3D9 overlay has shown for th10 to th20, and th08 is the first D3D8 game to get it.
+
+  Checked in game at 180Hz: three presentations per frame 5.56ms apart, 180.6 presentations per
+  second, the game's own frame rate reading 60 with its own text at "60.00fps", the bullets, the
+  player, its shots, the familiars (all five teams) and the straight lasers all smooth with no jumps,
+  ghosting or misalignment, and thprac's input latency readout back where it was before the extras
+  were added.
+
+  Not done, as the requirements say: the enemies (their animation scripts place them, there is no
+  velocity to read) and the curve lasers.
+
 ## 2026-10-14
 
 ### Added
