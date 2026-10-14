@@ -10,7 +10,7 @@
 
 ### 新增
 
-- **东方永夜抄（th08）也用上了 vpatch 那套输入处理**（`dd75d02`）
+- **东方永夜抄（th08）也用上了 vpatch 那套输入处理**（`dd75d02`、`2d18dbd`）
 
   永夜抄的自机输入不是直接来自键盘：`Player::HandlePlayerInputs`（`0x44AEC0`）与
   `Player::__shoot_bullets`（`0x451500`）读的是 `0x164D52C` 那份副本，而游戏只在
@@ -18,7 +18,7 @@
   在输入轮询（优先级 0）和自机（优先级 9）之后。于是每一帧用的都是上一帧的输入，
   这正是 vpatch readme 里给这一作写的「和妖妖梦一样有 1 帧输入延迟」，也是它 rev4 声称消掉的那一帧。
 
-  消除它靠的就是 vpatch 的那 4 处补丁，这里由 `FixInputGlitching` 开关：`Supervisor::OnUpdate` 里
+  消除它靠的就是 vpatch 的那 4 处补丁：`Supervisor::OnUpdate` 里
   对 `Controller::GetInput` 的调用（`0x4455F0`）改走包装函数，在**读到输入的当下**推进副本
   （滤掉暂停位；正在回放时不动副本），记录更新里的副本搬运（`0x452326`）被跳过，
   它开头检查的标志（`0x452319`）改由这里消费，`ReplayManager::AddedCallbackRecord` 的返回
@@ -29,18 +29,44 @@
   vpatch 的 ini 给这一作的 `AlwaysBlt` 写的也正是这套代码 —— 窗口失去焦点后按键被留在上面，
   是这套副本处理顺带修掉的另一件事。
 
+- **东方妖妖梦（th07）用上了同一套输入处理的对应版本**（`2d18dbd`）
+
+  妖妖梦的自机读的是 `g_CurFrameGameInput`（`0x4B9E50`，`0x4B9E58` 是它的上一帧），这份副本只在
+  `ReplayManager::OnUpdateRecord`（`0x442CD0`）里被推进 —— 计算链优先级 16，在自机（优先级 8）之后。
+  这正是 vpatch readme 里给这一作写的那一帧「输入延迟」（它说妖妖梦合计 2 帧：1 帧绘制 + 1 帧输入），
+  也正是上游那句「把绘制挪到逻辑之后」从来没管到的那一帧。这里的做法：`0x437D80` 上对
+  `Controller::GetInput` 的调用改走包装函数、在读到输入的当下推进副本（正在回放时不动），
+  游戏自己那份副本任务（`0x442CD9`）被接管、它的搬运（`0x442CF2`）被跳过，
+  `ReplayManager::AddedCallbackRecord` 的返回（`0x4433A5`）与 th08 一样把标志置起。
+
+  两作这一套都按 vpatch 的方式**无条件生效**（最初一版曾放在 `FixInputGlitching` 开关后面，那个门已经拆掉）。
+
 ### 变更
 
 - **`FixInputGlitching` 默认改为开启**（`dd75d02`）
 
-  在红魔乡/妖妖梦里，它修的是「窗口不在前台时游戏读到的键盘状态」：DirectInput 拒绝给状态
+  它现在负责的就是红魔乡/妖妖梦里「窗口不在前台时游戏读到的键盘状态」：DirectInput 拒绝给状态
   （`DIERR_NOTACQUIRED`），游戏却只把 `DIERR_INPUTLOST` 当失败，于是继续读一份从没被填过的缓冲区，
   表现就是凭空冒出各种按键。同样默认开启的 `AlwaysBlt` 只管「继续跑」，于是它每帧都会踩进这个坑 ——
-  原版失焦时整个 Render 直接返回，所以只有这个组合才会碰到。
+  原版失焦时整个 Render 直接返回，所以只有这个组合才会碰到。上面两条输入时序修正与这个选项无关（两作都是）。
+
+### 修复
+
+- **不再给 D3D8 作品强制 discard 交换模式**（`dfdcaf5`）
+
+  `apply_presentation_overrides` 一直在给每个 D3D8 作品强塞 `D3DSWAPEFFECT_DISCARD` 与
+  `BackBufferCount = 0`，而这些作品是在 **Present 之后**立刻回读后缓冲的：`GameWindow::Present`
+  （`main.cpp:368`）先调 `Present()`，紧接着 `AnmManager::TakeScreencaptures` 会
+  `GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO)` 把内容拷进残像效果（以及暂停菜单背景）用的 surface。
+  而 DISCARD 的定义就是「Present 之后内容未定义」——于是截到的不再是刚画完的那一帧。
+  在永夜抄上表现就是 6A boss 开场那段残像拖影看起来不对，以及 thprac 的覆盖层在同一批帧上多留了几帧；
+  现在把这两项交还给游戏后就都正常了。刷新率选择（`FullscreenRefreshRate` 对 D3D8 依然生效）与
+  强制关 vsync 都保留。
 
 还没做：键盘设备目前仍然只在启动时 `Acquire()` 一次，如果补上副本处理后仍有「失焦后按键被留在上面」
-的情况，下一步是在窗口重新激活时 `Acquire()`（vpatch 也没做这件事）。th08 的渲染问题
-（thprac 6A boss 拖影）与它的补帧都还没开始。
+的情况，下一步是在窗口重新激活时 `Acquire()`（vpatch 也没做这件事——它自己的答案是换成背景协作级，
+这里没动）。th08 的补帧还没开始。D3D9 那条路（`d3d9_hook.cpp`）对 D3D9 作品仍强制着同样的 discard
+交换模式，等有作品给出理由再动。
 
 ## 2026-10-13
 

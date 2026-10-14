@@ -11,7 +11,7 @@ is also the record of what has actually been verified rather than just what was 
 
 ### Added
 
-- **Touhou 8 gets the input handling vpatch applies to it** (`dd75d02`)
+- **Touhou 8 gets the input handling vpatch applies to it** (`dd75d02`, `2d18dbd`)
 
   Imperishable Night's player input does not come from the keyboard directly: `Player::HandlePlayerInputs`
   (`0x44AEC0`) and `Player::__shoot_bullets` (`0x451500`) read the copy at `0x164D52C`, and the game
@@ -21,7 +21,7 @@ is also the record of what has actually been verified rather than just what was 
   lag vpatch's readme describes for this game (`永夜抄は、妖々夢と同じ入力遅延が1フレームあります`) and
   the one its rev4 changelog says it removed.
 
-  vpatch's four patches are what removes it, and they are applied here behind `FixInputGlitching`: the
+  vpatch's four patches are what removes it: the
   call to `Controller::GetInput` inside `Supervisor::OnUpdate` (`0x4455F0`) goes to a wrapper that
   advances the copy at the moment the input is read (pause bit filtered, and left alone while a replay
   is playing), the copy work inside the record update (`0x452326`) is skipped, the flag that update
@@ -33,21 +33,53 @@ is also the record of what has actually been verified rather than just what was 
   The same copy handling is also what vpatch's own ini documents its `AlwaysBlt` for this game with -
   keys staying held after the window loses focus are its other effect.
 
+- **Touhou 7 gets its own version of the same input handling** (`2d18dbd`)
+
+  Perfect Cherry Blossom's player reads `g_CurFrameGameInput` (`0x4B9E50`, with `0x4B9E58` as its
+  previous frame) - a copy the game only advances in `ReplayManager::OnUpdateRecord` (`0x442CD0`), the
+  calc chain element at priority 16, after the player has run (priority 8). That is the extra frame of
+  input lag vpatch's readme lists for this game next to the drawing one, and what upstream's "run the
+  drawing logic after the game update logic" never touched. Here the call to `Controller::GetInput`
+  (`0x437D80`) starts going through a wrapper that advances the copy at the moment the input is read
+  (left alone while a replay is playing), the game's own copy job is taken over (`0x442CD9`) with its
+  copy pair skipped (`0x442CF2`), and `ReplayManager::AddedCallbackRecord`'s return (`0x4433A5`)
+  raises the same flag Touhou 8's does.
+
+  Both games' handling is applied the way vpatch applies its own: unconditionally. (The first version
+  of this had it behind `FixInputGlitching`; that gate is gone.)
+
 ### Changed
 
 - **`FixInputGlitching` is on by default** (`dd75d02`)
 
-  In EoSD and PCB it fixes the keyboard state the game reads while the window is not in the foreground:
+  What it covers is the keyboard state EoSD and PCB read while the window is not in the foreground:
   DirectInput refuses to hand the state over (`DIERR_NOTACQUIRED`), the game only treats
   `DIERR_INPUTLOST` as a failure and goes on reading a buffer that was never filled in, which shows up
   as keys being pressed out of nowhere. `AlwaysBlt`, on by default as well and only about keeping the
   game running, is what walks into that every frame - in vanilla the whole render bails out while
-  unfocused, so this could only be reached with that combination of options.
+  unfocused, so this could only be reached with that combination of options. The input timing fixes
+  the two entries above are about are not this option, on either game.
+
+### Fixed
+
+- **D3D8 games are no longer told to use a discard swap effect** (`dfdcaf5`)
+
+  `apply_presentation_overrides` was forcing `D3DSWAPEFFECT_DISCARD` and a back buffer count of 0 on
+  every D3D8 game, and those games read back buffer 0 right after presenting: `GameWindow::Present`
+  (`main.cpp:368`) calls `Present()` and then `AnmManager::TakeScreencaptures`, which does
+  `GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO)` and copies what it finds into the surfaces the afterimage
+  effects (and the pause screen's background) are drawn from. DISCARD means exactly "the contents are
+  undefined after a present", so those captures stopped reading the frame that had just been drawn. On
+  Touhou 8 that was the afterimage trail in the stage 6A boss intro looking different, and thprac's
+  overlay over the same frames disappearing a few frames late; both look right with the two settings
+  left to the game. The refresh rate choice (`FullscreenRefreshRate` still applies to the D3D8 games)
+  and vsync being forced off stay.
 
 Not done yet: the keyboard device is still only acquired once at startup, so if keys can still be left
 held after losing focus once the copy handling is in, an `Acquire()` on activation is the next step
-(vpatch does not do that either). Touhou 8's rendering problem (the thprac 6A boss trail) and its frame
-interpolation are still open.
+(vpatch does not do that either - its own answer is a background cooperative level, which is left
+alone here). Touhou 8's frame interpolation is still open. The D3D9 hook still forces the same discard
+swap effect on the D3D9 games; that is left alone until a game shows a reason.
 
 ## 2026-10-13
 
