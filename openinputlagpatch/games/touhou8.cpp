@@ -1,6 +1,7 @@
 // Touhou 8: Imperishable Night v1.00d
 
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include "patch_util.h"
 #include "d3d8_hook.h"
@@ -275,6 +276,223 @@ static void th8_fps_state_restore(const Th8FpsState* state) {
 static unsigned char* th8_tool_frame_address = (unsigned char*)0x0043CB37;
 static unsigned char* th8_tool_draw_address = (unsigned char*)0x0043CC45;
 
+// How far along the extra presentation being drawn sits, as a fraction of a frame; 0 while the
+// game's own pass is being drawn (see th8_extra_presentation)
+static float th8_extra_t;
+
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player
+// ---------------------------------------------------------------------------
+//
+// The player's sprite is not drawn where the player is: Player::OnDrawHighPrio (0x44D530) writes the
+// sprite VM's own position from the player's first - `[player+0x218] = [player+0x2B4] + the screen
+// shake`, `[player+0x21C] = [player+0x2B8] + the same` (0x44D568..0x44D59C) - and then draws the VM
+// at player+0x10 (0x44D5AF..0x44D5B9). So that VM position is what an extra presentation has to
+// move, and it has to be moved after the game's own code has written it, which is the call that
+// draws the sprite: it is taken over here, the position is nudged by however far the player moves in
+// a frame times the extra's fraction of it, the sprite is drawn, and the position goes back.
+//
+// How far the player moves in a frame is measured rather than read: the player's movement adds its
+// velocity (player+0x3F8) to its position once a frame, but it is not the only thing that can move
+// it (a death or a stage transition repositions it outright), so the position is sampled once a
+// frame - in the game's own pass, at the top of the draw chain - and the step is the difference to
+// what it was the frame before. Nothing of the player's own state is written anywhere but that VM
+// position, which is put back the moment the sprite is drawn.
+
+static unsigned char* th8_player = (unsigned char*)0x017D5EF8; // g_Player
+static const unsigned int th8_player_pos_offset = 0x2B4;
+static const unsigned int th8_player_sprite_pos_offset = 0x218; // the VM at player+0x10, pos at +0x208
+
+static float th8_player_last_pos[2];
+static float th8_player_step[2];
+static bool th8_player_pos_known;
+
+// What the player moved by over the last frame, for the diagnostics
+static float th8_player_step_length;
+
+// Called once a frame, from the frame's first draw pass (see th8_render_hook)
+static void th8_player_measure() {
+    const float* pos = (const float*)(th8_player + th8_player_pos_offset);
+
+    if (th8_player_pos_known) {
+        th8_player_step[0] = pos[0] - th8_player_last_pos[0];
+        th8_player_step[1] = pos[1] - th8_player_last_pos[1];
+        th8_player_step_length = (float)sqrt((double)(th8_player_step[0] * th8_player_step[0] +
+                                                      th8_player_step[1] * th8_player_step[1]));
+    } else {
+        th8_player_step[0] = 0.0f;
+        th8_player_step[1] = 0.0f;
+        th8_player_pos_known = true;
+    }
+
+    th8_player_last_pos[0] = pos[0];
+    th8_player_last_pos[1] = pos[1];
+}
+
+// The draw the hook goes in front of (the call at 0x44D5B9) is shaped like the AnmManager's own
+// draws: the manager in ECX, and the VM the caller pushed (0x44D5B2) as its one argument - which
+// the function itself takes off again (0x4631C2 is `ret 4` at its end). So the VM is *not* in ECX,
+// and the argument has to come off exactly once, which is why the hook is written out by hand
+// rather than as a C function: getting that wrong leaves the manager drawing whatever ECX happened
+// to be, with the stack four bytes off, and the sprite stops being drawn at all.
+static void* th8_draw_player_sprite = (void*)0x00462FF0;
+
+static float th8_player_sprite_pos[2];
+
+static void th8_player_sprite_nudge(void* vm) {
+    float* pos = (float*)((char*)vm + 0x208);
+
+    th8_player_sprite_pos[0] = pos[0];
+    th8_player_sprite_pos[1] = pos[1];
+
+    if (th8_extra_t != 0.0f) {
+        pos[0] = th8_player_sprite_pos[0] + th8_player_step[0] * th8_extra_t;
+        pos[1] = th8_player_sprite_pos[1] + th8_player_step[1] * th8_extra_t;
+    }
+}
+
+static void th8_player_sprite_put_back(void* vm) {
+    float* pos = (float*)((char*)vm + 0x208);
+
+    pos[0] = th8_player_sprite_pos[0];
+    pos[1] = th8_player_sprite_pos[1];
+}
+
+static __declspec(naked) void th8_player_sprite_hook() {
+    __asm {
+        push ebp
+        mov ebp, esp
+        push esi
+
+        // The VM is the argument the caller pushed, not ECX
+        mov esi, dword ptr [ebp + 8]
+
+        push esi
+        call th8_player_sprite_nudge
+        add esp, 4
+
+        // The game's own draw, called the way its caller calls it
+        mov ecx, dword ptr ds:[018BDC90h]
+        push esi
+        call dword ptr [th8_draw_player_sprite]
+
+        push esi
+        call th8_player_sprite_put_back
+        add esp, 4
+
+        pop esi
+        pop ebp
+        ret 4
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player's own shots
+// ---------------------------------------------------------------------------
+//
+// The player's shots are 0x80 slots of 0x484 bytes at player+0xBE838. The shot list's draw
+// (0x4512F0, the first thing Player::OnDrawHighPrio runs) walks them, skips the ones whose state
+// (slot+0x462, a 16 bit field) is not 1, copies each shot's own position (slot+0x2A4, three floats)
+// plus the screen shake into the position of the sprite VM the slot holds (slot+0x208/+0x20C, at
+// 0x451360..0x451387) and draws that VM through the slot's own callback (slot+0x478, 0x4513ED).
+// Moving the shot's own position is therefore enough - the pass copies it into the sprite itself -
+// and that needs no hook, whose calling convention would have to be matched to the byte (see the
+// note above the player's sprite hook).
+//
+// A shot's own movement is its SHT script, run by the list's update through 0x40D3B0 (the script
+// cursor is at slot+0x450), so there is no velocity field to read here either. Instead the frame's
+// own movement is measured: every slot's position is sampled once a frame, in the game's own pass,
+// and the difference to the frame before is what the extras project by. A slot that was not in use
+// the frame before has just been spawned and gets no step for that frame.
+
+static const unsigned int th8_shots_max = 0x80;
+static const unsigned int th8_shots_offset = 0xBE838;      // from the player
+static const unsigned int th8_shot_size = 0x484;
+static const unsigned int th8_shot_in_use_offset = 0x462;  // 16 bit, 1 while the slot is in use
+static const unsigned int th8_shot_pos_offset = 0x2A4;     // the pass copies this into the sprite
+
+static float th8_shots_last_pos[th8_shots_max][3];
+static float th8_shots_step[th8_shots_max][3];
+static bool th8_shots_used_last[th8_shots_max];
+
+// A shot that is done with its slot leaves it, and a new shot can be spawned into the same slot
+// during the same frame, which the once-a-frame sampling here cannot see: the two positions are
+// hundreds of pixels apart (the old one is up the screen where it died, the new one is at the
+// player's), and projecting that jump draws the new shot somewhere below the player on the extras
+// before it settles. Nothing a shot does in one frame comes anywhere near this far, so a step that
+// big is thrown away instead of projected - that slot's shot is drawn where the frame's own pass put
+// it for that one extra, and from the frame after on the step is the shot's own again.
+static const float th8_shots_max_step = 48.0f;
+
+static unsigned char* th8_shot_slot(unsigned int index) {
+    return th8_player + th8_shots_offset + (size_t)index * th8_shot_size;
+}
+
+// Called once a frame, from the frame's first draw pass, next to th8_player_measure
+static void th8_shots_measure() {
+    for (unsigned int i = 0; i < th8_shots_max; ++i) {
+        const unsigned char* slot = th8_shot_slot(i);
+        const bool in_use = *(const short*)(slot + th8_shot_in_use_offset) == 1;
+        const float* pos = (const float*)(slot + th8_shot_pos_offset);
+
+        const float step_x = pos[0] - th8_shots_last_pos[i][0];
+        const float step_y = pos[1] - th8_shots_last_pos[i][1];
+        const bool reused = (step_x * step_x + step_y * step_y) >
+                            th8_shots_max_step * th8_shots_max_step;
+
+        for (int c = 0; c < 3; ++c) {
+            // A slot that was not in use last frame, or one the game has reused, has just had a shot
+            // spawned in it: its script has not run a step of its own yet, so there is nothing to
+            // project by (see th8_shots_max_step)
+            th8_shots_step[i][c] = in_use && th8_shots_used_last[i] && !reused
+                                       ? pos[c] - th8_shots_last_pos[i][c]
+                                       : 0.0f;
+            th8_shots_last_pos[i][c] = pos[c];
+        }
+        th8_shots_used_last[i] = in_use;
+    }
+}
+
+// What the last extra presentation moved, for the diagnostics
+static unsigned int th8_shots_in_play;
+static unsigned int th8_shots_projected;
+
+static unsigned int th8_shots_moved[th8_shots_max];
+static float th8_shots_saved_pos[th8_shots_max][3];
+static unsigned int th8_shots_moved_count;
+
+static void th8_shots_advance(float t) {
+    th8_shots_moved_count = 0;
+    th8_shots_in_play = 0;
+
+    for (unsigned int i = 0; i < th8_shots_max; ++i) {
+        unsigned char* slot = th8_shot_slot(i);
+        if (*(short*)(slot + th8_shot_in_use_offset) != 1)
+            continue;
+
+        ++th8_shots_in_play;
+
+        float* pos = (float*)(slot + th8_shot_pos_offset);
+        for (int c = 0; c < 3; ++c) {
+            th8_shots_saved_pos[th8_shots_moved_count][c] = pos[c];
+            pos[c] = pos[c] + th8_shots_step[i][c] * t;
+        }
+        th8_shots_moved[th8_shots_moved_count] = i;
+        ++th8_shots_moved_count;
+    }
+
+    th8_shots_projected = th8_shots_moved_count;
+}
+
+static void th8_shots_undo() {
+    for (unsigned int n = 0; n < th8_shots_moved_count; ++n) {
+        float* pos = (float*)(th8_shot_slot(th8_shots_moved[n]) + th8_shot_pos_offset);
+        for (int c = 0; c < 3; ++c)
+            pos[c] = th8_shots_saved_pos[n][c];
+    }
+    th8_shots_moved_count = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Frame interpolation, stage 1: the bullets
 // ---------------------------------------------------------------------------
@@ -373,6 +591,13 @@ static void __fastcall th8_render_hook(void* chain) {
 
     ToolState::WatchFrameReady(th8_tool_frame_address, th8_tool_draw_address);
 
+    // The frame's own pass (the extras run this hook as well, and their positions are the same ones
+    // this frame already measured)
+    if (!th8_drew_frame) {
+        th8_player_measure();
+        th8_shots_measure();
+    }
+
     th8_drew_frame = true;
     th8_run_draw_chain(chain);
 }
@@ -411,6 +636,12 @@ static void th8_extra_presentation(float t) {
     // Where the bullets are a fraction of a frame on from here; put back right after the pass drew
     // them (see the stage 1 comment above)
     th8_bullets_advance(t);
+    th8_shots_advance(t);
+
+    // The player's sprite, the familiars and the player's own shots are drawn from positions the
+    // game's own code writes while drawing, so those are nudged where they are drawn instead - this
+    // is what tells them how far along this presentation sits (see th8_player_sprite_hook)
+    th8_extra_t = t;
 
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it: the extras draw the same frame rate text the game's own pass drew, and the
@@ -420,7 +651,10 @@ static void th8_extra_presentation(float t) {
     th8_run_draw_chain(th8_chain);
     th8_fps_state_restore(&fps);
 
+    th8_extra_t = 0.0f;
+
     th8_bullets_undo();
+    th8_shots_undo();
 
     th8_flush_vertex_buffer(*th8_anm_manager);
     device->SetTexture(0, nullptr);
@@ -492,6 +726,22 @@ static void th8_diag_dump() {
             th8_bullets_in_play, th8_bullets_projected);
     fprintf(file, "bullets: the manager's own count says %u (the update's count, taken before it "
                   "turns the finished ones off)\n", th8_bullets_managers_say);
+    // The player (see the player's stage 1 comment above): how far the frame's own pass moved it,
+    // which is what the extras project by
+    fprintf(file, "player: %.2f px a frame (measured over the frames recorded)\n", th8_player_step_length);
+    // The player's own shots (see their stage 1 comment above): how many slots are in use, and how
+    // many of those the last presentation moved
+    fprintf(file, "shots: %u in play, %u projected forward (last presentation)\n", th8_shots_in_play,
+            th8_shots_projected);
+    // The familiars' callbacks are set at runtime, so the diagnostics name them: the code behind
+    // them is what says where a familiar's own position lives (its slot is at player+0x40C+i*0x2F4,
+    // its update callback at +0x6F8 and its draw callback at +0x6FC within the player)
+    fprintf(file, "familiars: update %08x %08x %08x %08x\n",
+            *(unsigned int*)(th8_player + 0x6F8), *(unsigned int*)(th8_player + 0x9EC),
+            *(unsigned int*)(th8_player + 0xCE0), *(unsigned int*)(th8_player + 0xFD4));
+    fprintf(file, "familiars: draw   %08x %08x %08x %08x\n",
+            *(unsigned int*)(th8_player + 0x6FC), *(unsigned int*)(th8_player + 0x9F0),
+            *(unsigned int*)(th8_player + 0xCE4), *(unsigned int*)(th8_player + 0xFD8));
 
     double presents = 0.0;
     double first = 0.0;
@@ -647,6 +897,17 @@ static void th8_install_interpolation() {
         // overlay the two lines go on is only there when ShowOverlay is on, so there is nothing
         // else to check here.)
         overlay_show_present_rate(true);
+    }
+    {
+        // call 0x462FF0, the draw of the player's sprite VM (0x44D5B9), taken over so the extras can
+        // nudge the position the game has just written into that VM (see the player's stage 1
+        // comment above)
+        BYTE* site = (BYTE*)0x0044D5B9;
+        if (site[0] == 0xE8 && *(DWORD*)(site + 1) == 0x00462FF0 - (0x0044D5B9 + 5)) {
+            patch_call(0x0044D5B9, th8_player_sprite_hook);
+        } else {
+            printf("th08 player sprite draw at 0x44D5B9 doesn't look like a known one, skipping!\n");
+        }
     }
     printf("Frame interpolation: th08 extra presentations installed (setting %d)\n", Config::Interpolation);
 }
