@@ -7,6 +7,48 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-14
+
+### Added
+
+- **Touhou 8 gets the input handling vpatch applies to it** (`dd75d02`)
+
+  Imperishable Night's player input does not come from the keyboard directly: `Player::HandlePlayerInputs`
+  (`0x44AEC0`) and `Player::__shoot_bullets` (`0x451500`) read the copy at `0x164D52C`, and the game
+  only refreshes that copy in `ReplayManager::OnUpdateHighPrioRecord` (`0x452310`) - the calc chain
+  element at priority 17, after the input has been polled (priority 0) and after the player has run
+  (priority 9). Every frame therefore used the previous frame's input, which is the one frame of input
+  lag vpatch's readme describes for this game (`永夜抄は、妖々夢と同じ入力遅延が1フレームあります`) and
+  the one its rev4 changelog says it removed.
+
+  vpatch's four patches are what removes it, and they are applied here behind `FixInputGlitching`: the
+  call to `Controller::GetInput` inside `Supervisor::OnUpdate` (`0x4455F0`) goes to a wrapper that
+  advances the copy at the moment the input is read (pause bit filtered, and left alone while a replay
+  is playing), the copy work inside the record update (`0x452326`) is skipped, the flag that update
+  tests (`0x452319`) is spent there, and the return of `ReplayManager::AddedCallbackRecord`
+  (`0x452D52`) raises that flag so a stage's first frame does not carry its selection keys over. The
+  play test is what says it worked: the input lag this game had been chased for since the first round
+  is gone, and it was the answer to "why is oilp a frame behind vpatch here" all along.
+
+  The same copy handling is also what vpatch's own ini documents its `AlwaysBlt` for this game with -
+  keys staying held after the window loses focus are its other effect.
+
+### Changed
+
+- **`FixInputGlitching` is on by default** (`dd75d02`)
+
+  In EoSD and PCB it fixes the keyboard state the game reads while the window is not in the foreground:
+  DirectInput refuses to hand the state over (`DIERR_NOTACQUIRED`), the game only treats
+  `DIERR_INPUTLOST` as a failure and goes on reading a buffer that was never filled in, which shows up
+  as keys being pressed out of nowhere. `AlwaysBlt`, on by default as well and only about keeping the
+  game running, is what walks into that every frame - in vanilla the whole render bails out while
+  unfocused, so this could only be reached with that combination of options.
+
+Not done yet: the keyboard device is still only acquired once at startup, so if keys can still be left
+held after losing focus once the copy handling is in, an `Acquire()` on activation is the next step
+(vpatch does not do that either). Touhou 8's rendering problem (the thprac 6A boss trail) and its frame
+interpolation are still open.
+
 ## 2026-10-13
 
 ### Added
