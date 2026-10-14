@@ -176,19 +176,38 @@ DebugConsole = 0
 ; 默认 / Default: 0
 DebugWait = 0
 
-; 修掉红魔乡/妖妖梦里取消窗口焦点（比如加载时点别处）会出现的输入卡顿问题。
+; 修掉这几作原本就有的输入问题（相当于 vpatch 的 FixInputGlitching；永夜抄上就是它 AlwaysBlt
+; 背后那套输入补丁）。
 ;
-; Fixes the input glitching issues that can occur in EoSD and PCB if you deselect the window while
-; the game is loading for example.
+; 红魔乡/妖妖梦：窗口不在前台时 DirectInput 拒绝给状态，游戏却只把「设备丢失」当失败，
+; 于是继续拿一份没被填过的缓冲区当键盘状态 —— 会凭空冒出各种按键，按键也会卡住。
+; 永夜抄：自机的输入来自一份"算完才更新"的副本，这里让副本跟着实时输入走 —— 顺带消掉
+; 1 帧输入延迟，并修掉窗口失去焦点后按键被"留在按下状态"的问题。
 ;
-; 默认 / Default: 0
-FixInputGlitching = 0
+; Fixes input problems the game already has (the same thing vpatch's FixInputGlitching does; for
+; Touhou 8 it is the input patches behind its AlwaysBlt option).
+;
+; EoSD / PCB: while the window is not in the foreground DirectInput refuses to hand over the state,
+; but the game only treats "device lost" as a failure and goes on reading a buffer that was never
+; filled in - keys show up as pressed out of nowhere, and they can stay stuck as well.
+; IN: the player's input comes from a copy the game only refreshes at the end of the frame. This
+; keeps that copy in step with the live input, which removes a frame of input lag and also fixes
+; keys staying held after the window loses focus.
+;
+; 默认 / Default: 1
+FixInputGlitching = 1
 
 ; 游戏窗口失去焦点时继续渲染并呈现，切出去画面不会冻住（相当于 vpatch 的 AlwaysBlt）。
 ; 只对 th06 与 th07 实现。
 ;
 ; Keeps rendering while the game window isn't active, so the picture doesn't freeze after switching
 ; away from it (same idea as vpatch's AlwaysBlt). Only implemented for th06 and th07.
+;
+; 红魔乡/妖妖梦里失焦时整个 Render 会直接返回，所以只有这一项打开、FixInputGlitching 关掉，
+; 才会真的跑进上面那个「读未初始化缓冲区」的坑里。
+;
+; In EoSD and PCB the whole render bails out while unfocused, so it takes this option with
+; FixInputGlitching off to actually run into the uninitialised-buffer bug described above.
 ;
 ; 默认 / Default: 1
 AlwaysBlt = 1
