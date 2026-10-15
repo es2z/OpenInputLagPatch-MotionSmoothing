@@ -401,14 +401,127 @@ static void th7_fps_state_restore(const Th7FpsState* state) {
     *(short*)0x00575AD8 = state->cur_fps;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the bullets
+// ---------------------------------------------------------------------------
+//
+// The bullets the game draws live in g_BulletManager (0x0062F958). The manager's own draw
+// (BulletManager::OnDraw, 0x426C40) walks six layer chains - the heads at manager+0x37A144
+// (BulletManager::bulletsPtrs), a bullet's next at bullet+0xC04 - and draws each one it finds by
+// calling Bullet::Draw (0x426B00, from 0x426F3E) for as long as there is a next one (0x426F46).
+// The chains are rebuilt from the bullet array every frame by BulletManager::OnUpdate (0x425A50):
+// it walks the 1024 slots, skips the ones whose state (bullet+0xBFC, 16 bit) is BULLET_INACTIVE,
+// counts the rest into bulletCount (manager+0x37A128, 0x425B3B) and pushes each one it got to the
+// end of the switch onto the chain its collision type names (bullet+0xB8A, 0x426357..0x426387).
+// Walking those six chains is therefore walking exactly what the frame's draw pass puts on screen,
+// at the position it puts it at - not a pool or a guess at one.
+//
+// A bullet's own position is what the draw reads: Bullet::Draw copies pos (bullet+0xB8C, three
+// floats) plus the play field's corner into the sprite VM it is about to draw
+// (0x426B6C..0x426B96). So a bullet is moved the way th08's shots are - its own position is moved
+// before the pass and put back after, and no hook is needed.
+//
+// How far it moves in a frame is the velocity (bullet+0xB98, three floats) that the update adds to
+// its position once a frame, scaled by what the bullet is doing at the time:
+//
+//     state 1  BULLET_NORMAL           pos += velocity              (0x425CB0..0x425CF7)
+//     state 2  BULLET_SPAWNING_FAST    pos += velocity / 2.0f       (0x425F05.., fdiv 0x498A70 = 2)
+//     state 3  BULLET_SPAWNING_NORMAL  pos += velocity / 2.5f       (0x426010.., fdiv 0x498D50 = 2.5)
+//     state 4  BULLET_SPAWNING_SLOW    pos += velocity / 3.0f       (0x42611A, fdiv 0x498A8C = 3)
+//     state 5  BULLET_DESPAWN          pos += velocity / 2.0f       (0x426202, fdiv 0x498A70 = 2)
+//
+// Reading the velocity, the way th08's bullets do, is the right thing here as well: what is in the
+// field is the value the update just added to the position, so adding a fraction of it puts the
+// bullet exactly a fraction of a frame's step on, and a bullet that is not moving is left where it
+// is. Nothing else moves a bullet's position from one frame to the next - the four steps back it
+// takes when it is spawned are part of the spawn, and the game's own pass draws it there too.
+
+static const unsigned int th7_bullet_layers = 6;
+static const unsigned int th7_bullet_layer_heads_offset = 0x37A144;  // BulletManager::bulletsPtrs
+static const unsigned int th7_bullet_count_offset = 0x37A128;        // BulletManager::bulletCount
+static const unsigned int th7_bullet_pos_offset = 0xB8C;
+static const unsigned int th7_bullet_velocity_offset = 0xB98;
+static const unsigned int th7_bullet_state_offset = 0xBFC;           // 16 bit
+static const unsigned int th7_bullet_next_offset = 0xC04;
+static const unsigned int th7_bullets_max = 1024;                    // MAX_BULLETS
+static unsigned char* th7_bullet_manager = (unsigned char*)0x0062F958; // g_BulletManager
+
+// The fraction of a frame's step the update moves a bullet by in each of the states above
+static float th7_bullet_step_scale(unsigned int state) {
+    switch (state) {
+        case 2: // BULLET_SPAWNING_FAST
+        case 5: // BULLET_DESPAWN
+            return 0.5f;
+        case 3: // BULLET_SPAWNING_NORMAL
+            return 0.4f; // 1 / 2.5
+        case 4: // BULLET_SPAWNING_SLOW
+            return 1.0f / 3.0f;
+        default: // BULLET_NORMAL
+            return 1.0f;
+    }
+}
+
+// What the last extra presentation found and moved, for the diagnostics
+static unsigned int th7_bullets_in_play;
+static unsigned int th7_bullets_projected;
+static unsigned int th7_bullets_managers_say;
+
+// Where the bullets' positions were before they were moved, so they can be put back exactly (not
+// worked out backwards - the positions have to come out bit for bit what the game left there)
+static unsigned char* th7_projected_bullets[th7_bullets_max];
+static float th7_projected_positions[th7_bullets_max][3];
+static unsigned int th7_projected_count;
+
+static void th7_bullets_advance(float t) {
+    th7_projected_count = 0;
+
+    for (unsigned int layer = 0; layer < th7_bullet_layers; ++layer) {
+        unsigned char* bullet = *(unsigned char**)(th7_bullet_manager + th7_bullet_layer_heads_offset + layer * 4);
+        while (bullet != nullptr) {
+            if (th7_projected_count >= th7_bullets_max)
+                break;
+
+            const unsigned int state = *(const unsigned short*)(bullet + th7_bullet_state_offset);
+            const float scale = th7_bullet_step_scale(state);
+            float* pos = (float*)(bullet + th7_bullet_pos_offset);
+            const float* velocity = (const float*)(bullet + th7_bullet_velocity_offset);
+
+            th7_projected_bullets[th7_projected_count] = bullet;
+            th7_projected_positions[th7_projected_count][0] = pos[0];
+            th7_projected_positions[th7_projected_count][1] = pos[1];
+            th7_projected_positions[th7_projected_count][2] = pos[2];
+            ++th7_projected_count;
+
+            pos[0] = pos[0] + velocity[0] * scale * t;
+            pos[1] = pos[1] + velocity[1] * scale * t;
+            pos[2] = pos[2] + velocity[2] * scale * t;
+
+            bullet = *(unsigned char**)(bullet + th7_bullet_next_offset);
+        }
+    }
+
+    th7_bullets_in_play = th7_projected_count;
+    th7_bullets_projected = th7_projected_count;
+    th7_bullets_managers_say = *(unsigned int*)(th7_bullet_manager + th7_bullet_count_offset);
+}
+
+static void th7_bullets_undo() {
+    for (unsigned int i = 0; i < th7_projected_count; ++i) {
+        float* pos = (float*)(th7_projected_bullets[i] + th7_bullet_pos_offset);
+        pos[0] = th7_projected_positions[i][0];
+        pos[1] = th7_projected_positions[i][1];
+        pos[2] = th7_projected_positions[i][2];
+    }
+    th7_projected_count = 0;
+}
+
 // One extra presentation of the frame: the block the game draws a frame with, once more, so the
 // state the game is in is drawn and presented again.
 //
-// Nothing of the frame's own state is moved forward yet - the stages that follow project the
-// objects (bullets, the player, the lasers) forward by the fraction of a frame this presentation
-// sits at. What the extras put back is the game's own accounting and the state the frame was drawn
-// with.
-static void th7_extra_presentation() {
+// t is where this presentation sits between the game's own one and the next one, i.e. how far the
+// objects it draws are moved forward; t = 0 is the state the game's own presentation showed. The
+// stage 1 code below projects the objects forward by it.
+static void th7_extra_presentation(float t) {
     IDirect3DDevice8* device = th7_device();
     if (device == nullptr)
         return;
@@ -438,6 +551,10 @@ static void th7_extra_presentation() {
     // know its frame is ready to be drawn again
     ToolState::ReadyToDraw();
 
+    // Where the bullets are a fraction of a frame on from here; put back right after the pass drew
+    // them (see the stage 1 comment above)
+    th7_bullets_advance(t);
+
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it: the extras draw the same frame rate text the game's own pass drew, and the
     // game's own accounting never sees them
@@ -445,6 +562,8 @@ static void th7_extra_presentation() {
     th7_fps_state_save(&fps);
     th7_draw_pass();
     th7_fps_state_restore(&fps);
+
+    th7_bullets_undo();
 
     // Presented with the device's own Present, without the hooks other patches and tools put in
     // front of it (see d3d8_present_bypassing_hooks, the same thing th08, th19 and th20 do): a
@@ -500,6 +619,18 @@ static void th7_diag_dump() {
             (int)*(short*)0x00575AD8, (char*)0x0135E0F0, *(float*)0x00575AD0, *(float*)0x00575AD4,
             *(unsigned int*)0x0135E1F0);
     fprintf(file, "frameskip config: %u\n", (unsigned int)*(unsigned char*)0x00575A8B);
+    // The bullets (see the stage 1 comment above): what the walk through the game's own layer
+    // chains found, and what the manager's own counter says. The counter reads a few higher than
+    // the chains hold, and that is the update loop's own doing: it counts a bullet as active
+    // (0x425B3B) before it gets to the end of the switch that links it into a layer, and the ones
+    // it turns off on the way there - the bullets whose despawn effect has finished or which left
+    // the play field, which it puts back to BULLET_INACTIVE (0x417B20) - stay in the count it
+    // leaves behind. The chains are the ones the frame's draw pass walks (BulletManager::OnDraw,
+    // 0x426C40), which is what the extras project.
+    fprintf(file, "bullets: %u in play, %u projected forward (last presentation)\n",
+            th7_bullets_in_play, th7_bullets_projected);
+    fprintf(file, "bullets: the manager's own count says %u (the update's count, taken before it "
+                  "turns the bullets it removes off)\n", th7_bullets_managers_say);
 
     double presents = 0.0;
     double first = 0.0;
@@ -597,7 +728,10 @@ static void th7_present_hook() {
                     QueryPerformanceCounter(&present_time[presents]);
                 ++presents;
 
-                th7_extra_presentation();
+                // Where this presentation sits between the game's own one and the next one: the
+                // presentations of one game frame are spread evenly over it, so the k-th of
+                // extras + 1 of them draws the state k/(extras + 1) frames along
+                th7_extra_presentation((float)k / (float)(extras + 1));
             }
         }
     }
