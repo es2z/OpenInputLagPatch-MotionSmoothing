@@ -745,14 +745,30 @@ static void th8_shots_undo() {
 // chains is therefore walking exactly what the frame's draw pass puts on screen, at the position
 // the sprite is drawn at - not a pool or a guess at one.
 //
-// A bullet moves by its velocity added to its position once a frame: the movers are handed the two
-// fields by address (`add ecx,0D50h` / `add ecx,0D44h`, 0x43149E and on) and what they run into is
-// a three-float add (0x410A70: `fld [pos.x] / fadd [vel.x] / fstp [pos.x]`, and the same for y and
-// z). So an extra presentation puts the bullets where the frame's own step will put them t frames
-// on: position += velocity * t, drawn, and put straight back again - the game's own logic and its
-// collision code still see the positions they last read. What it costs is that a bullet whose
-// velocity changes within the step (an accelerating or turning one) is drawn a little off the path
-// it will actually take, an error the fraction of a frame it is drawn a fraction of does not show.
+// A bullet moves by its velocity added to its position once a frame, scaled by what it is doing at
+// the time. The position update hands the two fields to the game's own Float3 helpers by address
+// (`add ecx,0D50h` / `add ecx,0D44h`) and the add is Float3::operator+= (0x410A70):
+//
+//     state 1  BULLET_NORMAL           pos += velocity             (0x4314AE)
+//     state 2  BULLET_SPAWNING_FAST    pos += velocity / 2.0f      (0x43179F, 0x40000000 pushed)
+//     state 3  BULLET_SPAWNING_NORMAL  pos += velocity / 2.5f      (0x4318B1, 0x40200000 pushed)
+//     state 4  BULLET_SPAWNING_SLOW    pos += velocity / 3.0f      (0x4319C2, 0x40400000 pushed)
+//     state 5  BULLET_DESPAWN          pos += velocity / 2.0f      (0x431AC3, 0x40000000 pushed)
+//
+// The four spawning and despawning ones are the state switch of BulletManager::OnUpdate
+// (0x4312DF..0x4312FF, its jump table at 0x432156), and each of them divides the velocity with
+// Float3::operator/ (0x40C7D0) before adding it - that game's own tip for a bullet that is still
+// moving into place, or already fading out. So an extra presentation puts the bullets where the
+// frame's own step will put them t frames on: position += velocity * scale * t, drawn, and put
+// straight back again - the game's own logic and its collision code still see the positions they
+// last read. What it costs is that a bullet whose velocity changes within the step (an accelerating
+// or turning one) is drawn a little off the path it will actually take, an error the fraction of a
+// frame it is drawn a fraction of does not show.
+//
+// A bullet that is just flying has one more thing going on: while the game has time stopped, the
+// update skips its step entirely (0x431490 reads g_GameManager.isTimeStopped at 0x160F534 and jumps
+// over the add), so there is nothing to project for one. The states that are still moving into or
+// out of the play field keep animating even then - their cases carry no such test.
 
 // The manager's fields (see the comment above), and the pool size the manager's own chains can't
 // hold more than
@@ -762,8 +778,29 @@ static const unsigned int th8_bullet_count_offset = 0x6BA538; // the manager's o
 static const unsigned int th8_bullet_next_in_layer_offset = 0xDC0;
 static const unsigned int th8_bullet_pos_offset = 0xD44;
 static const unsigned int th8_bullet_velocity_offset = 0xD50;
+static const unsigned int th8_bullet_state_offset = 0xDB8; // 16 bit, BULLET_NORMAL and up
 static const unsigned int th8_bullets_max = 0x601; // MAX_ENEMY_BULLETS + 1
 static unsigned char* th8_bullet_manager = (unsigned char*)0x00F54E90;
+
+// g_GameManager.isTimeStopped (0x160F534, GameManager+0x2C)
+static unsigned char* th8_time_stopped = (unsigned char*)0x0160F534;
+
+// The fraction of a frame's step the update moves a bullet by in each of the states above
+static float th8_bullet_step_scale(unsigned int state) {
+    switch (state) {
+        case 2: // BULLET_SPAWNING_FAST
+        case 5: // BULLET_DESPAWN
+            return 0.5f;
+        case 3: // BULLET_SPAWNING_NORMAL
+            return 0.4f; // 1 / 2.5
+        case 4: // BULLET_SPAWNING_SLOW
+            return 1.0f / 3.0f;
+        default:
+            // BULLET_NORMAL, and the only one of the five the update leaves alone while the game
+            // has time stopped (see the comment above) - there is nothing to project for one then
+            return *th8_time_stopped ? 0.0f : 1.0f;
+    }
+}
 
 // What the last extra presentation moved, for the diagnostics (see th8_diag_dump)
 static unsigned int th8_bullets_in_play;
@@ -785,6 +822,8 @@ static void th8_bullets_advance(float t) {
             if (th8_projected_count >= th8_bullets_max)
                 break;
 
+            const unsigned int state = *(const unsigned short*)(bullet + th8_bullet_state_offset);
+            const float scale = th8_bullet_step_scale(state);
             float* pos = (float*)(bullet + th8_bullet_pos_offset);
             const float* velocity = (const float*)(bullet + th8_bullet_velocity_offset);
 
@@ -794,9 +833,9 @@ static void th8_bullets_advance(float t) {
             th8_projected_positions[th8_projected_count][2] = pos[2];
             ++th8_projected_count;
 
-            pos[0] = pos[0] + velocity[0] * t;
-            pos[1] = pos[1] + velocity[1] * t;
-            pos[2] = pos[2] + velocity[2] * t;
+            pos[0] = pos[0] + velocity[0] * scale * t;
+            pos[1] = pos[1] + velocity[1] * scale * t;
+            pos[2] = pos[2] + velocity[2] * scale * t;
 
             bullet = *(unsigned char**)(bullet + th8_bullet_next_in_layer_offset);
         }

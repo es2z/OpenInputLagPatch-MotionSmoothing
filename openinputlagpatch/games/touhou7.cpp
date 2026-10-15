@@ -435,6 +435,11 @@ static void th7_fps_state_restore(const Th7FpsState* state) {
 // bullet exactly a fraction of a frame's step on, and a bullet that is not moving is left where it
 // is. Nothing else moves a bullet's position from one frame to the next - the four steps back it
 // takes when it is spawned are part of the spawn, and the game's own pass draws it there too.
+//
+// One thing does stop all of that: while the game has time stopped, the update returns at the top
+// and moves nothing at all, nor does it rebuild the chains (0x425A74..0x425A84 reads
+// g_GameManager.isTimeStopped at 0x62627C and returns CONTINUE). There is no step to project then,
+// and the bullets have to be left exactly where the game froze them.
 
 static const unsigned int th7_bullet_layers = 6;
 static const unsigned int th7_bullet_layer_heads_offset = 0x37A144;  // BulletManager::bulletsPtrs
@@ -445,6 +450,9 @@ static const unsigned int th7_bullet_state_offset = 0xBFC;           // 16 bit
 static const unsigned int th7_bullet_next_offset = 0xC04;
 static const unsigned int th7_bullets_max = 1024;                    // MAX_BULLETS
 static unsigned char* th7_bullet_manager = (unsigned char*)0x0062F958; // g_BulletManager
+
+// g_GameManager.isTimeStopped (0x62627C, GameManager+0x0C)
+static unsigned char* th7_time_stopped = (unsigned char*)0x0062627C;
 
 // The fraction of a frame's step the update moves a bullet by in each of the states above
 static float th7_bullet_step_scale(unsigned int state) {
@@ -474,6 +482,11 @@ static unsigned int th7_projected_count;
 
 static void th7_bullets_advance(float t) {
     th7_projected_count = 0;
+
+    // Nothing moves while the game has time stopped (see the comment above), so neither do the
+    // extras: the bullets stay exactly where the game froze them
+    if (*th7_time_stopped)
+        return;
 
     for (unsigned int layer = 0; layer < th7_bullet_layers; ++layer) {
         unsigned char* bullet = *(unsigned char**)(th7_bullet_manager + th7_bullet_layer_heads_offset + layer * 4);
