@@ -28,6 +28,7 @@ static void th7_begin_game_draw();
 static void th7_draw_pass();
 static void th7_player_measure();
 static void th7_shots_measure();
+static void th7_lasers_measure();
 
 int __fastcall th7_update_calc_chain_hook() {
 	auto engine = CEngine::Instance;
@@ -333,6 +334,7 @@ static void th7_begin_game_draw() {
     if (!th7_drew_frame) {
         th7_player_measure();
         th7_shots_measure();
+        th7_lasers_measure();
     }
 
     ToolState::WatchFrameReady(th7_tool_frame_address, th7_tool_draw_address);
@@ -736,6 +738,149 @@ static void th7_shots_undo() {
     th7_moved_shot_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the straight lasers
+// ---------------------------------------------------------------------------
+//
+// The enemy lasers live in the same manager as the bullets, in 64 slots of 0x4EC bytes at
+// g_BulletManager+0x366628 (BulletManager::lasers), with the flag that says a slot is in use at
+// slot+0x4D4 (a 32 bit field). BulletManager::OnDraw (0x426C40) draws them first, before the
+// bullets: it takes the slot, checks that flag (0x426C7F) and works the sprite's position out of
+// the laser's own geometry - the angle (slot+0x4A4, fed to sincosf at 0x426C9A) and the two ends it
+// spans between, startOffset (slot+0x4A8) and endOffset (slot+0x4AC): the sprite is centred at
+// startOffset + (endOffset - startOffset) / 2 (0x426CA5..0x426CBB, the 2.0f being the constant at
+// 0x498A70) from the laser's position (slot+0x498, three floats), and the play field's corner is
+// added to that (0x426D21..0x426D45) before it is drawn.
+//
+// The update grows the laser by moving those: it adds speed times the frame's multiplier to
+// endOffset and then sets startOffset to endOffset - startLength (BulletManager::OnUpdate,
+// 0x42640D..0x42645C, with speed at slot+0x4BC and startLength at slot+0x4B0). None of the four
+// fields the draw reads is written by the draw - it only reads them - so a laser is moved the way a
+// bullet is: the frame's own movement of each of them is measured over a frame, and the extras add
+// their fraction of it before the pass and put the fields back after it. That covers a laser that
+// is still growing, one that has settled and one that is turning, without the extras having to know
+// which of those it is doing. The sprite's own scale, which is what the width and the length are
+// drawn as, is worked out in the update as well; the extras leave it where the frame put it, which
+// leaves the laser a fraction of a frame's growth short at most.
+//
+// A slot the game hands to a different laser between two samples is not projected across the jump,
+// the same guard the bullets and the player's shots have.
+
+static const unsigned int th7_lasers_max = 64;
+static const unsigned int th7_lasers_offset = 0x366628;    // from g_BulletManager
+static const unsigned int th7_laser_size = 0x4EC;
+static const unsigned int th7_laser_in_use_offset = 0x4D4; // 32 bit, non-zero while in use
+static const unsigned int th7_laser_position_offset = 0x498; // three floats
+static const unsigned int th7_laser_angle_offset = 0x4A4;
+static const unsigned int th7_laser_start_offset = 0x4A8;
+static const unsigned int th7_laser_end_offset = 0x4AC;
+
+// What is measured and projected per laser: its position, its angle and the two ends
+static const unsigned int th7_laser_fields = 6;
+
+static const float th7_lasers_max_step = 48.0f;
+
+static unsigned char* th7_laser_slot(unsigned int index) {
+    // g_BulletManager (0x0062F958) - the bullets are in the same manager, so that is the address
+    // named there as well
+    return th7_bullet_manager + th7_lasers_offset + (size_t)index * th7_laser_size;
+}
+
+static void th7_laser_read(unsigned int index, float* values) {
+    const unsigned char* slot = th7_laser_slot(index);
+
+    values[0] = *(const float*)(slot + th7_laser_position_offset);
+    values[1] = *(const float*)(slot + th7_laser_position_offset + 4);
+    values[2] = *(const float*)(slot + th7_laser_position_offset + 8);
+    values[3] = *(const float*)(slot + th7_laser_angle_offset);
+    values[4] = *(const float*)(slot + th7_laser_start_offset);
+    values[5] = *(const float*)(slot + th7_laser_end_offset);
+}
+
+static float th7_lasers_last[th7_lasers_max][th7_laser_fields];
+static float th7_lasers_step[th7_lasers_max][th7_laser_fields];
+static bool th7_lasers_used_last[th7_lasers_max];
+
+static unsigned int th7_lasers_in_play;
+
+// Called once a frame, from the frame's own draw, next to th7_shots_measure
+static void th7_lasers_measure() {
+    th7_lasers_in_play = 0;
+
+    for (unsigned int i = 0; i < th7_lasers_max; ++i) {
+        const bool in_use = *(const unsigned int*)(th7_laser_slot(i) + th7_laser_in_use_offset) != 0;
+        float values[th7_laser_fields];
+        th7_laser_read(i, values);
+
+        const float step_x = values[0] - th7_lasers_last[i][0];
+        const float step_y = values[1] - th7_lasers_last[i][1];
+        const bool reused = (step_x * step_x + step_y * step_y) >
+                            th7_lasers_max_step * th7_lasers_max_step;
+
+        if (in_use)
+            ++th7_lasers_in_play;
+
+        for (unsigned int f = 0; f < th7_laser_fields; ++f) {
+            th7_lasers_step[i][f] = in_use && th7_lasers_used_last[i] && !reused
+                                        ? values[f] - th7_lasers_last[i][f]
+                                        : 0.0f;
+            th7_lasers_last[i][f] = values[f];
+        }
+        th7_lasers_used_last[i] = in_use;
+    }
+}
+
+static unsigned int th7_lasers_projected;
+static unsigned int th7_lasers_moved[th7_lasers_max];
+static float th7_lasers_saved[th7_lasers_max][th7_laser_fields];
+static unsigned int th7_lasers_moved_count;
+
+static void th7_lasers_advance(float t) {
+    th7_lasers_moved_count = 0;
+
+    for (unsigned int i = 0; i < th7_lasers_max; ++i) {
+        unsigned char* slot = th7_laser_slot(i);
+        if (*(const unsigned int*)(slot + th7_laser_in_use_offset) == 0)
+            continue;
+
+        float* fields[th7_laser_fields] = {
+            (float*)(slot + th7_laser_position_offset),
+            (float*)(slot + th7_laser_position_offset + 4),
+            (float*)(slot + th7_laser_position_offset + 8),
+            (float*)(slot + th7_laser_angle_offset),
+            (float*)(slot + th7_laser_start_offset),
+            (float*)(slot + th7_laser_end_offset),
+        };
+
+        for (unsigned int f = 0; f < th7_laser_fields; ++f) {
+            th7_lasers_saved[th7_lasers_moved_count][f] = *fields[f];
+            *fields[f] = *fields[f] + th7_lasers_step[i][f] * t;
+        }
+        th7_lasers_moved[th7_lasers_moved_count] = i;
+        ++th7_lasers_moved_count;
+    }
+
+    th7_lasers_projected = th7_lasers_moved_count;
+}
+
+static void th7_lasers_undo() {
+    for (unsigned int n = 0; n < th7_lasers_moved_count; ++n) {
+        unsigned char* slot = th7_laser_slot(th7_lasers_moved[n]);
+        float* fields[th7_laser_fields] = {
+            (float*)(slot + th7_laser_position_offset),
+            (float*)(slot + th7_laser_position_offset + 4),
+            (float*)(slot + th7_laser_position_offset + 8),
+            (float*)(slot + th7_laser_angle_offset),
+            (float*)(slot + th7_laser_start_offset),
+            (float*)(slot + th7_laser_end_offset),
+        };
+
+        for (unsigned int f = 0; f < th7_laser_fields; ++f)
+            *fields[f] = th7_lasers_saved[n][f];
+    }
+    th7_lasers_moved_count = 0;
+}
+
 // One extra presentation of the frame: the block the game draws a frame with, once more, so the
 // state the game is in is drawn and presented again.
 //
@@ -777,6 +922,7 @@ static void th7_extra_presentation(float t) {
     th7_bullets_advance(t);
     th7_player_advance(t);
     th7_shots_advance(t);
+    th7_lasers_advance(t);
 
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it: the extras draw the same frame rate text the game's own pass drew, and the
@@ -789,6 +935,7 @@ static void th7_extra_presentation(float t) {
     th7_bullets_undo();
     th7_player_undo();
     th7_shots_undo();
+    th7_lasers_undo();
 
     // Presented with the device's own Present, without the hooks other patches and tools put in
     // front of it (see d3d8_present_bypassing_hooks, the same thing th08, th19 and th20 do): a
@@ -863,6 +1010,10 @@ static void th7_diag_dump() {
     fprintf(file, "shots: %u in play (%u flying, %u exploding), %u projected forward "
                   "(last presentation)\n",
             th7_shots_in_play, th7_shots_flying, th7_shots_exploding, th7_shots_projected);
+    // The lasers (see their stage 1 comment above): their slots are in the same manager as the
+    // bullets, and the flag that says a slot is in use is the game's own
+    fprintf(file, "lasers: %u in play, %u projected forward (last presentation)\n",
+            th7_lasers_in_play, th7_lasers_projected);
 
     double presents = 0.0;
     double first = 0.0;
