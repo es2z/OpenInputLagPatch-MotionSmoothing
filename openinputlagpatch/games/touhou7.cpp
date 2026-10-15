@@ -1,6 +1,7 @@
 // Touhou 7: Perfect Cherry Blossom v1.00b
 
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include "patch_util.h"
 #include "d3d8_hook.h"
@@ -25,6 +26,8 @@ static bool th7_interpolating;
 static bool th7_drew_frame;
 static void th7_begin_game_draw();
 static void th7_draw_pass();
+static void th7_player_measure();
+static void th7_shots_measure();
 
 int __fastcall th7_update_calc_chain_hook() {
 	auto engine = CEngine::Instance;
@@ -322,6 +325,16 @@ static void th7_begin_game_draw() {
         th7_scene_camera_mode = *(unsigned char*)((char*)manager + th7_anm_camera_mode);
     }
 
+    // The frame's own movement of the player, its options and its own shots (see the stage 1
+    // comment below): sampled once a frame, where the calculation chain has already run. (With the
+    // game's own frame skip turned on a frame can run the calculation chain and the draw more than
+    // once; the sample is taken at the first of those, the same way th08 takes it, which leaves the
+    // extras projecting a frame's worth of movement the frame before the last one in that case.)
+    if (!th7_drew_frame) {
+        th7_player_measure();
+        th7_shots_measure();
+    }
+
     ToolState::WatchFrameReady(th7_tool_frame_address, th7_tool_draw_address);
 }
 
@@ -528,6 +541,201 @@ static void th7_bullets_undo() {
     th7_projected_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player, its options and its own shots
+// ---------------------------------------------------------------------------
+//
+// All three are drawn from their own positions, which the draw writes into the sprite it is about
+// to draw each pass, so none of them needs a hook - moving the position before the pass and putting
+// it back after is enough. What is not the same about them is how they move, which is why the step
+// here is measured off the positions themselves rather than read out of a velocity:
+//
+//   - The player. Player::OnDrawHighPrio (0x4420B0) writes the sprite's position from the player's
+//     own position (playerSprite.pos = arcadeRegionTopLeftPos + player+0x930, 0x442102..0x44212C,
+//     drawn at 0x442149) and then the two options' sprites from optionsPosition[0] and [1]
+//     (player+0x9B4 and player+0x9C0, 0x442190..0x44222E) - the options are this game's familiars,
+//     the two that trail the player and shoot for it. The player moves with
+//     `pos += velocity` where the velocity is worked out from the input, the shot type's speed and
+//     the bomb multiplier (Player::HandlePlayerInputs, 0x43xxxx) and the position is then clamped
+//     to the movement area, and a death or a stage transition puts it somewhere else outright. The
+//     options are placed from the player's position every frame, with an offset that swings with
+//     optionAngle. Reading a velocity would therefore be wrong as soon as the player is against a
+//     wall, and the offset the options move with is not a velocity at all.
+//   - The player's own shots. Player::DrawBullets (0x43D690) draws the slots whose bulletState
+//     (bullet+0x34A, 16 bit, in the array at player+0x2444, 0x364 bytes a slot) is 1 and copies
+//     each slot's pos (bullet+0x24C) plus the play field's corner into its sprite (0x43D723..
+//     0x43D74A); Player::DrawBulletExplosions (0x43D790) does the same for the ones that are
+//     exploding, state 2. Player::UpdateShots (0x43D2F0) moves every slot that is in use by
+//     velocity * effectiveFramerateMultiplier, but before that it runs the shot's own update
+//     (ShtData::UpdateHomingBullet and friends, 0x49ECC8): those turn the velocity, and two of them
+//     place the shot outright - UpdateOrbLaser (0x43C700) puts it on its option, UpdatePlayerLaser
+//     (0x43C940) on the player. So the frame's step of a shot is what its own update made of it,
+//     and measuring covers all of them at once.
+//
+// The step of each is the difference to the position the frame before had, sampled once a frame in
+// the game's own draw (th7_begin_game_draw) - after the calculation chain has run, which is where
+// the positions are the ones the frame is drawn with. Nothing of this is written anywhere but the
+// positions themselves, and they are put back the moment the pass drew, so the game's logic, its
+// collisions and its random numbers see exactly what they last read.
+//
+// A position that jumped further in one frame than anything can move is not projected across that
+// jump: an explosion's slot in the shot array can be given to a shot that was just spawned, which
+// the once-a-frame sampling cannot see, and a shot's own update can replace it the same way.
+
+static const unsigned int th7_player_pos_offset = 0x930;                 // Float3
+static const unsigned int th7_player_options_offset = 0x9B4;             // Float3[2]
+static const unsigned int th7_player_bullets_offset = 0x2444;            // PlayerBullet[96]
+static const unsigned int th7_player_bullet_size = 0x364;
+static const unsigned int th7_player_bullet_pos_offset = 0x24C;          // Float3
+static const unsigned int th7_player_bullet_state_offset = 0x34A;        // 16 bit
+static const unsigned int th7_player_bullets_max = 96;
+static unsigned char* th7_player = (unsigned char*)0x004BDAD8;           // g_Player
+
+// A bullet cannot move anywhere near this far in a frame (the fastest of the shot updates tops out
+// around 18 pixels a frame), so a step this big is a slot that was given to something else
+static const float th7_shots_max_step = 48.0f;
+
+// Where one measured position was, and how far it moved over the frame
+struct Th7Step {
+    float last[3];
+    float step[3];
+    bool known;
+};
+
+static void th7_step(Th7Step* state, const float* pos, float limit) {
+    if (state->known) {
+        state->step[0] = pos[0] - state->last[0];
+        state->step[1] = pos[1] - state->last[1];
+        state->step[2] = pos[2] - state->last[2];
+
+        if (limit > 0.0f &&
+            state->step[0] * state->step[0] + state->step[1] * state->step[1] > limit * limit)
+            state->step[0] = state->step[1] = state->step[2] = 0.0f;
+    } else {
+        state->step[0] = state->step[1] = state->step[2] = 0.0f;
+        state->known = true;
+    }
+
+    state->last[0] = pos[0];
+    state->last[1] = pos[1];
+    state->last[2] = pos[2];
+}
+
+static float th7_player_pos[3];              // where the player's own position was
+static Th7Step th7_player_step;
+static Th7Step th7_option_steps[2];
+static Th7Step th7_shot_steps[th7_player_bullets_max];
+
+// What the last extra presentation found, for the diagnostics (see th7_diag_dump)
+static unsigned int th7_shots_in_play;
+static unsigned int th7_shots_flying;
+static unsigned int th7_shots_exploding;
+static unsigned int th7_shots_projected;
+static float th7_player_step_length;
+
+// Called once a frame, from the frame's own draw (see th7_begin_game_draw)
+static void th7_player_measure() {
+    const float* pos = (const float*)(th7_player + th7_player_pos_offset);
+    th7_step(&th7_player_step, pos, 0.0f);
+    th7_player_step_length = (float)sqrt((double)(th7_player_step.step[0] * th7_player_step.step[0] +
+                                                  th7_player_step.step[1] * th7_player_step.step[1]));
+
+    for (unsigned int option = 0; option < 2; ++option)
+        th7_step(&th7_option_steps[option],
+                 (const float*)(th7_player + th7_player_options_offset + option * 12), 0.0f);
+}
+
+static void th7_shots_measure() {
+    th7_shots_in_play = 0;
+    th7_shots_flying = 0;
+    th7_shots_exploding = 0;
+
+    for (unsigned int i = 0; i < th7_player_bullets_max; ++i) {
+        unsigned char* shot = th7_player + th7_player_bullets_offset + (size_t)i * th7_player_bullet_size;
+        const int state = *(const short*)(shot + th7_player_bullet_state_offset);
+
+        // A slot that is not in use is forgotten rather than measured across what was there before
+        // it: the shot that gets it next has not moved at all yet (see the comment above)
+        if (state == 0) {
+            th7_shot_steps[i].known = false;
+            continue;
+        }
+
+        ++th7_shots_in_play;
+        if (state == 1)
+            ++th7_shots_flying;
+        else
+            ++th7_shots_exploding;
+
+        th7_step(&th7_shot_steps[i], (const float*)(shot + th7_player_bullet_pos_offset),
+                 th7_shots_max_step);
+    }
+}
+
+// What the last extra presentation moved, so it can be put back
+static float th7_saved_player_pos[3];
+static float th7_saved_option_pos[2][3];
+static unsigned char* th7_moved_shots[th7_player_bullets_max];
+static float th7_saved_shot_pos[th7_player_bullets_max][3];
+static unsigned int th7_moved_shot_count;
+
+static void th7_player_advance(float t) {
+    float* pos = (float*)(th7_player + th7_player_pos_offset);
+    for (int c = 0; c < 3; ++c) {
+        th7_saved_player_pos[c] = pos[c];
+        pos[c] = pos[c] + th7_player_step.step[c] * t;
+    }
+
+    for (unsigned int option = 0; option < 2; ++option) {
+        float* option_pos = (float*)(th7_player + th7_player_options_offset + option * 12);
+        for (int c = 0; c < 3; ++c) {
+            th7_saved_option_pos[option][c] = option_pos[c];
+            option_pos[c] = option_pos[c] + th7_option_steps[option].step[c] * t;
+        }
+    }
+}
+
+static void th7_player_undo() {
+    float* pos = (float*)(th7_player + th7_player_pos_offset);
+    for (int c = 0; c < 3; ++c)
+        pos[c] = th7_saved_player_pos[c];
+
+    for (unsigned int option = 0; option < 2; ++option) {
+        float* option_pos = (float*)(th7_player + th7_player_options_offset + option * 12);
+        for (int c = 0; c < 3; ++c)
+            option_pos[c] = th7_saved_option_pos[option][c];
+    }
+}
+
+static void th7_shots_advance(float t) {
+    th7_moved_shot_count = 0;
+
+    for (unsigned int i = 0; i < th7_player_bullets_max; ++i) {
+        unsigned char* shot = th7_player + th7_player_bullets_offset + (size_t)i * th7_player_bullet_size;
+        if (*(const short*)(shot + th7_player_bullet_state_offset) == 0)
+            continue;
+
+        float* pos = (float*)(shot + th7_player_bullet_pos_offset);
+        for (int c = 0; c < 3; ++c) {
+            th7_saved_shot_pos[th7_moved_shot_count][c] = pos[c];
+            pos[c] = pos[c] + th7_shot_steps[i].step[c] * t;
+        }
+        th7_moved_shots[th7_moved_shot_count] = shot;
+        ++th7_moved_shot_count;
+    }
+
+    th7_shots_projected = th7_moved_shot_count;
+}
+
+static void th7_shots_undo() {
+    for (unsigned int n = 0; n < th7_moved_shot_count; ++n) {
+        float* pos = (float*)(th7_moved_shots[n] + th7_player_bullet_pos_offset);
+        for (int c = 0; c < 3; ++c)
+            pos[c] = th7_saved_shot_pos[n][c];
+    }
+    th7_moved_shot_count = 0;
+}
+
 // One extra presentation of the frame: the block the game draws a frame with, once more, so the
 // state the game is in is drawn and presented again.
 //
@@ -567,6 +775,8 @@ static void th7_extra_presentation(float t) {
     // Where the bullets are a fraction of a frame on from here; put back right after the pass drew
     // them (see the stage 1 comment above)
     th7_bullets_advance(t);
+    th7_player_advance(t);
+    th7_shots_advance(t);
 
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it: the extras draw the same frame rate text the game's own pass drew, and the
@@ -577,6 +787,8 @@ static void th7_extra_presentation(float t) {
     th7_fps_state_restore(&fps);
 
     th7_bullets_undo();
+    th7_player_undo();
+    th7_shots_undo();
 
     // Presented with the device's own Present, without the hooks other patches and tools put in
     // front of it (see d3d8_present_bypassing_hooks, the same thing th08, th19 and th20 do): a
@@ -644,6 +856,13 @@ static void th7_diag_dump() {
             th7_bullets_in_play, th7_bullets_projected);
     fprintf(file, "bullets: the manager's own count says %u (the update's count, taken before it "
                   "turns the bullets it removes off)\n", th7_bullets_managers_say);
+    // The player, its options and its own shots (see their stage 1 comment above): how far the
+    // frame's own pass moved the player, which is what the extras project it by, and what the
+    // three states of the shot slots add up to - the drawn ones are the flying and the exploding
+    fprintf(file, "player: %.2f px a frame (measured over the frames recorded)\n", th7_player_step_length);
+    fprintf(file, "shots: %u in play (%u flying, %u exploding), %u projected forward "
+                  "(last presentation)\n",
+            th7_shots_in_play, th7_shots_flying, th7_shots_exploding, th7_shots_projected);
 
     double presents = 0.0;
     double first = 0.0;
