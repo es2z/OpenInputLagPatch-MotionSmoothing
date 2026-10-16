@@ -356,6 +356,139 @@ static void th6_forget_anm_cache() {
     manager[th6_anm_z_write_offset] = 0xFF;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the bullets
+// ---------------------------------------------------------------------------
+//
+// The enemy bullets live in g_BulletManager (0x005A5FF8), in the 640 slots of BulletManager::bullets
+// at manager+0x5600 (MAX_ENEMY_BULLETS, sizeof(Bullet) == 0x5C4; the manager adds 0x5600 to reach the
+// array at 0x4149DD and 0x4149DD+... for each slot, 0x414A26). Unlike th07 and th08 there are no
+// layer chains here: the manager's own draw (BulletManager_OnDraw, 0x416500) walks all 640 slots four
+// times over - by the bullet's height and sprite, for the draw order: bulletHeight > 16, == 16 with
+// the ring/ball sprite, == 16 with the others, and == 8 (BulletManager.cpp:1215-1269) - and draws
+// every slot whose state (bullet+0x5BE, a 16 bit field, read at 0x416B5B) is not
+// BULLET_STATE_INACTIVE. That is the set the extras project.
+//
+// Bullet::Draw in the later games is DrawBullet here (0x416B50): it picks the sprite by state (the
+// spawn effect sprites for the spawning and despawning states, the bullet's own sprite otherwise),
+// copies the bullet's own position into it (bullet+0x560 to the sprite's pos at +0x90, three floats,
+// 0x416BBB..0x416BE5) and draws it. So, as in th07, a bullet needs no hook - its own position is
+// moved before the extra pass and put back the moment the pass drew it, bit for bit rather than
+// worked out backwards, which leaves the game's logic, its collision code and its random numbers with
+// the positions they last read.
+//
+// How far a bullet moves in a frame is its velocity (bullet+0x56C, three floats) scaled by what it is
+// doing at the time, times the frame's effective frame rate multiplier (this is the one thing in this
+// game whose step is scaled by it):
+//
+//     BULLET_STATE_FIRED           pos += velocity                    (0x414xxx, BulletManager.cpp:876)
+//     BULLET_STATE_SPAWNING_FAST   pos += velocity / 2.0f              (BulletManager.cpp:672)
+//     BULLET_STATE_SPAWNING_NORMAL pos += velocity / 2.5f              (BulletManager.cpp:681)
+//     BULLET_STATE_SPAWNING_SLOW   pos += velocity / 3.0f              (BulletManager.cpp:690)
+//     BULLET_STATE_DESPAWNING      pos += velocity / 2.0f              (BulletManager.cpp:935)
+//
+// and each of those is multiplied by g_Supervisor.effectiveFramerateMultiplier (0x6C6EC0). Reading
+// the velocity is what th07's bullets do and it is exact here as well: the update runs the bullet's
+// velocity effects *before* the step (BulletManager.cpp:700-876: EX_SPEEDUP, EX_ACCELERATION,
+// EX_VELOCITY, the angle changes and the bounces all rewrite the velocity first), so what the field
+// holds when the update returns is the vector the step used - and a bullet that is not moving is
+// left where it is.
+//
+// While the game has time stopped the whole update returns at its top - 0x4149E5 reads
+// g_GameManager.isTimeStopped (0x69BCCC, GameManager+0x2C) and jumps straight to CONTINUE - so
+// nothing moves, and neither do the extras: the bullets stay exactly where the game froze them.
+
+static const unsigned int th6_bullets_max = 640;             // MAX_ENEMY_BULLETS
+static const unsigned int th6_bullet_size = 0x5C4;           // sizeof(Bullet)
+static const unsigned int th6_bullet_array_offset = 0x5600;  // BulletManager::bullets
+static const unsigned int th6_bullet_pos_offset = 0x560;     // three floats
+static const unsigned int th6_bullet_velocity_offset = 0x56C;
+static const unsigned int th6_bullet_state_offset = 0x5BE;   // 16 bit
+static const unsigned int th6_bullet_count_offset = 0xF5C04; // BulletManager::bulletCount
+static unsigned char* th6_bullet_manager = (unsigned char*)0x005A5FF8; // g_BulletManager
+
+// g_GameManager.isTimeStopped (0x69BCCC, GameManager+0x2C)
+static unsigned char* th6_time_stopped = (unsigned char*)0x0069BCCC;
+
+// g_Supervisor.effectiveFramerateMultiplier (0x6C6EC0, Supervisor+0x1A8): the factor the update
+// scales every bullet's step by
+static float* th6_effective_framerate = (float*)0x006C6EC0;
+
+static unsigned char* th6_bullet_slot(unsigned int index) {
+    return th6_bullet_manager + th6_bullet_array_offset + (size_t)index * th6_bullet_size;
+}
+
+// The fraction of a frame's step the update moves a bullet by in each of the states above
+static float th6_bullet_step_scale(unsigned int state) {
+    switch (state) {
+        case 2: // BULLET_STATE_SPAWNING_FAST
+        case 5: // BULLET_STATE_DESPAWNING
+            return 0.5f;
+        case 3: // BULLET_STATE_SPAWNING_NORMAL
+            return 0.4f; // 1 / 2.5
+        case 4: // BULLET_STATE_SPAWNING_SLOW
+            return 1.0f / 3.0f;
+        default: // BULLET_STATE_FIRED
+            return 1.0f;
+    }
+}
+
+// What the last extra presentation found and moved, for the diagnostics
+static unsigned int th6_bullets_in_play;
+static unsigned int th6_bullets_projected;
+static unsigned int th6_bullets_managers_say;
+
+// Where the bullets' positions were before they were moved, so they can be put back exactly
+static unsigned char* th6_projected_bullets[th6_bullets_max];
+static float th6_projected_positions[th6_bullets_max][3];
+static unsigned int th6_projected_count;
+
+static void th6_bullets_advance(float t) {
+    th6_projected_count = 0;
+
+    // Nothing moves while the game has time stopped (see the comment above), so neither do the extras
+    if (*th6_time_stopped)
+        return;
+
+    const float multiplier = *th6_effective_framerate;
+
+    for (unsigned int i = 0; i < th6_bullets_max; ++i) {
+        unsigned char* bullet = th6_bullet_slot(i);
+
+        const unsigned int state = *(const unsigned short*)(bullet + th6_bullet_state_offset);
+        if (state == 0) // BULLET_STATE_INACTIVE
+            continue;
+
+        const float scale = th6_bullet_step_scale(state) * multiplier;
+        float* pos = (float*)(bullet + th6_bullet_pos_offset);
+        const float* velocity = (const float*)(bullet + th6_bullet_velocity_offset);
+
+        th6_projected_bullets[th6_projected_count] = bullet;
+        th6_projected_positions[th6_projected_count][0] = pos[0];
+        th6_projected_positions[th6_projected_count][1] = pos[1];
+        th6_projected_positions[th6_projected_count][2] = pos[2];
+        ++th6_projected_count;
+
+        pos[0] = pos[0] + velocity[0] * scale * t;
+        pos[1] = pos[1] + velocity[1] * scale * t;
+        pos[2] = pos[2] + velocity[2] * scale * t;
+    }
+
+    th6_bullets_in_play = th6_projected_count;
+    th6_bullets_projected = th6_projected_count;
+    th6_bullets_managers_say = *(unsigned int*)(th6_bullet_manager + th6_bullet_count_offset);
+}
+
+static void th6_bullets_undo() {
+    for (unsigned int i = 0; i < th6_projected_count; ++i) {
+        float* pos = (float*)(th6_projected_bullets[i] + th6_bullet_pos_offset);
+        pos[0] = th6_projected_positions[i][0];
+        pos[1] = th6_projected_positions[i][1];
+        pos[2] = th6_projected_positions[i][2];
+    }
+    th6_projected_count = 0;
+}
+
 // The state DrawFpsCounter (0x423F3F) works in. It is called from the draw chain, so every extra
 // presentation runs it once more, and this is what puts the game's accounting back the way its own
 // pass left it:
@@ -438,11 +571,8 @@ static void th6_begin_game_draw() {
 //
 // t is where this presentation sits between the game's own one and the next one, i.e. how far the
 // objects it draws are moved forward; t = 0 is the state the game's own presentation showed. The
-// stage 1 code will project the objects forward by it (nothing is projected yet, so a stage 0 extra
-// draws exactly the state the game's own pass drew).
+// stage 1 code below projects the objects forward by it.
 static void th6_extra_presentation(float t) {
-    (void)t;
-
     IDirect3DDevice8* device = th6_device();
     if (device == nullptr)
         return;
@@ -472,12 +602,18 @@ static void th6_extra_presentation(float t) {
     // know its frame is ready to be drawn again
     ToolState::ReadyToDraw();
 
+    // Where the bullets are a fraction of a frame on from here; put back right after the pass drew
+    // them (see the stage 1 comment above)
+    th6_bullets_advance(t);
+
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it
     Th6FpsState fps;
     th6_fps_state_save(&fps);
     th6_draw_pass();
     th6_fps_state_restore(&fps);
+
+    th6_bullets_undo();
 
     // Presented with the device's own Present, without the hooks other patches and tools put in front
     // of it (see d3d8_present_bypassing_hooks, the same thing th07, th08, th19 and th20 do): a tool's
@@ -545,6 +681,16 @@ static void th6_diag_dump() {
     fprintf(file, "frameskip config: %u, cur frame: %u\n",
             (unsigned int)*(unsigned char*)0x006C6E4B,
             (unsigned int)*(unsigned char*)(0x006C6BD4 + 0x10));
+    // The bullets (see the stage 1 comment above): what the walk over the game's own 640 slots found,
+    // which is what the frame's draw pass draws and what the extras project, and what the manager's
+    // own counter says. The counter reads a few higher, and that is the update loop's own doing: it
+    // counts a bullet as active before it gets to the end of the switch, so the ones it puts back to
+    // BULLET_STATE_INACTIVE on the way there (out of bounds and done despawning) stay in the count it
+    // leaves behind.
+    fprintf(file, "bullets: %u in play, %u projected forward (last presentation)\n",
+            th6_bullets_in_play, th6_bullets_projected);
+    fprintf(file, "bullets: the manager's own count says %u (the update's count, taken before it "
+                  "turns the bullets it removes off)\n", th6_bullets_managers_say);
     double presents = 0.0;
     double first = 0.0;
     double last = 0.0;
