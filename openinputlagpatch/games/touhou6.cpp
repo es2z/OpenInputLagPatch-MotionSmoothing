@@ -1,6 +1,7 @@
 // Touhou 6: Embodiment of Scarlet Devil v1.02h
 
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include "patch_util.h"
 #include "limiter.h"
@@ -489,6 +490,226 @@ static void th6_bullets_undo() {
     th6_projected_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the player, its two orbs and its own shots
+// ---------------------------------------------------------------------------
+//
+// All three are drawn from positions the draw copies into the sprite it is about to draw, so none of
+// them needs a hook - what the extras move is what the draw reads:
+//
+//   - The player. Player_OnDrawHighPrio (0x429930) writes the sprite's position from the player's own
+//     positionCenter (Player+0x440, two floats; the corner of the play field, which GameManager keeps
+//     at 0x69D6DC/0x69D6E0, is added at 0x42996D..0x429994) and draws it with
+//     AnmManager::DrawNoRotation, then does the same for the orbs out of orbsPosition[0] and [1]
+//     (Player+0x4A0 and +0x4AC, 0x4299F9..0x429AEB, drawn with AnmManager::Draw, z = 0.491f). The
+//     player moves with the input, the shot type's speed (and a bomb multiplier) and is clamped to
+//     the movement area, and a death or a stage transition puts it somewhere else outright, so what
+//     one frame moved it by is measured rather than read out of a velocity - the same thing th07 and
+//     th08 do for theirs.
+//   - The orbs are this game's familiars: two of them, drawn while the player has power 8 or more
+//     (Player.cpp:704: below that the game hides them, orbState = ORB_HIDDEN, and from 8 on it runs
+//     ORB_UNFOCUSED / FOCUSING / FOCUSED / UNFOCUSING with focusMovementTimer) and placed from the
+//     player's position with an offset that swings between 24 and 8 pixels out and 32 up as the focus
+//     key is held. The shots of the shot types that have a spawnPositionIdx fire from them
+//     (Player.cpp:75). Their step is not a velocity either: their offset moves with that little state
+//     machine, so it is measured the same way the player's is.
+//   - The player's own shots. DrawBullets (0x429B00) walks the 80 slots of Player::bullets
+//     (Player+0xA28, sizeof(PlayerBullet) == 0x158) and draws the ones whose bulletState
+//     (bullet+0x14E, 16 bit) is PLAYER_BULLET_STATE_FIRED, out of the slot's own sprite (the AnmVm at
+//     the start of the slot, drawn with AnmManager::Draw2); Player_OnDrawLowPrio (0x429B90) draws the
+//     ones that have collided (state 2) the same way, as their explosion, out of the same sprite
+//     (DrawBulletExplosions, 0x429BB0). What is drawn is therefore the sprite's own position
+//     (slot+0x90), not the bullet's logical one (slot+0x110) - and that is what the extras move, so
+//     nothing of the game's own state is written at all. The update keeps the two in step
+//     (UpdatePlayerBullets, Player.cpp:933: sprite.pos.x = position.x += velocity.x * the frame rate
+//     multiplier), but how far a shot actually went is the difference between two frames' drawn
+//     positions, measured the way the player's is, which covers the shot types whose update places
+//     them outright as well.
+//
+// The step of each is the difference to the position the frame before had, sampled once a frame where
+// the game's own draw starts (th6_begin_game_draw) - after the calculation chain has run, which is
+// where the positions are the ones the frame is drawn with. Nothing of this is written anywhere but
+// those positions, and they are put back the moment the pass drew, so the game's logic, its
+// collisions and its random numbers see exactly what they last read.
+//
+// A shot's drawn position that jumped further in one frame than anything can move is not projected
+// across that jump: a slot that was free is given to a shot that was just spawned, which the
+// once-a-frame sampling cannot see, and the same guard th07 and th08 use (48 pixels, against the
+// fastest of these shots' ten or so pixels a frame) keeps that from being drawn as a fraction of the
+// jump.
+
+static const unsigned int th6_player_position_offset = 0x440;      // Float3, two of them used
+static const unsigned int th6_player_orb_positions_offset = 0x4A0; // D3DXVECTOR3[2]
+static const unsigned int th6_player_bullets_offset = 0xA28;       // PlayerBullet[80]
+static const unsigned int th6_player_bullet_size = 0x158;
+static const unsigned int th6_player_bullet_sprite_pos_offset = 0x90; // the drawn position
+static const unsigned int th6_player_bullet_state_offset = 0x14E;     // 16 bit
+static const unsigned int th6_player_bullets_max = 80;
+static unsigned char* th6_player = (unsigned char*)0x006CA628;     // g_Player
+static const unsigned int th6_orbs = 2;
+
+// A shot cannot move anywhere near this far in a frame, so a step this big is a slot that was given
+// to something else
+static const float th6_shots_max_step = 48.0f;
+
+// The player is moved by the input and then clamped to its movement area, which is a few pixels a
+// frame at most (the character data's movement speeds are single digits, and a bomb multiplies them
+// by at most two). A death, a respawn or a stage transition puts it somewhere else outright - Player
+// ::Die moves it back to the respawn point at the bottom of the play field - and the orbs are placed
+// from the player's position, so they jump with it. A frame that moved either of them further than
+// anything can move is not projected across that jump, the same guard the shots have: the extras then
+// draw them exactly where the frame's own pass drew them (at the respawn point) instead of a
+// fraction of the way down to it, which showed as the player flashing at a spot just below the
+// respawn point. th07 and th08 do not need this - their player is teleported the same way, but the
+// extra presentations of the frame a death lands in did not read as a flash there.
+static const float th6_player_max_step = 48.0f;
+
+// Where one measured position was, and how far it moved over the frame (the draws set the z of
+// everything here themselves, so only x and y are projected)
+struct Th6Step {
+    float last_x;
+    float last_y;
+    float step_x;
+    float step_y;
+    bool known;
+};
+
+static void th6_step(Th6Step* state, const float* pos, float limit) {
+    if (state->known) {
+        state->step_x = pos[0] - state->last_x;
+        state->step_y = pos[1] - state->last_y;
+
+        if (limit > 0.0f && state->step_x * state->step_x + state->step_y * state->step_y > limit * limit)
+            state->step_x = state->step_y = 0.0f;
+    } else {
+        state->step_x = state->step_y = 0.0f;
+        state->known = true;
+    }
+
+    state->last_x = pos[0];
+    state->last_y = pos[1];
+}
+
+static Th6Step th6_player_step;
+static Th6Step th6_orb_steps[th6_orbs];
+static Th6Step th6_shot_steps[th6_player_bullets_max];
+
+// What the last extra presentation found, for the diagnostics (see th6_diag_dump)
+static unsigned int th6_shots_in_play;
+static unsigned int th6_shots_flying;
+static unsigned int th6_shots_exploding;
+static unsigned int th6_shots_projected;
+static float th6_player_step_length;
+static float th6_orb_step_lengths[th6_orbs];
+
+// Called once a frame, from the frame's own draw
+static void th6_player_measure() {
+    const float* pos = (const float*)(th6_player + th6_player_position_offset);
+    th6_step(&th6_player_step, pos, th6_player_max_step);
+    th6_player_step_length = (float)sqrt((double)(th6_player_step.step_x * th6_player_step.step_x +
+                                                  th6_player_step.step_y * th6_player_step.step_y));
+
+    for (unsigned int orb = 0; orb < th6_orbs; ++orb) {
+        th6_step(&th6_orb_steps[orb],
+                 (const float*)(th6_player + th6_player_orb_positions_offset + orb * 12),
+                 th6_player_max_step);
+        th6_orb_step_lengths[orb] =
+            (float)sqrt((double)(th6_orb_steps[orb].step_x * th6_orb_steps[orb].step_x +
+                                 th6_orb_steps[orb].step_y * th6_orb_steps[orb].step_y));
+    }
+}
+
+static void th6_shots_measure() {
+    th6_shots_in_play = 0;
+    th6_shots_flying = 0;
+    th6_shots_exploding = 0;
+
+    for (unsigned int i = 0; i < th6_player_bullets_max; ++i) {
+        unsigned char* shot = th6_player + th6_player_bullets_offset + (size_t)i * th6_player_bullet_size;
+        const int state = *(const short*)(shot + th6_player_bullet_state_offset);
+
+        // A slot that is not in use is forgotten rather than measured across what was there before it:
+        // the shot that gets it next has not moved at all yet (see the comment above)
+        if (state == 0) {
+            th6_shot_steps[i].known = false;
+            continue;
+        }
+
+        ++th6_shots_in_play;
+        if (state == 1)
+            ++th6_shots_flying;
+        else
+            ++th6_shots_exploding;
+
+        th6_step(&th6_shot_steps[i], (const float*)(shot + th6_player_bullet_sprite_pos_offset),
+                 th6_shots_max_step);
+    }
+}
+
+// What the last extra presentation moved, so it can be put back
+static float th6_saved_player_pos[2];
+static float th6_saved_orb_pos[th6_orbs][2];
+static unsigned char* th6_moved_shots[th6_player_bullets_max];
+static float th6_saved_shot_pos[th6_player_bullets_max][2];
+static unsigned int th6_moved_shot_count;
+
+static void th6_player_advance(float t) {
+    float* pos = (float*)(th6_player + th6_player_position_offset);
+    th6_saved_player_pos[0] = pos[0];
+    th6_saved_player_pos[1] = pos[1];
+    pos[0] = pos[0] + th6_player_step.step_x * t;
+    pos[1] = pos[1] + th6_player_step.step_y * t;
+
+    for (unsigned int orb = 0; orb < th6_orbs; ++orb) {
+        float* orb_pos = (float*)(th6_player + th6_player_orb_positions_offset + orb * 12);
+        th6_saved_orb_pos[orb][0] = orb_pos[0];
+        th6_saved_orb_pos[orb][1] = orb_pos[1];
+        orb_pos[0] = orb_pos[0] + th6_orb_steps[orb].step_x * t;
+        orb_pos[1] = orb_pos[1] + th6_orb_steps[orb].step_y * t;
+    }
+}
+
+static void th6_player_undo() {
+    float* pos = (float*)(th6_player + th6_player_position_offset);
+    pos[0] = th6_saved_player_pos[0];
+    pos[1] = th6_saved_player_pos[1];
+
+    for (unsigned int orb = 0; orb < th6_orbs; ++orb) {
+        float* orb_pos = (float*)(th6_player + th6_player_orb_positions_offset + orb * 12);
+        orb_pos[0] = th6_saved_orb_pos[orb][0];
+        orb_pos[1] = th6_saved_orb_pos[orb][1];
+    }
+}
+
+static void th6_shots_advance(float t) {
+    th6_moved_shot_count = 0;
+
+    for (unsigned int i = 0; i < th6_player_bullets_max; ++i) {
+        unsigned char* shot = th6_player + th6_player_bullets_offset + (size_t)i * th6_player_bullet_size;
+        if (*(const short*)(shot + th6_player_bullet_state_offset) == 0)
+            continue;
+
+        float* pos = (float*)(shot + th6_player_bullet_sprite_pos_offset);
+        th6_saved_shot_pos[th6_moved_shot_count][0] = pos[0];
+        th6_saved_shot_pos[th6_moved_shot_count][1] = pos[1];
+        pos[0] = pos[0] + th6_shot_steps[i].step_x * t;
+        pos[1] = pos[1] + th6_shot_steps[i].step_y * t;
+        th6_moved_shots[th6_moved_shot_count] = shot;
+        ++th6_moved_shot_count;
+    }
+
+    th6_shots_projected = th6_moved_shot_count;
+}
+
+static void th6_shots_undo() {
+    for (unsigned int n = 0; n < th6_moved_shot_count; ++n) {
+        float* pos = (float*)(th6_moved_shots[n] + th6_player_bullet_sprite_pos_offset);
+        pos[0] = th6_saved_shot_pos[n][0];
+        pos[1] = th6_saved_shot_pos[n][1];
+    }
+    th6_moved_shot_count = 0;
+}
+
 // The state DrawFpsCounter (0x423F3F) works in. It is called from the draw chain, so every extra
 // presentation runs it once more, and this is what puts the game's accounting back the way its own
 // pass left it:
@@ -563,6 +784,17 @@ static void th6_begin_game_draw() {
     th6_scene.view = *(D3DMATRIX*)0x006C6D60;
     th6_scene.projection = *(D3DMATRIX*)0x006C6DA0;
 
+    // The frame's own movement of the player, its two orbs and its own shots (see the stage 1
+    // comment above): sampled once a frame, where the calculation chain has already run. (With the
+    // game's own frame skip turned on a frame can run the calculation chain and the draw more than
+    // once; the sample is taken at the first of those, the same way th07 and th08 take it, which
+    // leaves the extras projecting a frame's worth of movement the frame before the last one in that
+    // case.)
+    if (!th6_drew_frame) {
+        th6_player_measure();
+        th6_shots_measure();
+    }
+
     ToolState::WatchFrameReady(th6_tool_frame_address, th6_tool_draw_address);
 }
 
@@ -602,9 +834,11 @@ static void th6_extra_presentation(float t) {
     // know its frame is ready to be drawn again
     ToolState::ReadyToDraw();
 
-    // Where the bullets are a fraction of a frame on from here; put back right after the pass drew
-    // them (see the stage 1 comment above)
+    // Where the objects are a fraction of a frame on from here; put back right after the pass drew
+    // them (see the stage 1 comments above)
     th6_bullets_advance(t);
+    th6_player_advance(t);
+    th6_shots_advance(t);
 
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it
@@ -614,6 +848,8 @@ static void th6_extra_presentation(float t) {
     th6_fps_state_restore(&fps);
 
     th6_bullets_undo();
+    th6_player_undo();
+    th6_shots_undo();
 
     // Presented with the device's own Present, without the hooks other patches and tools put in front
     // of it (see d3d8_present_bypassing_hooks, the same thing th07, th08, th19 and th20 do): a tool's
@@ -691,6 +927,15 @@ static void th6_diag_dump() {
             th6_bullets_in_play, th6_bullets_projected);
     fprintf(file, "bullets: the manager's own count says %u (the update's count, taken before it "
                   "turns the bullets it removes off)\n", th6_bullets_managers_say);
+    // The player, its orbs and its own shots (see their stage 1 comment above): how far the frame's
+    // own pass moved the player and the two orbs, which is what the extras project them by, and what
+    // the three states of the shot slots add up to - the drawn ones are the flying and the exploding
+    fprintf(file, "player: %.2f px a frame (measured over the frames recorded)\n", th6_player_step_length);
+    fprintf(file, "orbs: %.2f/%.2f px a frame (measured; this game shows them from power 8 on)\n",
+            th6_orb_step_lengths[0], th6_orb_step_lengths[1]);
+    fprintf(file, "shots: %u in play (%u flying, %u exploding), %u projected forward "
+                  "(last presentation)\n",
+            th6_shots_in_play, th6_shots_flying, th6_shots_exploding, th6_shots_projected);
     double presents = 0.0;
     double first = 0.0;
     double last = 0.0;
