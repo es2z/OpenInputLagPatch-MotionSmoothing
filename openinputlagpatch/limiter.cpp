@@ -239,9 +239,20 @@ LARGE_INTEGER Limiter::FrameWait() {
 // Config::CalcFPS). The games' own counters are taken over, so this is what counts their frames in
 // their place: it adds one per game frame and works the rate out in the same half second windows
 // their own code uses, with the same timing source (timeGetTime), so the number the game is handed
-// matches what its own reading would have been had nothing gone wrong.
+// looks like the one its own reading would have produced.
+//
+// One thing it deliberately does not: the games count their draw passes against wall clock time, so a
+// frame the game spends stalled inside itself - loading a stage, a scene change - makes the window read
+// as a slow one, and the game then carries that as frame rate the run lost. That is the few percent of
+// "processing rate" a run with a load in it shows on its results screen and records in a replay, which
+// is what vpatch's CalcFPS exists to take out: its stub hands the game the frame rate the run is being
+// paced at rather than one it measured for itself. A frame is therefore charged for one frame's worth
+// of time here, not for however long a stall made it, which leaves a run that never fell behind reading
+// the frame rate it was paced at.
 static unsigned int measured_frame_count;
 static unsigned int measured_window_start;
+static unsigned int measured_last_time;
+static unsigned int measured_window_time;
 static float measured_fps;
 
 void Limiter::CountGameFrame() {
@@ -250,14 +261,29 @@ void Limiter::CountGameFrame() {
 	unsigned int now = timeGetTime();
 	if (measured_window_start == 0) {
 		measured_window_start = now;
+		measured_last_time = now;
 		return;
 	}
 
-	unsigned int elapsed = now - measured_window_start;
-	if (elapsed >= 500) {
-		measured_fps = (float)measured_frame_count * 1000.0f / (float)elapsed;
+	// How long one frame of the target frame rate is, in the same milliseconds the window is counted in
+	// (wait_amount is still zero until the limiter's first Tick has worked it out)
+	unsigned int frame_ms = (unsigned int)((double)wait_amount.QuadPart * 1000.0 / (double)perf_freq.QuadPart + 0.5);
+	if (frame_ms == 0)
+		frame_ms = 1;
+
+	unsigned int delta = now - measured_last_time;
+	measured_last_time = now;
+	
+	// A frame that took longer than any frame can is a stall inside the game rather than frame rate the
+	// run lost (see the comment above), so it is charged as one frame
+	if (delta > frame_ms * 2)
+		delta = frame_ms;
+	measured_window_time += delta;
+	
+	if (measured_window_time >= 500) {
+		measured_fps = (float)measured_frame_count * 1000.0f / (float)measured_window_time;
 		measured_frame_count = 0;
-		measured_window_start = now;
+		measured_window_time = 0;
 	}
 }
 
