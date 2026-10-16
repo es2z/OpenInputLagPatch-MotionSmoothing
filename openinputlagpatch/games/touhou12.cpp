@@ -160,24 +160,6 @@ static void th12_render_hook() {
 	th12_render_objects();
 }
 
-// The number of presentations per second the config asks for. 0 means interpolation is off.
-static double th12_present_rate() {
-	if (Config::InterpolationFPS)
-		return (double)Config::InterpolationFPS;
-
-	int multiplier = Config::Interpolation;
-	if (multiplier < 0) {
-		UINT display = Limiter::DisplayRefresh();
-		UINT logic = (UINT)(Limiter::game_fps + 0.5);
-		if (display == 0 || logic == 0)
-			return 0.0;
-		multiplier = (int)(display / logic);
-	}
-	if (multiplier < 2)
-		return 0.0;
-	return Limiter::game_fps * (double)multiplier;
-}
-
 // Diagnostics: press U to write the presentation timing of the last frames to oilp_diag.txt
 // (what the last presentation projected, see the stage 1 sections below)
 static unsigned int th12_bullets_in_play;
@@ -225,7 +207,7 @@ static void th12_diag_dump() {
 
 	fprintf(file, "oilp frame interpolation diagnostics\n");
 	fprintf(file, "logic frame rate: %.2f, configured presentation rate: %.2f\n",
-		Limiter::game_fps, th12_present_rate());
+		Limiter::game_fps, Limiter::PresentRate());
 	fprintf(file, "frames recorded: %u\n", count);
 	fprintf(file, "bullets: %u in play, %u projected forward (last game frame)\n",
 		th12_bullets_in_play, th12_bullets_moved);
@@ -971,8 +953,8 @@ static HRESULT th12_present_hook() {
 	LARGE_INTEGER present_time[th12_diag_presents_max];
 	present_time[0] = base;
 
-	double rate = th12_present_rate();
-	if (SUCCEEDED(result) && rate > 0.0 && Limiter::game_fps > 0.0) {
+	double rate = Limiter::PresentRate();
+	if (SUCCEEDED(result) && rate > 0.0 && Limiter::game_fps > 0.0 && !Limiter::PresentingEveryNthFrame()) {
 		static bool rate_printed = false;
 		if (!rate_printed) {
 			rate_printed = true;
@@ -980,41 +962,35 @@ static HRESULT th12_present_hook() {
 				rate, rate / Limiter::game_fps);
 		}
 
-		static double presentations_owed = 0.0;
-		presentations_owed += rate / Limiter::game_fps - 1.0;
-		unsigned int extras = 0;
-		while (presentations_owed >= 1.0 - 1e-9 && extras < 32) {
-			presentations_owed -= 1.0;
-			++extras;
-		}
-
+		// How many presentations this frame gets, and how far apart they sit: the limiter works
+		// both out (see Limiter::ExtraPresentations), carrying a rate that is not a multiple of
+		// the game's frame rate over from frame to frame, so every game behaves the same way here
+		LARGE_INTEGER spacing;
+		unsigned int extras = Limiter::ExtraPresentations(rate, spacing);
 		LARGE_INTEGER frame_wait = Limiter::FrameWait();
-		if (extras > 0 && frame_wait.QuadPart > 0) {
-			double spacing = (double)frame_wait.QuadPart / (double)(extras + 1);
-			if (spacing >= 1.0) {
-				LARGE_INTEGER frame_start = Limiter::FrameStart();
-				LARGE_INTEGER frame_work = Limiter::FrameWork();
-				bool has_deadline = frame_start.QuadPart > 0 && frame_work.QuadPart > 0;
-				LARGE_INTEGER deadline;
-				deadline.QuadPart = frame_start.QuadPart + frame_wait.QuadPart;
+		if (extras > 0 && spacing.QuadPart > 0) {
+			LARGE_INTEGER frame_start = Limiter::FrameStart();
+			LARGE_INTEGER frame_work = Limiter::FrameWork();
+			bool has_deadline = frame_start.QuadPart > 0 && frame_work.QuadPart > 0;
+			LARGE_INTEGER deadline;
+			deadline.QuadPart = frame_start.QuadPart + frame_wait.QuadPart;
 
-				for (unsigned int k = 1; k <= extras; ++k) {
-					LARGE_INTEGER target;
-					target.QuadPart = base.QuadPart + (LONGLONG)(spacing * (double)k + 0.5);
-					if (has_deadline && target.QuadPart + frame_work.QuadPart > deadline.QuadPart)
-						continue;
+			for (unsigned int k = 1; k <= extras; ++k) {
+				LARGE_INTEGER target;
+				target.QuadPart = base.QuadPart + spacing.QuadPart * (LONGLONG)k;
+				if (has_deadline && target.QuadPart + frame_work.QuadPart > deadline.QuadPart)
+					continue;
 
-					Limiter::WaitUntil(target);
+				Limiter::WaitUntil(target);
 
-					if (presents < th12_diag_presents_max)
-						QueryPerformanceCounter(&present_time[presents]);
-					++presents;
+				if (presents < th12_diag_presents_max)
+					QueryPerformanceCounter(&present_time[presents]);
+				++presents;
 
-					// Where this presentation sits between the game's own one and the next one:
-					// the frames of one game frame are spread evenly over it, so the k-th of
-					// extras + 1 of them draws the state k/(extras + 1) frames along
-					th12_extra_presentation(device, (float)k / (float)(extras + 1));
-				}
+				// Where this presentation sits between the game's own one and the next one:
+				// the frames of one game frame are spread evenly over it, so the k-th of
+				// extras + 1 of them draws the state k/(extras + 1) frames along
+				th12_extra_presentation(device, (float)k / (float)(extras + 1));
 			}
 		}
 	}
@@ -1115,7 +1091,7 @@ void th12_install_patches() {
 
 		// The frame rate the frames are actually presented at goes right after the line the patch
 		// draws in the bottom left corner (see overlay.h), the same as in th13, th14 and th15
-		overlay_show_present_rate(Config::ShowOverlay && (Config::Interpolation != 0 || Config::InterpolationFPS != 0));
+		// (the overlay readouts are Config::ShowOverlay's business; see Limiter::Initialize)
 		overlay_set_present_rate_follow_text(true);
 	}
 }

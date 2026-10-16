@@ -43,10 +43,18 @@ double Limiter::PresentRate() {
 	if (Config::InterpolationFPS)
 		return (double)Config::InterpolationFPS;
 
-	// "-1" picks the largest multiple of the game's frame rate the display can show, a positive
-	// value is that multiple (and 1, the off setting, leaves nothing to present)
+	// "1" asks for the display's own refresh rate: as many presentations a second as the display can
+	// show, whatever the game's frame rate is (60fps logic on a 144hz display is presented 144 times
+	// a second, which is 2 and 3 presentations a frame, carried over from frame to frame by
+	// ExtraPresentations below). The display's rate is the one the limiter read for itself; before it
+	// has, there is nothing to work from and the multiple below decides instead.
+	if (Config::Interpolation == 1 && display_refresh > 0)
+		return (double)display_refresh;
+
+	// "-1" picks the largest multiple of the game's frame rate the display can show, and a value of 2
+	// or more is that multiple (0, the off setting, leaves nothing to present)
 	int multiplier = Config::Interpolation;
-	if (multiplier < 0) {
+	if (multiplier < 0 || multiplier == 1) {
 		UINT display = display_refresh;
 		UINT logic = (UINT)(game_fps + 0.5);
 		if (display == 0 || logic == 0)
@@ -96,6 +104,15 @@ void Limiter::Initialize(ReplayCallback callback) {
 	last_wait_amount.QuadPart = 0;
 	frame_start.QuadPart = 0;
 	frame_end.QuadPart = 0;
+
+	// Which of the overlay's two readouts are shown is a setting of its own (see Config::ShowOverlay),
+	// and the rate one only means anything while the frames are actually being presented more than
+	// once per game frame: with the interpolation off the readout would just be the game's own frame
+	// rate, so it stays off whatever the setting says. (The presentation counting itself lives in the
+	// D3D8 and D3D9 hooks, which see every present.) Set here because this is the one place every game
+	// goes through, and it happens before any overlay is created.
+	overlay_show_present_rate((Config::ShowOverlay & 1) != 0 &&
+	                          (Config::Interpolation != 0 || Config::InterpolationFPS != 0));
 
 	initialized = true;
 }
@@ -338,7 +355,10 @@ void Limiter::TickUntil(double seconds) {
 		frame_work_end.QuadPart = 0;
 		__int64 frame_elapsed = frame_end_time - frame_start.QuadPart;
 		frame_work.QuadPart = frame_elapsed;
-		if (++frame_num % 30 == 0) {
+		// The render time line is one of the overlay's two readouts and can be turned off on its own
+		// (see Config::ShowOverlay); frame_num is counted either way, the limiter paces by it
+		const bool show_time_text = (++frame_num % 30) == 0 && (Config::ShowOverlay & 2) != 0;
+		if (show_time_text) {
 			char overlay_text[64];
 			sprintf_s(overlay_text, "%.2f/%.2fms", frame_elapsed / (float)perf_freq.QuadPart * 1000.0, (float)Config::BltPrepareTime);
 			unsigned long overlay_color = frame_elapsed > blt_prepare_time.QuadPart ? 0xFFFF0000 : 0xFFFFFFFF;
@@ -397,7 +417,8 @@ void Limiter::Tick() {
 		frame_elapsed = frame_end_time - frame_start.QuadPart;
 		frame_work.QuadPart = frame_elapsed;
 
-		if (frame_num % 30 == 0) {
+		// See the note on the same block in TickUntil above: the render time line can be off on its own
+		if ((Config::ShowOverlay & 2) != 0 && frame_num % 30 == 0) {
 			char overlay_text[64];
 			sprintf_s(overlay_text, "%.2f/%.2fms", frame_elapsed / (float)perf_freq.QuadPart * 1000.0, (float)Config::BltPrepareTime);
 			unsigned long overlay_color = frame_elapsed > blt_prepare_time.QuadPart ? 0xFFFF0000 : 0xFFFFFFFF;

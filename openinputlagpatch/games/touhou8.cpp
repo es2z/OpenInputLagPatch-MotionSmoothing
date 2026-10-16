@@ -1332,11 +1332,10 @@ static void th8_install_interpolation() {
     }
     {
         // The rate the frames are actually presented at, next to the render time line in the bottom
-        // left corner - the same readout th10 to th20 show while the interpolation is on. The
-        // presentation counting itself lives in the D3D8 hook, which sees every present. (The
-        // overlay the two lines go on is only there when ShowOverlay is on, so there is nothing
-        // else to check here.)
-        overlay_show_present_rate(true);
+        // left corner - the same readout th10 to th20 have. Which of the overlay's readouts are shown
+        // is Config::ShowOverlay's business rather than the interpolation's, and is set once in
+        // Limiter::Initialize; the presentation counting itself lives in the D3D8 hook, which sees
+        // every present.
     }
     {
         // call 0x462FF0, the draw of the player's sprite VM (0x44D5B9), taken over so the extras can

@@ -1254,11 +1254,10 @@ static void th6_install_interpolation() {
         }
     }
     {
-        // The rate the frames are actually presented at, next to the render time line in the bottom left
-        // corner - the same readout th07, th08 and th10 to th20 show while the interpolation is on. The
-        // presentation counting itself lives in the D3D8 hook, which sees every present. (The overlay the
-        // two lines go on is only there when ShowOverlay is on, so there is nothing else to check here.)
-        overlay_show_present_rate(true);
+        // The overlay's readouts are Config::ShowOverlay's business rather than the interpolation's,
+        // and which of them are shown is set once in Limiter::Initialize: the rate the frames are
+        // actually presented at is counted by the D3D8 hook, which sees every present, so it works
+        // with the interpolation off as well.
     }
 
     // From here on the calculation chain hook draws the frame (see the stage 0 comment above)

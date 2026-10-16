@@ -319,7 +319,10 @@ void D3D8Overlay::Draw() {
     if (overlay_present_rate_enabled()) {
         char rate_text[32];
         sprintf_s(rate_text, "%.1f fps", overlay_present_rate());
-        float rate_x = (float)strlen(text_buffer) * 7.0f + 2.0f + 6.0f;
+        // Right after the render time line, but at the left edge itself when that line isn't drawn
+        // (see Config::ShowOverlay): the two readouts can be switched on separately, and the rate on
+        // its own belongs in the corner rather than where the line before it would have ended
+        float rate_x = strlen(text_buffer) > 0 ? (float)strlen(text_buffer) * 7.0f + 2.0f + 6.0f : 0.0f;
 
         rect_count = UpdateBuffers(rate_text, D3DCOLOR_COLORVALUE(1.0, 1.0, 1.0, 0.9), rate_x);
         d3d8_device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, rect_count * 2 * 3, 0, rect_count * 2);

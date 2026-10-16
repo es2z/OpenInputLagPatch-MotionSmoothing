@@ -387,7 +387,9 @@ void D3D9Overlay::Draw() {
         // edge of the window (see overlay.h)
         float rate_x;
         if (present_rate_follows_text) {
-            rate_x = (float)strlen(text_buffer) * 7.0f + 2.0f + 6.0f;
+            // Right after the render time line, but at the left edge itself when that line isn't
+            // drawn (see Config::ShowOverlay)
+            rate_x = strlen(text_buffer) > 0 ? (float)strlen(text_buffer) * 7.0f + 2.0f + 6.0f : 0.0f;
         } else if (present_rate_width > 0) {
             // The game's own picture may be shown smaller or larger than it is drawn in, so the
             // edge it asked for moves with the window

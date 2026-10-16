@@ -11,12 +11,12 @@ UINT Config::BltPrepareTime = 2;
 SleepType Config::Sleep = SleepType::Vpatch;
 BOOL Config::D3D9Ex = TRUE;
 TargetRefreshRate Config::FullscreenRefreshRate = TargetRefreshRate::MultipleOfSixty;
-BOOL Config::ShowOverlay = TRUE;
+int Config::ShowOverlay = 1;
 BOOL Config::DebugConsole = FALSE;
 BOOL Config::DebugWait = FALSE;
 BOOL Config::FixInputGlitching = TRUE;
 BOOL Config::CalcFPS = TRUE;
-int Config::Interpolation = -1;
+int Config::Interpolation = 1;
 UINT Config::InterpolationFPS = 0;
 BOOL Config::AlwaysBlt = TRUE;
 TouhouGame Config::GameOverride = TouhouGame::Unknown;
@@ -72,10 +72,10 @@ bool Config::Load() {
 	LOAD_WINDOW_SETTING(WindowAlwaysOnTop, "AlwaysOnTop");
 	LOAD_WINDOW_SETTING(WindowCoverTaskbar, "CoverTaskbar");
 
-	// Frame interpolation: "0", "-1", a multiplier, or "*<frame rate>"
+	// Frame interpolation: "0", "1", "-1", a multiplier, or "*<frame rate>"
 	{
 		wchar_t value[64] = {};
-		GetPrivateProfileStringW(TEXT("Option"), TEXT("Interpolation"), TEXT("0"), value, 64, config_path);
+		GetPrivateProfileStringW(TEXT("Option"), TEXT("Interpolation"), TEXT("1"), value, 64, config_path);
 		if (value[0] == L'*')
 			Config::InterpolationFPS = (UINT)_wtoi(value + 1);
 		else
@@ -101,6 +101,10 @@ bool Config::Load() {
 		Config::FullscreenRefreshRate = TargetRefreshRate::MultipleOfSixty;
 	if ((int)Config::GameOverride < (int)TouhouGame::Unknown || (int)Config::GameOverride >= (int)TouhouGame::MaxValue)
 		Config::GameOverride = TouhouGame::Unknown;
+	if (Config::ShowOverlay < 0)
+		Config::ShowOverlay = 0;
+	else if (Config::ShowOverlay > 3)
+		Config::ShowOverlay = 3;
 
 	return true;
 }

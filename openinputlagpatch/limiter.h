@@ -82,8 +82,11 @@ public:
 	// The number of presentations per second the frame interpolation should be putting on the
 	// display, worked out from the two interpolation settings. 0 means there is nothing to
 	// interpolate:
-	//   Interpolation = -1     the largest multiple of the game's frame rate the display can show
-	//                          (a 180hz display and a 60fps game give 3)
+	//   Interpolation = 1      the display's own refresh rate (a 144hz display with a 60fps game is
+	//                          presented 144 times a second, whatever the game's frame rate is)
+	//   Interpolation = -1     the largest whole multiple of the game's frame rate the display can
+	//                          show, which keeps the presentations evenly spaced (a 180hz display and
+	//                          a 60fps game give 3)
 	//   Interpolation = N      present N times per game frame
 	//   InterpolationFPS = R   present at R frames per second (e.g. *144)
 	//

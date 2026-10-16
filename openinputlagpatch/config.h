@@ -28,7 +28,13 @@ public:
 	static SleepType Sleep;
 	static BOOL D3D9Ex;
 	static TargetRefreshRate FullscreenRefreshRate;
-	static BOOL ShowOverlay;
+	// What the patch's overlay shows, as a sum of the two readouts it has:
+	//   0  nothing (no overlay at all)
+	//   1  the rate the frames are actually presented at ("144.0 fps"), which is the default
+	//   2  the render time line ("0.65/2.00ms": how long the game's own part of the frame took, and
+	//      what BltPrepareTime is set to - this is the line that setting is tuned with)
+	//   3  both
+	static int ShowOverlay;
 	static BOOL DebugConsole;
 	static BOOL DebugWait;
 	static BOOL FixInputGlitching;
@@ -47,10 +53,13 @@ public:
 	// Frame interpolation (motion smoothing). The value is read as text because it has more than
 	// one form:
 	//   0   = off
-	//   -1  = pick the largest multiple of the game's frame rate the display can show
+	//   1   = present at the display's own refresh rate, i.e. as many presentations a second as the
+	//         display can show (the default; on a 144hz display 60fps logic is presented at 144)
+	//   -1  = pick the largest whole multiple of the game's frame rate the display can show, which
+	//         keeps the presentations evenly spaced (on a 144hz display 60fps logic gives 120)
 	//   N   = present N times per game frame
 	//   *R  = present at R frames per second no matter what the game's frame rate is (e.g. *144)
-	// Interpolation holds the first three forms and InterpolationFPS holds the fourth one, so
+	// Interpolation holds the first four forms and InterpolationFPS holds the last one, so
 	// InterpolationFPS takes priority when it is set.
 	static int Interpolation;
 	static UINT InterpolationFPS;
