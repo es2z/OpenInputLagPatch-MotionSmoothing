@@ -159,6 +159,82 @@ spend:
     __asm { jmp ecx }
 }
 
+// ---------------------------------------------------------------------------
+// The frame rate the game measures for itself (vpatch's CalcFPS)
+//
+// Touhou 7 works its own frame rate out in Supervisor::DrawFpsCounter (0x4390A5): every frame it
+// adds 1 + frameskipConfig to the counter at 0x135E1F0, and once half a second has gone by it
+// divides that counter by the time the window took and clears it. The reading drives
+// 0x575AD0 / 0x575AD4 (framerateMultiplier and fpsAccumulator), whose ratio is the processing rate
+// the results screen shows (ResultScreen.cpp:1176) and a replay records (ReplayManager.cpp:626); a
+// window that a load or a scene change lands in reads as a slow one, and the run carries that as
+// lost frame rate from then on.
+//
+// The function has two timing paths, timeGetTime and the performance counter (the one that runs on
+// a normal system), and vpatch's CalcFPS=1 takes over both: its patches at 0x43915F and 0x43929B
+// skip the game's own counting, timing and division and carry on at 0x43917E and 0x439326 with a
+// frame rate of its own. This does the same with the frame rate the limiter measured for itself
+// (see Limiter::CountGameFrame).
+// ---------------------------------------------------------------------------
+// vpatch's own stub for this site (60003DA0) leaves its frame rate in the game's fps variable *and*
+// on the x87 stack, because the continuation it jumps to (0x43917E) formats whatever is on the stack
+// rather than loading the variable again. Ours is a plain C function, so it can only leave a value
+// in the variable: the continuation here is one instruction earlier (0x43917B, the game's own
+// "fld dword ptr [ebp-4]"), which loads what the game would have loaded for itself.
+static void* th7_fps_common(void* frame, void* continuation) {
+    // The frame pointer this is handed is the game's own; a hook that gets the calling convention
+    // wrong hands over something else entirely, which used to mean writing through it. Writing only
+    // to something that can be a stack address keeps that mistake from becoming memory corruption.
+    if ((size_t)frame < 0x10000)
+        return continuation;
+    // The counter the game adds to is left where its own code would have left it: cleared once the
+    // window it belongs to is over
+    *(unsigned int*)0x0135E1F0 = 0;
+    *(float*)((char*)frame - 4) = Limiter::MeasuredFps();
+    return continuation;
+}
+
+static void* th7_fps_time_continue(void* frame) { return th7_fps_common(frame, (void*)0x0043917B); }
+static void* th7_fps_perf_continue(void* frame) { return th7_fps_common(frame, (void*)0x00439326); }
+
+static __declspec(naked) void th7_fps_time_hook() {
+    // The game's frame pointer, pushed the way the game's own calls pass their arguments (it is
+    // what the fps variable is written through, see th7_fps_common)
+    __asm { push ebp }
+    __asm { call th7_fps_time_continue }
+    __asm { add esp, 4 }
+    __asm { jmp eax }
+}
+
+static __declspec(naked) void th7_fps_perf_hook() {
+    __asm { push ebp }
+    __asm { call th7_fps_perf_continue }
+    __asm { add esp, 4 }
+    __asm { jmp eax }
+}
+
+static void th7_install_fps_measurement() {
+    {
+        // The timeGetTime path: A1 F0 E1 35 01 (mov eax, [0x135E1F0])
+        BYTE* site = (BYTE*)0x0043915F;
+        if (site[0] == 0xA1 && *(DWORD*)(site + 1) == 0x0135E1F0) {
+            patch_jmp(0x0043915F, th7_fps_time_hook);
+        } else {
+            printf("th07 fps measurement at 0x43915F doesn't look like a known one, skipping!\n");
+        }
+    }
+    {
+        // The performance counter path: 83 3D 98 E2 35 01 00 (cmp dword [0x135E298], 0)
+        BYTE* site = (BYTE*)0x0043929B;
+        if (site[0] == 0x83 && site[1] == 0x3D && *(DWORD*)(site + 2) == 0x0135E298 &&
+            site[6] == 0x00) {
+            patch_jmp(0x0043929B, th7_fps_perf_hook);
+        } else {
+            printf("th07 fps measurement at 0x43929B doesn't look like a known one, skipping!\n");
+        }
+    }
+}
+
 // Takes over the two present calls of GameWindow::Render (defined below, after the comment that
 // explains what a frame is made of)
 static void th7_install_interpolation();
@@ -205,6 +281,10 @@ void th7_install_patches() {
         // window loses focus. Turn that conditional jump into an unconditional one.
         BYTE patch[] = { 0xEB, 0x07 }; // jne 004346F9 -> jmp 004346F9
         patch_bytes(0x004346F0, patch, sizeof(patch));
+    }
+    if (Config::CalcFPS) {
+        // Replace the frame rate the game measures for itself (see the comment above)
+        th7_install_fps_measurement();
     }
     if (Config::Interpolation != 0 || Config::InterpolationFPS != 0)
         th7_install_interpolation();

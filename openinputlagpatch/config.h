@@ -33,6 +33,17 @@ public:
 	static BOOL DebugWait;
 	static BOOL FixInputGlitching;
 
+	// Whether the patch should replace the frame rate the game measures for itself, the way vpatch's
+	// CalcFPS=1 does. Touhou 6, 7 and 8 count their own draw passes and work their frame rate out of
+	// them over half second windows, and the ratio of that to half a second of frames is the
+	// "processing rate" the results screen shows and a replay records (0.00% is a run that never
+	// fell behind). A window that a load or a scene change lands in reads as a slow one, and the run
+	// carries that as lost frame rate from then on, which is why a run that spends any time between
+	// stages shows a few percent where a run that doesn't shows none. vpatch's CalcFPS sidesteps
+	// that measurement altogether; this does the same thing with the frame rate the limiter measures
+	// for itself (see Limiter::CountGameFrame). vpatch's default is 1, so that is the default here.
+	static BOOL CalcFPS;
+
 	// Frame interpolation (motion smoothing). The value is read as text because it has more than
 	// one form:
 	//   0   = off

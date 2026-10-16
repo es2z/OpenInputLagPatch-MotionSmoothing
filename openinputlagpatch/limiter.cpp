@@ -235,6 +235,38 @@ LARGE_INTEGER Limiter::FrameWait() {
 	return wait_amount;
 }
 
+// The frame rate measurement the games that measure their own are told about (see limiter.h and
+// Config::CalcFPS). The games' own counters are taken over, so this is what counts their frames in
+// their place: it adds one per game frame and works the rate out in the same half second windows
+// their own code uses, with the same timing source (timeGetTime), so the number the game is handed
+// matches what its own reading would have been had nothing gone wrong.
+static unsigned int measured_frame_count;
+static unsigned int measured_window_start;
+static float measured_fps;
+
+void Limiter::CountGameFrame() {
+	++measured_frame_count;
+
+	unsigned int now = timeGetTime();
+	if (measured_window_start == 0) {
+		measured_window_start = now;
+		return;
+	}
+
+	unsigned int elapsed = now - measured_window_start;
+	if (elapsed >= 500) {
+		measured_fps = (float)measured_frame_count * 1000.0f / (float)elapsed;
+		measured_frame_count = 0;
+		measured_window_start = now;
+	}
+}
+
+float Limiter::MeasuredFps() {
+	// Until the first window has closed the game is told the frame rate it is being paced to, which
+	// is what it would have read off a run that never fell behind
+	return measured_fps != 0.0f ? measured_fps : (float)game_fps;
+}
+
 // Where the game's own part of the current frame ended, if it was reported (see limiter.h)
 static LARGE_INTEGER frame_work_end;
 
@@ -319,6 +351,12 @@ void Limiter::TickUntil(double seconds) {
 void Limiter::Tick() {
 	if (!initialized)
 		panic_msgbox(L"Tried to tick the limiter before initialization.");
+
+	// One frame of the game is about to run, which is what the measurement the games' own frame rate
+	// counters are replaced with counts (see CountGameFrame). This is the one place that is reached
+	// once per frame and never for an extra presentation, so the extra presentations the frame
+	// interpolation adds cannot end up in the frame rate the game is told about.
+	CountGameFrame();
 
 	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);

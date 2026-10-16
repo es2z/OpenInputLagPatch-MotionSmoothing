@@ -15,6 +15,7 @@ BOOL Config::ShowOverlay = TRUE;
 BOOL Config::DebugConsole = FALSE;
 BOOL Config::DebugWait = FALSE;
 BOOL Config::FixInputGlitching = TRUE;
+BOOL Config::CalcFPS = TRUE;
 int Config::Interpolation = -1;
 UINT Config::InterpolationFPS = 0;
 BOOL Config::AlwaysBlt = TRUE;
@@ -55,6 +56,7 @@ bool Config::Load() {
 	LOAD_SETTING(DebugConsole);
 	LOAD_SETTING(DebugWait);
 	LOAD_SETTING(FixInputGlitching);
+	LOAD_SETTING(CalcFPS);
 	// Interpolation is read as text below, it has more than one form
 	LOAD_SETTING(AlwaysBlt);
 	LOAD_SETTING(GameOverride);

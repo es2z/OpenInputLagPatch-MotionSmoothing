@@ -102,6 +102,8 @@ spend:
 // Takes over the game's present call and the draw chain call that precedes it (defined below,
 // after the comment that explains what a frame is made of)
 static void th8_install_interpolation();
+// Replaces the frame rate the game measures for itself (see the comment at its definition)
+static void th8_install_fps_measurement();
 
 void th8_install_patches() {
     {
@@ -143,6 +145,8 @@ void th8_install_patches() {
     }
     if (Config::Interpolation != 0 || Config::InterpolationFPS != 0)
         th8_install_interpolation();
+    if (Config::CalcFPS)
+        th8_install_fps_measurement();
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +295,58 @@ static void th8_fps_state_restore(const Th8FpsState* state) {
     *(float*)0x017CE8E8 = state->lag_numerator;
     *(float*)0x017CE8EC = state->lag_denominator;
     *(short*)0x017CE8F0 = state->rounded_rate;
+}
+
+// ---------------------------------------------------------------------------
+// The frame rate the game measures for itself (vpatch's CalcFPS)
+//
+// Touhou 8 works its own frame rate out in Supervisor::CalculateFps (0x446F53): every frame it adds
+// 1 + frameskipConfig to the counter at 0x17CF4C0, and once half a second has gone by it divides
+// that counter by the time the window took and clears it. That reading decides how much of the half
+// second the game counts as lost, which it accumulates into 0x17CE8E8 over 0x17CE8EC
+// (lagNumerator / lagDenominator) - the pair the results screen's processing rate
+// (ResultScreen.cpp:2016) and a replay's recorded value (SaveReplay, 0x453464) come out of. A
+// window that a load or a scene change lands in reads as a slow one, and the run carries that as
+// lost frame rate from then on.
+//
+// vpatch's CalcFPS=1 takes the measurement over: its patch at 0x446F6B skips the game's own
+// counting, timing and division and carries on at 0x447029 with the value its stub 60003DC0 worked
+// out. This does the same with the frame rate the limiter measured for itself (see
+// Limiter::CountGameFrame).
+// ---------------------------------------------------------------------------
+static void* th8_fps_continue(void* frame) {
+    // The frame pointer this is handed is the game's own; a hook that gets the calling convention
+    // wrong hands over something else entirely, which used to mean writing through it. Writing only
+    // to something that can be a stack address keeps that mistake from becoming memory corruption.
+    if ((size_t)frame < 0x10000)
+        return (void*)0x00447029;
+    // The counter the game adds to is left where its own code would have left it
+    *(unsigned int*)0x017CF4C0 = 0;
+    *(float*)((char*)frame - 4) = Limiter::MeasuredFps();
+    // Where vpatch continues: the game formats and draws the frame rate text from here, and the
+    // per half second weighting (0x447043 on) runs as the game wrote it
+    return (void*)0x00447029;
+}
+
+static __declspec(naked) void th8_fps_hook() {
+    // The game's frame pointer, pushed the way the game's own calls pass their arguments (it is
+    // what the fps variable is written through, see th8_fps_continue)
+    __asm { push ebp }
+    __asm { call th8_fps_continue }
+    __asm { add esp, 4 }
+    __asm { jmp eax }
+}
+
+static void th8_install_fps_measurement() {
+    // 0F B6 05 93 E8 7C 01 (movzx eax, byte [0x17CE893], the frameskip config the counter starts
+    // from)
+    BYTE* site = (BYTE*)0x00446F6B;
+    if (site[0] == 0x0F && site[1] == 0xB6 && site[2] == 0x05 &&
+        *(DWORD*)(site + 3) == 0x017CE893) {
+        patch_jmp(0x00446F6B, th8_fps_hook);
+    } else {
+        printf("th08 fps measurement at 0x446F6B doesn't look like a known one, skipping!\n");
+    }
 }
 
 // Where the user's tool builds its frame and where it draws it (see tool_state.h). thprac's th08

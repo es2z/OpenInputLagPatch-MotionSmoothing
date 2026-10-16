@@ -16,6 +16,21 @@ public:
 	// schedule that can drift out of phase with the game's clock.
 	static void TickUntil(double seconds);
 
+	// The frame rate the games that measure their own (Touhou 6, 7 and 8) are told about, for
+	// Config::CalcFPS (see the comment on it): those games add one to a counter every frame and work
+	// their frame rate out of it over half second windows, and that reading is the "processing rate"
+	// their results screen shows and a replay records. With CalcFPS on the counter the games add to
+	// is replaced along with their fps hook, and:
+	//   - CountGameFrame is called once per frame of the game, from that hook, so what is measured
+	//     here is the frame rate the game is actually being run at
+	//   - MeasuredFps is that measurement, in frames per second, and is what the game is handed in
+	//     place of the reading it would have worked out for itself
+	// It is measured over the same half second windows the games use, so the value follows the real
+	// frame rate the way their own reading would have, without a load or a scene change counting as
+	// lost frame rate for the rest of the run.
+	static void CountGameFrame();
+	static float MeasuredFps();
+
 	// Waits until the given point in time, in performance counter units. The frame interpolation
 	// uses this to place the extra presentations inside a frame.
 	static void WaitUntil(LARGE_INTEGER target);
