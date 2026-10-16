@@ -258,26 +258,38 @@ static void th8_forget_anm_texture() {
 //     0x17CF2A8..0x17CF2B4  the state that the replay path of the counter keeps
 //     (0x447149..0x4471DF; the branch it is on is dead in this build - 0x17CEA58 is only ever read)
 //     0x17CE8E8  Supervisor::lagNumerator, the lag the game compensates its frame rate for
+//     0x17CE8EC  Supervisor::lagDenominator, the other half of that measurement: the two are the
+//     game's own "how much of the frame rate was lost" ratio (every consumer divides the first by
+//     this one - SaveReplay 0x453676, ResultScreen::DrawFinalStats 0x458183, the replay list
+//     0x4563E5 - and its score/rank and the replay's recorded slowdown rate come out of it). The
+//     function adds 60.0 to it per draw pass (0x447069..0x447072) and 30.0 to 60.0 to the numerator,
+//     so a pass the extras run without putting this back skews the ratio: that is what "the
+//     processing rate went wrong" was (the extras added two passes' worth per frame, and only the
+//     numerator was being put back).
 //     0x17CE8F0  Supervisor::unk198, the rounded frame rate it works out (0x447122)
 //
 // The whole 0x17CF2A0..0x17CF4C4 block holds only those (nothing else in the executable reads or
-// writes any of it), and the two supervisor fields sit outside it, so that is what is saved and put
-// back.
+// writes any of it), and the supervisor fields sit outside it, so that is what is saved and put
+// back. The list of what the function writes is short enough to check: every absolute address it
+// stores to is in the block above, or one of 0x17CE8E8, 0x17CE8EC and 0x17CE8F0.
 struct Th8FpsState {
     unsigned char block[0x224];
     float lag_numerator;
+    float lag_denominator;
     short rounded_rate;
 };
 
 static void th8_fps_state_save(Th8FpsState* state) {
     memcpy(state->block, (void*)0x017CF2A0, sizeof(state->block));
     state->lag_numerator = *(float*)0x017CE8E8;
+    state->lag_denominator = *(float*)0x017CE8EC;
     state->rounded_rate = *(short*)0x017CE8F0;
 }
 
 static void th8_fps_state_restore(const Th8FpsState* state) {
     memcpy((void*)0x017CF2A0, state->block, sizeof(state->block));
     *(float*)0x017CE8E8 = state->lag_numerator;
+    *(float*)0x017CE8EC = state->lag_denominator;
     *(short*)0x017CE8F0 = state->rounded_rate;
 }
 
@@ -979,6 +991,43 @@ static unsigned int th8_diag_count;
 static bool th8_diag_key_down;
 static LARGE_INTEGER th8_diag_perf_freq;
 
+// The game's own processing rate measurement over time (see Th8FpsState): what the two halves of
+// the ratio are, what comes out of them, and the 500ms window its rate is counted with. The pair is
+// reset when a stage is set up (GameManager::AddedCallback, GameManager.cpp:1145..1146), and its
+// "not in a menu" gate is GameManager::flags.isActive - bit 2 of 0x164D0B4, set in that same
+// callback and only cleared by the pause and retry menus (0x45231E tests it) - so the time a run
+// spends on the results screen between stages is measured into the run as well. What that does
+// depends on how many frames the game draws there, because the rate is the draw passes per half
+// second: a window whose rate is under 54 adds less to the numerator while the 60 it adds to the
+// denominator never changes, and the ratio the results screen and a saved replay read comes out
+// lower (and the processing rate they show higher) for it.
+struct Th8LagSample {
+    unsigned int frame;         // the diagnostics' own frame counter when this was taken
+    float numerator;
+    float denominator;
+    unsigned int flags;         // g_GameManager.flags (0x164D0B4)
+    unsigned int window_count;  // 0x17CF4C0, the passes counted in the window that is open
+    unsigned int window_age;    // ms since that window opened (0x17CF4B8 holds its start)
+    unsigned int window_rate;   // that window's rate so far, passes per second
+};
+static Th8LagSample th8_lag_ring[64];
+static unsigned int th8_lag_count;
+
+static void th8_lag_sample() {
+    Th8LagSample& sample = th8_lag_ring[th8_lag_count % 64];
+    ++th8_lag_count;
+    sample.frame = th8_diag_count;
+    sample.numerator = *(float*)0x017CE8E8;
+    sample.denominator = *(float*)0x017CE8EC;
+    sample.flags = *(unsigned int*)0x0164D0B4;
+    sample.window_count = *(unsigned int*)0x017CF4C0;
+    sample.window_age = (unsigned int)timeGetTime() - *(unsigned int*)0x017CF4B8;
+    sample.window_rate = sample.window_age > 0
+                             ? (unsigned int)((float)sample.window_count * 1000.0f /
+                                              (float)sample.window_age)
+                             : 0;
+}
+
 static void th8_diag_dump() {
     wchar_t path[1024] = {};
     if (!GetModuleFileNameW(NULL, path, MAX_PATH))
@@ -1008,8 +1057,34 @@ static void th8_diag_dump() {
     // about three times that is the extras being counted
     fprintf(file, "game's own frame rate: %d, its text: \"%.16s\", lag: %.4f\n",
             (int)*(short*)0x017CE8F0, (char*)0x017CF3B8, *(float*)0x017CE8E8);
+    // The game's own "how much frame rate was lost" measurement (see Th8FpsState), which its score,
+    // its rank and a replay's recorded processing rate all come out of: the ratio it works out of
+    // the two is what those show, and its frame rate correction multiplier sits beside them
+    fprintf(file, "game's own lag ratio: numerator %.4f, denominator %.4f, ratio %.4f, "
+                  "frame rate correction %.4f\n",
+            *(float*)0x017CE8E8, *(float*)0x017CE8EC,
+            *(float*)0x017CE8EC != 0.0f
+                ? *(float*)0x017CE8E8 / *(float*)0x017CE8EC
+                : 0.0f,
+            *(float*)0x017CE8E0);
     fprintf(file, "frameskip config: %u, loading (Supervisor::unk178): %u\n",
             (unsigned int)*(unsigned char*)0x017CE893, (unsigned int)*(DWORD*)0x017CE8D0);
+    // The processing rate measurement over the last half minute (see Th8LagSample): the ratio and
+    // what the window the rate is counted with looked like at each sample
+    {
+        unsigned int n = th8_lag_count < 64 ? th8_lag_count : 64;
+        unsigned int ring_start = th8_lag_count < 64 ? 0 : th8_lag_count % 64;
+        fprintf(file, "lag over time (every 30 frames, oldest first, %u samples):\n", n);
+        for (unsigned int i = 0; i < n; ++i) {
+            const Th8LagSample& sample = th8_lag_ring[(ring_start + i) % 64];
+            fprintf(file,
+                    "    frame %4u: numerator %9.2f denominator %9.2f ratio %7.4f flags %08x "
+                    "window %3u passes in %4u ms (%u/s)\n",
+                    sample.frame, sample.numerator, sample.denominator,
+                    sample.denominator != 0.0f ? sample.numerator / sample.denominator : 0.0f,
+                    sample.flags, sample.window_count, sample.window_age, sample.window_rate);
+        }
+    }
     // The bullets (see the stage 1 comment above): what the walk through the game's own layer
     // chains found, and what the manager's own counter says. A walk that stopped finding bullets
     // would say so right here. The counter reads a few higher than the chains hold, and that is the
@@ -1159,6 +1234,11 @@ static void __fastcall th8_present_hook(void* self) {
         for (unsigned int p = 0; p < th8_diag_presents_max; ++p)
             frame.present_time[p] = p < presents ? present_time[p] : present_time[0];
         ++th8_diag_count;
+
+        // Every half second, so the samples cover the last ~30 seconds of play: where the ratio
+        // falls (or stops falling) is what says which part of a run is being measured into it
+        if (th8_diag_count % 30 == 0)
+            th8_lag_sample();
     }
 
     // U dumps the diagnostics
