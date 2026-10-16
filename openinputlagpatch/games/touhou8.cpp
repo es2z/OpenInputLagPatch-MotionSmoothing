@@ -52,10 +52,21 @@ int __fastcall th8_window_update_hook(void* self) {
 // ---------------------------------------------------------------------------
 static DWORD th8_input_discard;
 
+// The game's own flags word, read the way the instruction the consumer below replaces (0x452319,
+// which tests bit 2 for "not in a menu") read it. A C read on purpose: in inline asm this compiler
+// turns "mov eax, dword ptr [0164D0B4h]" into "mov eax, 164D0B4h", the number itself, which is not
+// the game's state at all (0x164D0B4 happens to have bit 2 set, so it went unnoticed here, but
+// Touhou 7's value has it clear and its replay recorder was dead because of that - see
+// th7_game_flags in touhou7.cpp). Lesson: never hand an absolute address to an inline asm memory
+// operand here; use a C read.
+static unsigned int th8_game_flags() {
+    return *(volatile unsigned int*)0x0164D0B4;
+}
+
 // Where the game calls Controller::GetInput (0x4455F0), vpatch's 60003DE0
 static __int16 th8_input_hook() {
     __int16 input = get_input();
-    if ((*(volatile BYTE*)0x0164D0B4 & 8) == 0) {
+    if ((th8_game_flags() & 8) == 0) {
         __int16 copy = input;
         if (th8_input_discard != 0)
             copy = 0;
@@ -77,7 +88,8 @@ static __declspec(naked) void th8_input_flag_consumer() {
     __asm { mov eax, dword ptr [th8_input_discard] }
     __asm { test eax, eax }
     __asm { jne spend }
-    __asm { mov eax, dword ptr [0164D0B4h] }
+    // eax = the flags the game's own instruction would have read, then the game's next instruction
+    __asm { call th8_game_flags }
     __asm { mov ecx, 0045231Eh }
     __asm { jmp ecx }
 spend:

@@ -24,6 +24,9 @@ CTextureManager** CTextureManager::InstancePtr = (CTextureManager**)0x004B9E44;
 // needs.
 static bool th7_interpolating;
 static bool th7_drew_frame;
+// TEMPORARY PROBE: what RunCalcChain returned (how many chain elements ran) this frame / at most
+static unsigned int th7_last_update_count;
+static unsigned int th7_max_update_count;
 static void th7_begin_game_draw();
 static void th7_draw_pass();
 static void th7_player_measure();
@@ -35,6 +38,14 @@ int __fastcall th7_update_calc_chain_hook() {
 	Limiter::Tick();
 
     auto ret = CChainManager__UpdateCalcChain(CChainManager::Instance);
+    if (th7_interpolating) {
+        // TEMPORARY PROBE (how many elements the chain walk ran, and the most it ever ran)
+        if ((unsigned int)ret < 0x1000) {
+            th7_last_update_count = (unsigned int)ret;
+            if (th7_max_update_count < th7_last_update_count)
+                th7_max_update_count = th7_last_update_count;
+        }
+    }
     if (ret != 0 && ret != -1 && engine->config.frameskip <= (char)CWindowManager::Instance->frames_skipped) {
         // The frame's own draw (see the frame interpolation comment below, which is where the
         // block lives now)
@@ -82,6 +93,25 @@ int __fastcall th7_window_update_hook() {
 //      raises that flag.
 // ---------------------------------------------------------------------------
 static DWORD th7_input_discard;
+static DWORD th7_input_flag_set_count; // TEMPORARY PROBE
+static DWORD th7_input_consumer_count; // TEMPORARY PROBE
+
+// TEMPORARY PROBE: counts how often the recorder's entry (the patched 0x442CD9) is reached, i.e.
+// how often ReplayManager::OnUpdateRecord is called at all
+static void th7_count_consumer() {
+    ++th7_input_consumer_count;
+}
+
+// The game's own flags word (0x0062F648), read the way the instruction this hook replaces
+// (0x442CD9, which tests bit 2 for "not in a menu") read it. It is a C read on purpose: in inline
+// asm this compiler turns "mov eax, dword ptr [0062F648h]" into "mov eax, 62F648h", the number
+// itself, and that value has bit 2 clear - so the test failed on every single frame, the recorder
+// below never recorded anything, and saving a replay then crashed at th07.exe+0x43FCA, because the
+// stage's end pointers were never written (they were the memory the manager was allocated with).
+// Lesson: never hand an absolute address to an inline asm memory operand here; use a C read.
+static unsigned int th7_game_flags() {
+    return *(volatile unsigned int*)0x0062F648;
+}
 
 // Where the game calls Controller::GetInput (0x00437D80)
 static __int16 th7_input_hook() {
@@ -93,18 +123,32 @@ static __int16 th7_input_hook() {
     return input;
 }
 
+// TEMPORARY PROBE: counts how often ReplayManager::AddedCallbackRecord returns, which is also how
+// often the flag above is raised
+static void th7_count_flag_setter() {
+    ++th7_input_flag_set_count;
+}
+
 // The ret at 0x004433A5 of the function that ends there
 static __declspec(naked) void th7_input_flag_setter() {
     __asm { mov dword ptr [th7_input_discard], edx }
+    __asm { pushad }
+    __asm { call th7_count_flag_setter }
+    __asm { popad }
     __asm { ret }
 }
 
 // 0x00442CD9, the top of the game's own copy job
 static __declspec(naked) void th7_input_flag_consumer() {
+    __asm { pushad }
+    __asm { call th7_count_consumer }
+    __asm { popad }
     __asm { mov eax, dword ptr [th7_input_discard] }
     __asm { test eax, eax }
     __asm { jne spend }
-    __asm { mov eax, dword ptr [0062F648h] }
+    // eax = the flags the game's own instruction would have read, then straight to the game's
+    // "not in a menu" test (see the comment on th7_game_flags)
+    __asm { call th7_game_flags }
     __asm { mov ecx, 00442CDEh }
     __asm { jmp ecx }
 spend:
@@ -1014,7 +1058,61 @@ static void th7_diag_dump() {
     // bullets, and the flag that says a slot is in use is the game's own
     fprintf(file, "lasers: %u in play, %u projected forward (last presentation)\n",
             th7_lasers_in_play, th7_lasers_projected);
-
+    // TEMPORARY PROBE (for the replay-save crash at th07.exe+0x43FCA; remove once it is understood)
+    //
+    // g_ReplayManager = 0x004B9E48 (0x443D36), the manager's replayInputs is at +0x84 and its
+    // stageFpsDataPointers at +0xA8 (see StopRecording, 0x443D30), the file header's
+    // stageReplayData[i].data is at data+0x1C+4i and its stageFpsData[i].data at data+0x38+4i
+    // (ReplayHeader, ReplayManager.hpp).
+    {
+        unsigned char* replay = *(unsigned char**)0x004B9E48;
+        fprintf(file, "probe: stage %d, g_ReplayManager %p, input flag %u\n",
+                *(int*)0x0062F85C, replay, th7_input_discard);
+        if ((unsigned int)(size_t)replay > 0x10000 && (unsigned int)(size_t)replay < 0x7F000000) {
+            unsigned char* data = *(unsigned char**)(replay + 4);
+            fprintf(file, "probe: data %p, frameId %d, replayInputs %p, fpsCursor %p\n", data,
+                    *(int*)replay, *(void**)(replay + 0x84), *(void**)(replay + 0xA4));
+            if ((unsigned int)(size_t)data > 0x10000 && (unsigned int)(size_t)data < 0x7F000000) {
+                for (int i = 0; i < 7; ++i) {
+                    unsigned char* in_data = *(unsigned char**)(data + 0x1C + i * 4);
+                    unsigned char* in_end = *(unsigned char**)(replay + 0x88 + i * 4);
+                    unsigned char* fps_data = *(unsigned char**)(data + 0x38 + i * 4);
+                    unsigned char* fps_end = *(unsigned char**)(replay + 0xA8 + i * 4);
+                    fprintf(file, "probe: stage %d inputs %p -> %p, fps %p -> %p\n", i,
+                            in_data, in_end, fps_data, fps_end);
+                }
+            }
+        }
+        // The three things that keep ReplayManager::OnUpdateRecord (0x442CD0) from recording
+        // (GameManager::notInMenu, the config's slowMode, Supervisor::timingBad), and the two menu
+        // flags GameManager::OnUpdate derives notInMenu from before returning CHAIN_CALLBACK_RESULT_BREAK
+        // (GameManager.cpp:204, 220..225)
+        fprintf(file, "probe: game flags %08x, supervisor flags %08x, cfg slowMode %u, "
+                      "slowActive %u, pause %u, retry %u\n",
+                *(unsigned int*)0x0062F648, *(unsigned int*)0x00575ADC,
+                (unsigned int)*(unsigned char*)(*(unsigned char**)0x00626274 + 0x25),
+                (unsigned int)*(unsigned char*)0x0062627D, (unsigned int)*(unsigned char*)0x0062F64C,
+                (unsigned int)*(unsigned char*)0x0062F64D);
+        fprintf(file, "probe: AddedCallbackRecord returned %u time(s), recorder entered %u time(s), "
+                      "chain elements ran %u (most %u)\n",
+                (unsigned int)th7_input_flag_set_count, (unsigned int)th7_input_consumer_count,
+                th7_last_update_count, th7_max_update_count);
+        // The calc chain as the frame walks it: priority, callback and argument of every element
+        // (CChainNode: priority +0, callback +4, next +0x14, arg +0x1C; g_Chain = 0x626218)
+        {
+            unsigned char* root = (unsigned char*)0x00626218;
+            unsigned char* node = *(unsigned char**)(root + 0x14);
+            for (int n = 0; n < 40; ++n) {
+                if (node == nullptr || node == root)
+                    break;
+                if ((size_t)node <= 0x10000 || (size_t)node >= 0x7F000000)
+                    break;
+                fprintf(file, "probe: calc %2d priority %2d callback %p arg %p\n", n,
+                        (int)*(short*)node, *(void**)(node + 4), *(void**)(node + 0x1C));
+                node = *(unsigned char**)(node + 0x14);
+            }
+        }
+    }
     double presents = 0.0;
     double first = 0.0;
     double last = 0.0;
