@@ -710,6 +710,164 @@ static void th6_shots_undo() {
     th6_moved_shot_count = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Frame interpolation, stage 1: the straight lasers
+// ---------------------------------------------------------------------------
+//
+// The enemy lasers live in the same manager as the bullets, in the 64 slots of BulletManager::lasers
+// at g_BulletManager+0xEC000 = 0x6921F8 (MAX_ENEMY_LASERS, sizeof(Laser) == 0x270; the update reaches
+// them with 0x415DF7 `add eax, 0EC000h` and walks them with 0x415E14 `add edx, 270h`, the draw with
+// 0x416521 and 0x41653E), with the flag that says a slot is in use at slot+0x258 (a 32 bit field,
+// tested at 0x415E2A and 0x416554).
+//
+// BulletManager_OnDraw draws them before the bullets: it takes the slot, checks that flag, and works
+// the sprite's position out of the laser's own geometry - the angle (slot+0x22C, fed to fsincos at
+// 0x41657A) and the two ends it spans between, startOffset (slot+0x230) and endOffset (slot+0x234):
+// the sprite is centred at startOffset + (endOffset - startOffset) / 2 (0x416586..0x4165A7, the 2.0f
+// being the constant at 0x46A44C) away from the laser's own position (slot+0x220, x and y - the draw
+// sets the sprite's z to 0 itself, so the laser's own z is not used) and the play field's corner is
+// not added to it. When startOffset < 16 or the laser has stopped moving that pass it draws the
+// glow at its base as well (BulletManager.cpp:1180-1215), which the draw works out of the same two
+// offsets and the width, so it follows whatever those fields say.
+//
+// The update grows the laser by moving those two (BulletManager_OnUpdate, 0x415E38..0x415EB8:
+// `endOffset += speed * the frame rate multiplier`, the speed being slot+0x240, and then
+// `startOffset = endOffset - startLength`, the length being slot+0x238, clamped to 0), and works the
+// length and width out into the sprite's own scale (slot+0x1C is scaleX = width / the sprite's width
+// in pixels, slot+0x18 is scaleY = the length / its height, 0x415F21..0x415F5A); the offsets the
+// draw reads are only ever read by the draw. So a laser is moved the way a bullet is, except that
+// what moves is measured rather than read out of a speed: the frame's own movement of each of the
+// fields the draw uses - the position's x and y, the angle, the two offsets and the sprite's two
+// scales - is measured over a frame, and the extras add their fraction of it before the pass and put
+// the fields back after it. That covers a laser that is still growing, one that has settled, one that
+// is turning and one that is despawning (which shrinks it in the width) without the extras having to
+// know which of those it is doing.
+//
+// A slot the game hands to a different laser between two samples is not projected across the jump,
+// the same guard the bullets and the shots have. While the game has time stopped the laser update
+// never runs either (the same return at the top of BulletManager_OnUpdate that freezes the bullets),
+// so the measured step of a frozen laser is zero and the extras leave it where it is.
+
+static const unsigned int th6_lasers_max = 64;                // MAX_ENEMY_LASERS
+static const unsigned int th6_laser_size = 0x270;             // sizeof(Laser)
+static const unsigned int th6_laser_array_offset = 0xEC000;   // from g_BulletManager
+static const unsigned int th6_laser_pos_offset = 0x220;       // three floats, x and y used
+static const unsigned int th6_laser_angle_offset = 0x22C;
+static const unsigned int th6_laser_start_offset_offset = 0x230;
+static const unsigned int th6_laser_end_offset_offset = 0x234;
+static const unsigned int th6_laser_in_use_offset = 0x258;    // 32 bit, non-zero while in use
+static const unsigned int th6_laser_scale_y_offset = 0x18;    // the sprite's length
+static const unsigned int th6_laser_scale_x_offset = 0x1C;    // the sprite's width
+
+// What is measured and projected per laser: its position, its angle, the two ends, and the two scales
+// the update worked the length and the width out into
+static const unsigned int th6_laser_fields = 7;
+
+static const float th6_lasers_max_step = 48.0f;
+
+static unsigned char* th6_laser_slot(unsigned int index) {
+    // g_BulletManager (0x005A5FF8) - the bullets are in the same manager, so that is the address
+    // named there as well
+    return th6_bullet_manager + th6_laser_array_offset + (size_t)index * th6_laser_size;
+}
+
+static void th6_laser_read(unsigned int index, float* values) {
+    const unsigned char* slot = th6_laser_slot(index);
+
+    values[0] = *(const float*)(slot + th6_laser_pos_offset);
+    values[1] = *(const float*)(slot + th6_laser_pos_offset + 4);
+    values[2] = *(const float*)(slot + th6_laser_angle_offset);
+    values[3] = *(const float*)(slot + th6_laser_start_offset_offset);
+    values[4] = *(const float*)(slot + th6_laser_end_offset_offset);
+    values[5] = *(const float*)(slot + th6_laser_scale_y_offset);
+    values[6] = *(const float*)(slot + th6_laser_scale_x_offset);
+}
+
+static float th6_lasers_last[th6_lasers_max][th6_laser_fields];
+static float th6_lasers_step[th6_lasers_max][th6_laser_fields];
+static bool th6_lasers_used_last[th6_lasers_max];
+
+static unsigned int th6_lasers_in_play;
+
+// Called once a frame, from the frame's own draw, next to th6_shots_measure
+static void th6_lasers_measure() {
+    th6_lasers_in_play = 0;
+
+    for (unsigned int i = 0; i < th6_lasers_max; ++i) {
+        const bool in_use = *(const unsigned int*)(th6_laser_slot(i) + th6_laser_in_use_offset) != 0;
+        float values[th6_laser_fields];
+        th6_laser_read(i, values);
+
+        const float step_x = values[0] - th6_lasers_last[i][0];
+        const float step_y = values[1] - th6_lasers_last[i][1];
+        const bool reused = (step_x * step_x + step_y * step_y) > th6_lasers_max_step * th6_lasers_max_step;
+
+        if (in_use)
+            ++th6_lasers_in_play;
+
+        for (unsigned int f = 0; f < th6_laser_fields; ++f) {
+            th6_lasers_step[i][f] = in_use && th6_lasers_used_last[i] && !reused
+                                        ? values[f] - th6_lasers_last[i][f]
+                                        : 0.0f;
+            th6_lasers_last[i][f] = values[f];
+        }
+        th6_lasers_used_last[i] = in_use;
+    }
+}
+
+static unsigned int th6_lasers_projected;
+static unsigned int th6_lasers_moved[th6_lasers_max];
+static float th6_lasers_saved[th6_lasers_max][th6_laser_fields];
+static unsigned int th6_lasers_moved_count;
+
+static void th6_lasers_advance(float t) {
+    th6_lasers_moved_count = 0;
+
+    for (unsigned int i = 0; i < th6_lasers_max; ++i) {
+        unsigned char* slot = th6_laser_slot(i);
+        if (*(const unsigned int*)(slot + th6_laser_in_use_offset) == 0)
+            continue;
+
+        float* fields[th6_laser_fields] = {
+            (float*)(slot + th6_laser_pos_offset),
+            (float*)(slot + th6_laser_pos_offset + 4),
+            (float*)(slot + th6_laser_angle_offset),
+            (float*)(slot + th6_laser_start_offset_offset),
+            (float*)(slot + th6_laser_end_offset_offset),
+            (float*)(slot + th6_laser_scale_y_offset),
+            (float*)(slot + th6_laser_scale_x_offset),
+        };
+
+        for (unsigned int f = 0; f < th6_laser_fields; ++f) {
+            th6_lasers_saved[th6_lasers_moved_count][f] = *fields[f];
+            *fields[f] = *fields[f] + th6_lasers_step[i][f] * t;
+        }
+        th6_lasers_moved[th6_lasers_moved_count] = i;
+        ++th6_lasers_moved_count;
+    }
+
+    th6_lasers_projected = th6_lasers_moved_count;
+}
+
+static void th6_lasers_undo() {
+    for (unsigned int n = 0; n < th6_lasers_moved_count; ++n) {
+        unsigned char* slot = th6_laser_slot(th6_lasers_moved[n]);
+        float* fields[th6_laser_fields] = {
+            (float*)(slot + th6_laser_pos_offset),
+            (float*)(slot + th6_laser_pos_offset + 4),
+            (float*)(slot + th6_laser_angle_offset),
+            (float*)(slot + th6_laser_start_offset_offset),
+            (float*)(slot + th6_laser_end_offset_offset),
+            (float*)(slot + th6_laser_scale_y_offset),
+            (float*)(slot + th6_laser_scale_x_offset),
+        };
+
+        for (unsigned int f = 0; f < th6_laser_fields; ++f)
+            *fields[f] = th6_lasers_saved[n][f];
+    }
+    th6_lasers_moved_count = 0;
+}
+
 // The state DrawFpsCounter (0x423F3F) works in. It is called from the draw chain, so every extra
 // presentation runs it once more, and this is what puts the game's accounting back the way its own
 // pass left it:
@@ -793,6 +951,7 @@ static void th6_begin_game_draw() {
     if (!th6_drew_frame) {
         th6_player_measure();
         th6_shots_measure();
+        th6_lasers_measure();
     }
 
     ToolState::WatchFrameReady(th6_tool_frame_address, th6_tool_draw_address);
@@ -839,6 +998,7 @@ static void th6_extra_presentation(float t) {
     th6_bullets_advance(t);
     th6_player_advance(t);
     th6_shots_advance(t);
+    th6_lasers_advance(t);
 
     // The game counts its own frame rate off this pass (see the comment above), so its state is put
     // back around it
@@ -850,6 +1010,7 @@ static void th6_extra_presentation(float t) {
     th6_bullets_undo();
     th6_player_undo();
     th6_shots_undo();
+    th6_lasers_undo();
 
     // Presented with the device's own Present, without the hooks other patches and tools put in front
     // of it (see d3d8_present_bypassing_hooks, the same thing th07, th08, th19 and th20 do): a tool's
@@ -936,6 +1097,10 @@ static void th6_diag_dump() {
     fprintf(file, "shots: %u in play (%u flying, %u exploding), %u projected forward "
                   "(last presentation)\n",
             th6_shots_in_play, th6_shots_flying, th6_shots_exploding, th6_shots_projected);
+    // The lasers (see their stage 1 comment above): their slots are in the same manager as the
+    // bullets, and the flag that says a slot is in use is the game's own
+    fprintf(file, "lasers: %u in play, %u projected forward (last presentation)\n",
+            th6_lasers_in_play, th6_lasers_projected);
     double presents = 0.0;
     double first = 0.0;
     double last = 0.0;
