@@ -7,6 +7,84 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-16
+
+### Added
+
+- **Touhou 7 gets frame interpolation** (`a9379ec`, `7659460`, `90eccee`, `c265bce`)
+
+  Perfect Cherry Blossom runs on the same earlier D3D8 engine as Imperishable Night, where a frame is
+  one GameWindow::Render (from 0x434718): window update, calculation chain (the patch hooks it at
+  0x4347DF and moves it ahead of the drawing), the drawing block, one present (0x434A0E / 0x434A18).
+  The extras have the shape stage 0 gave this engine: the render block runs once more after the game's
+  own present, spread over what is left of the frame.
+
+  What is in the game goes down one of two paths. The bullets have their own position moved
+  (`pos += velocity × the state's step`, the five step sizes being the ones Touhou 8 uses: 1, 1/2,
+  0.4, 1/3, 1/2 - and while time is stopped only the bullets that are already flying move). The
+  player, its two options and its own shots have no velocity to read - the options follow the player,
+  and its shots are placed onto an option or the player by their scripts - so these are measured the
+  way Touhou 8's are: their positions are sampled every frame, the extras move them by that step
+  times the extra's fraction of the frame, and everything is put back the moment the render is done.
+  A slot that jumps further than it could in a frame is dropped rather than moved, which is what keeps
+  a reused slot from showing up as a jump. The straight lasers are measured the same way (their
+  position, angle and two end offsets).
+
+  One more thing this game shares with Touhou 8: the extras have to be kept out of the frame rate
+  accounting in the draw chain (Supervisor::DrawFpsCounter, 0x4390A5, counts the passes), so
+  Th7FpsState is put back around every extra presentation and the game still reads 60. The menus and
+  the pause screen needed no change at all (AsciiManager::OnDrawMenus, 0x401970, draws its strings and
+  clears them inside the same pass), so that stage ended with no code behind it.
+
+- **New CalcFPS option: replace the frame rate the game measures for itself** (`7af4968`)
+
+  EoSD, PCB and IN add one to a counter every frame, divide it by the elapsed half second, and use
+  that reading to decide how much of the half second was lost; the lost part over the frames counted
+  is the processing rate the results screen shows and the value a replay records
+  (lagNumerator/lagDenominator in Touhou 8, framerateMultiplier/fpsAccumulator in Touhou 7,
+  unk1b4/unk1b8 in Touhou 6, both read by the results screen and by SaveReplay). One half second
+  window landing on a load or a scene change drags the whole run's reading with it, which is why a
+  short stage or time spent between stages shows a few percent. vpatch's CalcFPS=1 sidesteps that
+  measurement by taking the game's own frame rate function over, which is why a vpatched game reads
+  0.00% there. This adds the same option (default 1, as in vpatch), but hands the game the frame rate
+  the limiter measured for itself, so a machine that really drops frames still shows it instead of
+  being pinned at zero. The counting lives in Limiter::Tick, which is reached once per game frame and
+  never for an extra presentation, so the extras of frame interpolation can never end up in this
+  reading.
+
+### Fixed
+
+- **Saving a replay crashed: the input patch read an address where the game read a flag word** (`23c5b6a`)
+
+  The port of vpatch's input handling re-does the game's own "load the flags word into eax" at
+  0x442CD9 (PCB) and 0x452319 (IN) in inline asm, written as `mov eax, dword ptr [0062F648h]` - which
+  this compiler assembles as the number itself (`mov eax, 62F648h`, `B8 …` rather than the `A1 …`
+  load). The value handed to the game's own "am I in a stage" test was therefore a constant: in PCB
+  that constant has bit 2 clear, so the recorder's own test failed on every frame and it never
+  recorded anything. Nothing else writes the end pointers a stage's replay data is measured with,
+  and StopRecording only fixes the input pair up, never the fps one, so saving a replay sized the fps
+  block as `stageFpsDataPointers[i] - stageFpsData[i].data` - 0 minus 0x19082400 - and the `rep movs`
+  at 0x443FCA copied ~970 million dwords out of a 1 MiB buffer (the 0xC0000005 at 0x43FCA in the
+  event log). Imperishable Night has the same line, but its constant happens to have bit 2 set, so
+  there it only meant the game was told the wrong flags. Both now read the field in a C function
+  (th7_game_flags / th8_game_flags), and the note left in the source is the lesson: an absolute
+  address inside an inline asm memory operand is not a load with this compiler.
+
+- **Touhou 8's processing rate was being changed by the extra presentations** (`6a0916a`)
+
+  Supervisor::CalculateFps (0x446F53) is a draw chain callback, so each extra presentation ran it
+  once more, and the state put back around them was missing lagDenominator (0x17CE8EC): it is the
+  half that goes up 60.0 on every pass while the numerator only gets its share when a window closes,
+  so the ratio every reader divides was pushed about three times off. Touhou 7 never had this
+  because it saves the whole pair. Found by listing every absolute address that function stores to;
+  after the fix a dump taken in a stage reads "numerator 16080.00 denominator 16080.00 ratio 1.0000".
+
+- **Touhou 8's bullets: the time stop gate and the per state step sizes** (`538d885`): the projection
+  used one step size for every state and did not copy the game's own "while time is stopped only the
+  bullets that are flying stay still" (0x431490 reads g_GameManager.isTimeStopped). It now uses the
+  five step sizes 1, 1/2, 0.4, 1/3 and 1/2, and projects nothing for a bullet that is flying while
+  time is stopped; the same guard was added on Touhou 7's side (Sakuya's bomb).
+
 ## 2026-10-15
 
 ### Added

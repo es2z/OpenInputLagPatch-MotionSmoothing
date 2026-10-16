@@ -198,6 +198,7 @@ DebugWait = 0
 ;
 ; 默认 / Default: 1
 FixInputGlitching = 1
+CalcFPS = 1
 
 ; 游戏窗口失去焦点时继续渲染并呈现，切出去画面不会冻住（相当于 vpatch 的 AlwaysBlt）。
 ; 只对 th06 与 th07 实现。
