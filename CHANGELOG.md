@@ -7,6 +7,140 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-17
+
+### Added
+
+- **Touhou 6 gets frame interpolation** (`fecb43a`, `279518d`, `398e2ab`, `ca3331c`)
+
+  Embodiment of Scarlet Devil runs on the same earlier D3D8 engine as Perfect Cherry Blossom and
+  Imperishable Night, where a frame is one GameWindow::Render (0x4206E0): the window update, the
+  calculation chain (the patch hooks it at 0x420853 and moves it ahead of the drawing), the drawing
+  block (0x420720..0x420807) and one present (0x420A01 / 0x420A0B, both plain calls to the static
+  GameWindow_Present, 0x420B50). The extras have the shape th07 and th08 gave this engine: after the
+  game's own present, the render block runs once more, spread over what is left of the frame.
+
+  What took the work this time was making an extra presentation start from exactly the state the
+  frame's own pass started from. Four things turned up, all of them this engine's own traps (each
+  with its evidence in the source comments): the **frame rate accounting** (DrawFpsCounter, 0x423F3F,
+  adds one to a counter every pass and works the game's own frame rate out of it every half second,
+  accumulating it into unk1b4 / unk1b8 while the game is in a menu - the ratio of the two is the
+  processing rate the results screen shows and a replay records) has to be saved and put back around
+  every extra pass; the **AnmManager's whole set of current* caches** has to be forgotten, because
+  this game checks the texture *inside* the "the sprite changed" branch, so a sprite whose pointer
+  repeats skips the bind as well - and the game's own pass ends by setting the device's texture to
+  NULL, so the extras drew untextured white quads (which is what the first test saw as bullets and
+  lasers washed out); the **viewport and the camera** exist twice each and both copies have to be put
+  back (g_Supervisor.viewport is where the play field's viewport and the stage camera both come from,
+  g_Supervisor.viewMatrix / projectionMatrix are what Stage::RenderObjects culls and projects the
+  stage with while the device holds its own pair, and the pass rewrites both partway through); and the
+  **depth buffer** has to be cleared, because the calculation chain clears it once a frame and a pass
+  that runs after the frame's own one otherwise inherits its depth values - which hid the things a
+  pass draws first (the stage background, the circles drawn before an enemy's own sprite) behind the
+  HUD and the sprites drawn last, showing as those flashing at the presentation rate. With all four
+  in place the three presentations of a frame are identical.
+
+  The objects go down three paths: the **bullets** have their position moved directly,
+  `pos += velocity × the state's step × effectiveFramerateMultiplier` (steps 1, 1/2, 0.4, 1/3 and
+  1/2 - note the multiplier, which th07's bullets do not have); the **player, its two orbs and its
+  own shots** have no velocity to read and follow th08's measured way instead (the position is
+  sampled once a frame, the difference is the frame's step, and the extras move by a fraction of it
+  and put it back afterwards) - the shots are drawn from their sprite's own position rather than
+  their logical one, so only that is moved and the logical position is not touched at all; and the
+  **straight lasers** are measured the same way, over seven fields (position x and y, angle, both
+  offsets and the sprite's two scales), which covers a laser that is growing, thinning out, turning
+  or fading. The **orbs are this game's familiars**: they appear from power 8 on, a focus state
+  machine places them between "24 pixels out on each side" and "8 out, 32 up", and the shots with a
+  spawnPositionIdx fire out of them. The measurement of the player and the orbs carries a "a frame
+  cannot move this far" guard, because a death puts the player at the respawn point in one step of
+  several hundred pixels: without it the extra presentations of that frame drew the sprite on the way
+  down to it, which read as a flash just below the respawn point (confirmed fixed in game).
+
+  The menus' and the pause screen's text needed **no change** - the string list is drawn and emptied
+  inside the same pass, and the draw callbacks don't append to it (confirmed in game). The
+  diagnostics file (oilp_diag.txt) is the one the other games have, including the two lines that
+  check the object counts against the game's own counters.
+
+  Checked in game (180Hz, Interpolation = -1): three presentations per frame 5.56ms apart, 176 to 180
+  a second; the game's own frame rate still reads 60 with its effective frame rate multiplier at
+  1.0000; 352 of 352 bullets projected (the manager's own count reads 359, the difference being the
+  bullets the update turns off that frame); 30 shots in play (14 flying, 16 exploding) all projected;
+  8 of 8 lasers projected; death and respawn, the menus and the loading screen all normal. Not done,
+  as the requirements say: the enemies themselves and the curve lasers.
+
+- **`ShowOverlay` chooses which of the overlay's readouts are shown** (`500bafd`)
+
+  The overlay has two lines and they answer different questions: the **rate the frames are actually
+  presented at** (the one that matters while the interpolation is on) and the **render time line**
+  ("0.65/2.00ms": how long the game's own part of the frame took, and what BltPrepareTime is set to -
+  the line that option is tuned with). The value is now their sum - 0 neither (no overlay at all),
+  1 the rate, 2 the render time, 3 both - and the default is 1. Which readouts show is the setting's
+  business rather than the interpolation's, so it is decided once in Limiter::Initialize and the
+  per-game calls of th06 to th20 (on both the D3D8 and the D3D9 side) are gone.
+
+- **`Interpolation = 1` means "the display's own refresh rate" and is the default** (`500bafd`)
+
+  1 used to mean "x1", which is the same as switching the interpolation off, so nothing used it. What
+  the setting is for is how often a frame reaches the display, so 1 now asks for the display's own
+  rate: a 144hz display with 60fps logic is presented 144 times a second (2 and 3 presentations a
+  frame in turn, with the fraction carried from frame to frame). -1 is still the largest whole
+  multiple of the game's frame rate the display can show (120 on that same display, with evenly
+  spaced presentations), and N and *R are unchanged. The ini and the READMEs say so, and the default
+  is now 1.
+
+### Changed
+
+- **The interpolation's two pieces of arithmetic live in the limiter alone** (`500bafd`)
+
+  Limiter::PresentRate() (the presentation rate) and Limiter::ExtraPresentations() (how many extra
+  presentations a frame gets and how far apart) only depend on the presentation rate, the game's
+  frame rate and the current frame's length - nothing about any one game. When th07 and th08 moved
+  their copies of them into the limiter, the eleven copies th10 to th20 still had (a present-rate
+  function each, and an inline "presentations owed" loop each) were left in place; they are gone now,
+  all pointing at the shared ones. At the same time th10 to th20 gained the guard th06 to th08 have
+  had since their stage 0: while the target frame rate is above the display's (replay fast forward,
+  an external tool speeding the game up) and the patch is presenting every Nth frame, the extras are
+  skipped as well, instead of presenting anyway and undoing that thinning.
+
+### Fixed
+
+- **A D3D9 game with Interpolation = 1 did not interpolate at all** (`500bafd`)
+
+  Those eleven copies did not know the new meaning of 1 and treated it as "x1 = off" (falling into
+  `multiplier < 2` and returning 0), so no extra presentations were made and the overlay's rate
+  readout said 60. Merging them into the shared implementation fixed it - and is an example of what
+  leaving one game with its own copy of something costs.
+
+- **The frame rate CalcFPS hands the game no longer counts a stall as lost frame rate** (`c839ac8`)
+
+  With CalcFPS on, Touhou 6, 7 and 8 are given the limiter's own measured frame rate, and that was
+  worked out as "frames divided by the wall clock time of the window": a frame the game spends
+  stalled inside itself (loading a stage, a scene change) makes the window long while holding almost
+  no frames, so it read as a slow one and the game recorded a little lost frame rate - which is the
+  **processing rate** it shows on the results screen and records in a replay, a few percent instead
+  of the 0.00% vpatch's CalcFPS=1 gives. The window is now counted in frames, with a frame charged
+  for one frame's worth of time rather than for however long a stall made it, so a run that never
+  fell behind reads the rate it was paced at (0.00%) while a machine that genuinely cannot keep up
+  still reads low. Measured: the diagnostics went from 10308/10680 (+6.97%) before to the two numbers
+  being equal, and the results screen now reads 0.00%.
+
+- **The rate readout sits at the left edge on its own, and is not shown at all with the interpolation
+  off** (`500bafd`)
+
+  The rate used to be placed after the render time line unconditionally (`x = width of the text x 7 +
+  8`), which left a gap even when that line was not drawn; it is now at x = 0 when there is no line
+  before it. And since the rate only means something while frames really are presented more than once
+  per game frame, it is not shown with the interpolation off (the render time line is unaffected - it
+  is what BltPrepareTime is tuned with).
+
+Left to do: frame interpolation for Touhou 9 and 9.5, and the enemies and the curve lasers are out of
+scope as the requirements say. The D3D9 side has no Present hook of its own, so the "present every
+Nth frame" thinning itself does not apply to the D3D9 games (their extra presentations do skip it
+now); the D3D9 side also still forces D3DSWAPEFFECT_DISCARD and a back buffer count of 0 for D3D9
+titles, which is left alone until a game gives a reason. Known approximation on Touhou 6: the
+spellcard background's script is set up again by an extra pass, which can cost a frame of that
+background's animation.
+
 ## 2026-10-16
 
 ### Added

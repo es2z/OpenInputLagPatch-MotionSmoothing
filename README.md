@@ -69,12 +69,13 @@ GameFPS = 60
 ; 画出来之后再立刻还原，所以游戏自己的逻辑和随机数完全不受影响。这里没有保存上一帧、也没有做
 ; 反向插值——是单向的向前外推（extrapolation），不是常见的双向插值。
 ;
-; 目前对东方风神录（th10）、东方地灵殿（th11）、东方星莲船（th12）、东方神灵庙（th13）、东方辉针城（th14）、东方绀珠传（th15）、东方天空璋（th16）、东方鬼形兽（th17）、东方虹龙洞（th18）、东方兽王园（th19）与东方锦上京（th20）生效：子弹、自机本体（含子机与自机弹）、
-; 直线激光会被外推；敌人本体不做，曲线激光不做。开启 ShowOverlay 时，会在左下角「渲染耗时」
-; 那行字的右边显示实际的呈现帧率。
+; 目前对东方红魔乡（th06）、东方妖妖梦（th07）、东方永夜抄（th08）、东方风神录（th10）、东方地灵殿（th11）、东方星莲船（th12）、东方神灵庙（th13）、东方辉针城（th14）、东方绀珠传（th15）、
+; 东方天空璋（th16）、东方鬼形兽（th17）、东方虹龙洞（th18）、东方兽王园（th19）与东方锦上京（th20）生效：
+; 子弹、自机本体（含子机/option 与自机弹）、直线激光会被外推；敌人本体不做，曲线激光不做。
+; ShowOverlay 勾了「帧率」这一项时，会显示实际呈现率（每秒呈现多少次）。
 ;
-; 取值：0 关闭；-1 取显示屏刷新率里游戏帧率的最大整数倍；N 每游戏帧呈现 N 次；
-;       *R 按固定呈现率（例如 *144，小数部分会在帧与帧之间累计）。
+; 取值：0 关闭；1 补到显示屏刷新率（144hz 显示器就呈现 144fps，60fps 逻辑则是每帧 2/3 次交替）；-1 取显示屏刷新率里游戏帧率的最大整数倍（间隔最均匀）；
+;       N 每游戏帧呈现 N 次；*R 按固定呈现率（例如 *144，小数部分会在帧与帧之间累计）。
 ;
 ; Frame interpolation (motion smoothing): draws extra frames between the game's own ones, so the
 ; game stays at its own frame rate but is presented more often.
@@ -84,16 +85,18 @@ GameFPS = 60
 ; drawn, and put back again, so the game's own logic and its random numbers never see it. No
 ; previous frame is kept and nothing is interpolated backwards - this is forward extrapolation.
 ;
-; Touhou 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20 for now: their bullets, the player itself (with its options and its shots) and
-; the straight lasers are extrapolated; the enemies aren't interpolated and the curve lasers are
-; left alone. With ShowOverlay on, the rate the frames are actually presented at is shown next to
-; the render time line in the bottom left corner.
+; Touhou 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20 for now: their bullets, the
+; player itself (with its options or orbs and its shots) and the straight lasers are extrapolated;
+; the enemies aren't interpolated and the curve lasers are left alone. When ShowOverlay asks for the
+; rate readout, the rate the frames are actually presented at is shown as well.
 ;
-; 0: off, -1: pick the largest multiple of the game's frame rate the display can show,
+; 0: off, 1: present at the display's own refresh rate (a 144hz display shows 144fps, which for
+; 60fps logic is 2 and 3 presentations a frame alternating), -1: pick the largest whole multiple of
+; the game's frame rate the display can show (evenly spaced presentations),
 ; N: present N times per game frame, *R: present at R frames per second (e.g. *144)
 ;
-; 默认 / Default: -1
-Interpolation = -1
+; 默认 / Default: 1
+Interpolation = 1
 
 ; 是否允许控制 replay 回放速度（会覆盖游戏自带的回放速度控制，如果有的话）。
 ;
@@ -156,13 +159,22 @@ D3D9Ex = 1
 ; 默认 / Default: 2
 FullscreenRefreshRate = 2
 
-; 在画面左下角画一个小 overlay，显示游戏渲染这一帧花了多久，用来调 BltPrepareTime。
-; 补帧开启时，游戏区右边还会显示实际的呈现帧率（每秒呈现多少次；D3D8 作品——th06 到 th09.5——是显示在左下角那行渲染耗时的右边）。
+; 画补丁自己的小 overlay，两行读数可以分别开关（它们的和就是这个值）：
+;   0  都不显示（等于完全没有 overlay）
+;   1  「帧率」：实际呈现率（每秒呈现多少次）。只有补帧开着时才有意义，所以补帧关闭时这一项不显示
+;      （单独显示时它就贴在左下角）
+;   2  「延迟」：左下角那行渲染耗时（`0.65/2.00ms` = 游戏自己这一帧花了多久 / BltPrepareTime 的设定值，调 BltPrepareTime 就看它）
+;   3  两个都显示
 ;
-; Draws a small overlay in the bottom left of the screen showing how long it takes the game to
-; render; with the interpolation on, the rate the frames are actually presented at is shown at the
-; right edge of the play area as well (the D3D8 games, th06 to th09.5, show it to the right of the
-; render time line in the bottom left corner). Useful for tweaking BltPrepareTime.
+; Draws the patch's own little overlay; its two readouts are switched on separately (this value is
+; their sum):
+;   0  neither (no overlay at all)
+;   1  the rate readout: how many frames a second are actually presented. It only means something
+;      while the interpolation is on, so it isn't shown with the interpolation off (on its own it
+;      sits at the left edge)
+;   2  the render time line: "0.65/2.00ms", how long the game's own part of the frame took and what
+;      BltPrepareTime is set to (the line that setting is tuned with)
+;   3  both
 ;
 ; 默认 / Default: 1
 ShowOverlay = 1
@@ -303,7 +315,7 @@ CoverTaskbar = 0
 
 `Direct3DCreate9` 被钩住并改用 `Direct3DCreate9Ex`，从而可以使用 `IDirect3DDevice9Ex::SetMaximumFrameLatency`，再减少 0~2 帧输入延迟。**这个优化只对老的 blt 模型呈现有效**（原生 D3D9，或者用 d3d8to9 的场合）：装了 dgVoodoo2 之后游戏是通过 DXGI 的 flip 模型交换链呈现的，队列本身已经压到最短，这个优化无事可做——dgVoodoo2 的 flip 模型也正是它在实测中延迟最低的原因。
 
-补帧（`Interpolation`）把每一游戏帧呈现多次：游戏仍然按自己的帧率跑逻辑，补丁在游戏自己那次呈现之后、下一帧逻辑开始之前，把同一份状态再画几遍并呈现（60fps 的游戏在 180hz 上就是 0、半帧、一帧各呈现一次）。zun 的引擎把逻辑与绘制分开，所以重画同一份状态本身是安全的；要让额外帧里的画面确实在动，补丁在每次额外呈现之前把要动的物体按「速度 × 这一帧的几分之几」前移（和游戏自己的 `位置 += 速度` 同一套算法），画完立刻还原，游戏自己的逻辑永远看不到这些改动。额外呈现走的是设备自己的 `Present`，不经过 thprac 等工具替换掉的那个（它们按"一游戏帧一次呈现"来测输入延迟，多吃到额外呈现会让读数变成整帧的几分之一）；工具在这一帧已经建好的覆盖层会被重画进每次额外呈现，但不会重跑它的 UI 与输入代码（按住方向键不会在它菜单里连跳）。目前永夜抄（th08）与风神录（th10）、地灵殿（th11）、星莲船（th12）、神灵庙（th13）、辉针城（th14）、绀珠传（th15）、天空璋（th16）、鬼形兽（th17）、虹龙洞（th18）、兽王园（th19）与锦上京（th20）实现了补帧：子弹、自机本体（连同子机与自机弹，鬼形兽里还包括咆哮/hyper 的特效与特殊自机弹；虹龙洞的自机弹系统与 th17 不同，另外还包括能力卡在自机身上画的特效精灵，以及商店买卡界面的文字修复；兽王园是对战作品，两侧各有一套管理器，所以上面每一项都是两侧一起做的，它的自机弹也不在子弹管理器的那几条链上，和直线激光一样是按每帧量出来的位移外推的；锦上京跑的是同一套引擎但它是单人作，自机弹是自机自己池子里的 256 格（位置在格内 +0x50、精灵 id 在 +0x18），而且它的绘制位是更新期烘焙进精灵的，所以格内位置与精灵 +0x5BC 两处都写；它的文字管理器不在全局里，是在构造处抓下来的；永夜抄是更早那一代的引擎，自机/自机弹/子机的绘制位都是绘制期才从逻辑位写进精灵的，所以自机在"画它的那一句"上做、自机弹与子机改的是各自的源位置；子机的四个槽用的是运行时才挂上去的绘制回调，五队共用同一个绘制函数；自机弹、子机与直线激光的运动由脚本/跟随决定、没有速度字段可读，都是按每帧量出来的位移外推的）、直线激光都会在额外帧里前移，菜单/暂停这类界面的文字也不会被额外帧多画一遍（永夜抄的字符串表本来就是"画完即清"，天然不会重复）。敌人本体不做——它们的画面位置由动画脚本决定，没有能读出来的速度，与其按猜的做不如明确排除；曲线激光同样不做。
+补帧（`Interpolation`）把每一游戏帧呈现多次：游戏仍然按自己的帧率跑逻辑，补丁在游戏自己那次呈现之后、下一帧逻辑开始之前，把同一份状态再画几遍并呈现（60fps 的游戏在 180hz 上就是 0、半帧、一帧各呈现一次）。zun 的引擎把逻辑与绘制分开，所以重画同一份状态本身是安全的；要让额外帧里的画面确实在动，补丁在每次额外呈现之前把要动的物体按「速度 × 这一帧的几分之几」前移（和游戏自己的 `位置 += 速度` 同一套算法），画完立刻还原，游戏自己的逻辑永远看不到这些改动。额外呈现走的是设备自己的 `Present`，不经过 thprac 等工具替换掉的那个（它们按"一游戏帧一次呈现"来测输入延迟，多吃到额外呈现会让读数变成整帧的几分之一）；工具在这一帧已经建好的覆盖层会被重画进每次额外呈现，但不会重跑它的 UI 与输入代码（按住方向键不会在它菜单里连跳）。目前红魔乡（th06）、妖妖梦（th07）、永夜抄（th08）与风神录（th10）、地灵殿（th11）、星莲船（th12）、神灵庙（th13）、辉针城（th14）、绀珠传（th15）、天空璋（th16）、鬼形兽（th17）、虹龙洞（th18）、兽王园（th19）与锦上京（th20）实现了补帧：子弹、自机本体（连同子机与自机弹，鬼形兽里还包括咆哮/hyper 的特效与特殊自机弹；虹龙洞的自机弹系统与 th17 不同，另外还包括能力卡在自机身上画的特效精灵，以及商店买卡界面的文字修复；兽王园是对战作品，两侧各有一套管理器，所以上面每一项都是两侧一起做的，它的自机弹也不在子弹管理器的那几条链上，和直线激光一样是按每帧量出来的位移外推的；锦上京跑的是同一套引擎但它是单人作，自机弹是自机自己池子里的 256 格（位置在格内 +0x50、精灵 id 在 +0x18），而且它的绘制位是更新期烘焙进精灵的，所以格内位置与精灵 +0x5BC 两处都写；它的文字管理器不在全局里，是在构造处抓下来的；永夜抄是更早那一代的引擎，自机/自机弹/子机的绘制位都是绘制期才从逻辑位写进精灵的，所以自机在"画它的那一句"上做、自机弹与子机改的是各自的源位置；子机的四个槽用的是运行时才挂上去的绘制回调，五队共用同一个绘制函数；自机弹、子机与直线激光的运动由脚本/跟随决定、没有速度字段可读，都是按每帧量出来的位移外推的；红魔乡与它同代，有三处这个引擎特有的地方：它的自机弹画的是**精灵自己的位置**（逻辑位另有一份，额外帧只动精灵那份、逻辑位一个字节都不碰），它的自机带**两颗 orb**（火力 8 以上才出现，就是这一作的"子机"——由聚焦状态机摆位，自机弹也从它出发），而额外帧必须把这一趟开画时的**深度缓冲**一起还原（游戏的计算链每帧清一次 Z；不还原的话这一趟先画的东西会被上一趟后画的 HUD/本体用深度挡住，表现为魔法阵与背景局部闪烁），**摄像机也要还两份**（全局的 `viewMatrix`/`projectionMatrix` 是舞台裁剪与投影用的，设备上另有一份）；它的 AnmManager 还把贴图检查嵌在"精灵变了"那个分支里，所以额外帧开画前要作废**整套** current* 缓存（只作废贴图会画出没有贴图的白色方块））、直线激光都会在额外帧里前移，菜单/暂停这类界面的文字也不会被额外帧多画一遍（永夜抄的字符串表本来就是"画完即清"，天然不会重复）。敌人本体不做——它们的画面位置由动画脚本决定，没有能读出来的速度，与其按猜的做不如明确排除；曲线激光同样不做。
 
 最后，游戏自带的限帧器被禁用，改用大幅简化的 vpatch 限帧器。
 

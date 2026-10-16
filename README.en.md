@@ -65,12 +65,13 @@ GameFPS = 60
 ; 画出来之后再立刻还原，所以游戏自己的逻辑和随机数完全不受影响。这里没有保存上一帧、也没有做
 ; 反向插值——是单向的向前外推（extrapolation），不是常见的双向插值。
 ;
-; 目前对东方风神录（th10）、东方地灵殿（th11）、东方星莲船（th12）、东方神灵庙（th13）、东方辉针城（th14）、东方绀珠传（th15）、东方天空璋（th16）、东方鬼形兽（th17）、东方虹龙洞（th18）、东方兽王园（th19）与东方锦上京（th20）生效：子弹、自机本体（含子机与自机弹）、
-; 直线激光会被外推；敌人本体不做，曲线激光不做。开启 ShowOverlay 时，会在左下角「渲染耗时」
-; 那行字的右边显示实际的呈现帧率。
+; 目前对东方红魔乡（th06）、东方妖妖梦（th07）、东方永夜抄（th08）、东方风神录（th10）、东方地灵殿（th11）、东方星莲船（th12）、东方神灵庙（th13）、东方辉针城（th14）、东方绀珠传（th15）、
+; 东方天空璋（th16）、东方鬼形兽（th17）、东方虹龙洞（th18）、东方兽王园（th19）与东方锦上京（th20）生效：
+; 子弹、自机本体（含子机/option 与自机弹）、直线激光会被外推；敌人本体不做，曲线激光不做。
+; ShowOverlay 勾了「帧率」这一项时，会显示实际呈现率（每秒呈现多少次）。
 ;
-; 取值：0 关闭；-1 取显示屏刷新率里游戏帧率的最大整数倍；N 每游戏帧呈现 N 次；
-;       *R 按固定呈现率（例如 *144，小数部分会在帧与帧之间累计）。
+; 取值：0 关闭；1 补到显示屏刷新率（144hz 显示器就呈现 144fps，60fps 逻辑则是每帧 2/3 次交替）；-1 取显示屏刷新率里游戏帧率的最大整数倍（间隔最均匀）；
+;       N 每游戏帧呈现 N 次；*R 按固定呈现率（例如 *144，小数部分会在帧与帧之间累计）。
 ;
 ; Frame interpolation (motion smoothing): draws extra frames between the game's own ones, so the
 ; game stays at its own frame rate but is presented more often.
@@ -80,16 +81,18 @@ GameFPS = 60
 ; drawn, and put back again, so the game's own logic and its random numbers never see it. No
 ; previous frame is kept and nothing is interpolated backwards - this is forward extrapolation.
 ;
-; Touhou 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20 for now: their bullets, the player itself (with its options and its shots) and
-; the straight lasers are extrapolated; the enemies aren't interpolated and the curve lasers are
-; left alone. With ShowOverlay on, the rate the frames are actually presented at is shown next to
-; the render time line in the bottom left corner.
+; Touhou 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20 for now: their bullets, the
+; player itself (with its options or orbs and its shots) and the straight lasers are extrapolated;
+; the enemies aren't interpolated and the curve lasers are left alone. When ShowOverlay asks for the
+; rate readout, the rate the frames are actually presented at is shown as well.
 ;
-; 0: off, -1: pick the largest multiple of the game's frame rate the display can show,
+; 0: off, 1: present at the display's own refresh rate (a 144hz display shows 144fps, which for
+; 60fps logic is 2 and 3 presentations a frame alternating), -1: pick the largest whole multiple of
+; the game's frame rate the display can show (evenly spaced presentations),
 ; N: present N times per game frame, *R: present at R frames per second (e.g. *144)
 ;
-; 默认 / Default: -1
-Interpolation = -1
+; 默认 / Default: 1
+Interpolation = 1
 
 ; 是否允许控制 replay 回放速度（会覆盖游戏自带的回放速度控制，如果有的话）。
 ;
@@ -152,13 +155,22 @@ D3D9Ex = 1
 ; 默认 / Default: 2
 FullscreenRefreshRate = 2
 
-; 在画面左下角画一个小 overlay，显示游戏渲染这一帧花了多久，用来调 BltPrepareTime。
-; 补帧开启时，游戏区右边还会显示实际的呈现帧率（每秒呈现多少次；D3D8 作品——th06 到 th09.5——是显示在左下角那行渲染耗时的右边）。
+; 画补丁自己的小 overlay，两行读数可以分别开关（它们的和就是这个值）：
+;   0  都不显示（等于完全没有 overlay）
+;   1  「帧率」：实际呈现率（每秒呈现多少次）。只有补帧开着时才有意义，所以补帧关闭时这一项不显示
+;      （单独显示时它就贴在左下角）
+;   2  「延迟」：左下角那行渲染耗时（`0.65/2.00ms` = 游戏自己这一帧花了多久 / BltPrepareTime 的设定值，调 BltPrepareTime 就看它）
+;   3  两个都显示
 ;
-; Draws a small overlay in the bottom left of the screen showing how long it takes the game to
-; render; with the interpolation on, the rate the frames are actually presented at is shown at the
-; right edge of the play area as well (the D3D8 games, th06 to th09.5, show it to the right of the
-; render time line in the bottom left corner). Useful for tweaking BltPrepareTime.
+; Draws the patch's own little overlay; its two readouts are switched on separately (this value is
+; their sum):
+;   0  neither (no overlay at all)
+;   1  the rate readout: how many frames a second are actually presented. It only means something
+;      while the interpolation is on, so it isn't shown with the interpolation off (on its own it
+;      sits at the left edge)
+;   2  the render time line: "0.65/2.00ms", how long the game's own part of the frame took and what
+;      BltPrepareTime is set to (the line that setting is tuned with)
+;   3  both
 ;
 ; 默认 / Default: 1
 ShowOverlay = 1
@@ -298,7 +310,7 @@ CoverTaskbar = 0
 
 `Direct3DCreate9` is hooked to use `Direct3DCreate9Ex` instead, which allows the use of `IDirect3DDevice9Ex::SetMaximumFrameLatency`, which should shave off an additional 0 to 2 frames of input lag. **This only does anything for the old blt model presentation** (native D3D9, or D3D8 through d3d8to9): with dgVoodoo2 the game is presented through a DXGI flip model swapchain, whose queue is already as short as it gets, so there is nothing left for this to save - that flip model is also why dgVoodoo2 measures best for input lag.
 
-Frame interpolation (`Interpolation`) presents every game frame more than once: the game keeps running at its own frame rate, and the patch draws the same state again right after the game's own present, spreading the extra presentations over the rest of the frame (a 60fps game on a 180hz display gets one at 0, half a frame and one frame). ZUN's engine separates the logic from the rendering, so drawing the same state again is safe by itself; for the extra presentations to show motion, the patch moves what is on screen forward by "velocity × the fraction of a frame" before each of them - the same movement the game applies itself - and puts it back right after the render, so the game's own logic never sees the moved positions. The extras go through the device's own Present rather than the hooks tools put in front of it (which measure the input latency assuming one present per game frame, and would report a fraction of a frame with the extras), and the overlay a tool has already built is drawn into every one of them without running any of its UI or input code (holding a direction key won't skip through its menus). Touhou 8 and 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20 have this so far: their bullets, the player itself (with its options and its shots - in th17 that includes what the hyper draws, and in th18 what the player's ability cards draw around it; th19 is a versus game with one set of managers per side, so every one of the above is done for both sides there, and its own shots do not live on the bullet manager's chains at all, so they - like its lasers - are extrapolated from a step measured every frame; th20 runs on th19's engine but is a single player game, and its own shots live in a pool of 256 slots the player owns whose drawn position is baked into a sprite while they update, so both the slot and the sprite are moved; Touhou 8 is the earlier engine, where the player, its shots and the familiars only have their drawn position written into a sprite while that sprite is drawn, so the player is nudged at the call that draws it and the shots and familiars have their own positions moved instead; the familiars are four slots whose draw callback is set at runtime and shared by every team; and its shots, familiars and lasers have no velocity to read, so their steps are measured every frame too) and the straight lasers, and the menus' and the pause screen's text is not drawn twice by the extra presentations either (Touhou 8's string list is drawn and cleared inside the same pass, so it never could be). The enemies are not interpolated - their animation scripts place them and there is no velocity to read - and the curve lasers are left alone, as the requirements say.
+Frame interpolation (`Interpolation`) presents every game frame more than once: the game keeps running at its own frame rate, and the patch draws the same state again right after the game's own present, spreading the extra presentations over the rest of the frame (a 60fps game on a 180hz display gets one at 0, half a frame and one frame). ZUN's engine separates the logic from the rendering, so drawing the same state again is safe by itself; for the extra presentations to show motion, the patch moves what is on screen forward by "velocity × the fraction of a frame" before each of them - the same movement the game applies itself - and puts it back right after the render, so the game's own logic never sees the moved positions. The extras go through the device's own Present rather than the hooks tools put in front of it (which measure the input latency assuming one present per game frame, and would report a fraction of a frame with the extras), and the overlay a tool has already built is drawn into every one of them without running any of its UI or input code (holding a direction key won't skip through its menus). Touhou 6, 7, 8 and 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20 have this so far: their bullets, the player itself (with its options and its shots - in th17 that includes what the hyper draws, and in th18 what the player's ability cards draw around it; th19 is a versus game with one set of managers per side, so every one of the above is done for both sides there, and its own shots do not live on the bullet manager's chains at all, so they - like its lasers - are extrapolated from a step measured every frame; th20 runs on th19's engine but is a single player game, and its own shots live in a pool of 256 slots the player owns whose drawn position is baked into a sprite while they update, so both the slot and the sprite are moved; Touhou 8 is the earlier engine, where the player, its shots and the familiars only have their drawn position written into a sprite while that sprite is drawn, so the player is nudged at the call that draws it and the shots and familiars have their own positions moved instead; the familiars are four slots whose draw callback is set at runtime and shared by every team; and its shots, familiars and lasers have no velocity to read, so their steps are measured every frame too; Touhou 6 runs on that same engine with three things of its own: its own shots are drawn from the sprite's own position rather than the logical one (only the sprite's is moved, the logical position is not touched at all), its player carries two orbs (this game's familiars, shown from power 8 on and placed by a focus state machine, and the shots with a spawnPositionIdx fire out of them), and an extra presentation has to put the depth buffer back the way the frame's own pass found it - the calculation chain clears it once a frame, and without clearing it the things this pass draws first are hidden behind the depth the pass before it left, which showed as the background and the circles around an enemy flashing - along with both copies of the camera (the game's own, which the stage is culled and projected with, and the device's); its AnmManager also checks the texture cache inside the "the sprite changed" branch, so the whole set of current* caches is forgotten before an extra draws) and the straight lasers, and the menus' and the pause screen's text is not drawn twice by the extra presentations either (Touhou 8's string list is drawn and cleared inside the same pass, so it never could be). The enemies are not interpolated - their animation scripts place them and there is no velocity to read - and the curve lasers are left alone, as the requirements say.
 
 Finally, the in-game frame limiter is disabled and a heavily simplified version of vpatch's frame limiter is used.
 
