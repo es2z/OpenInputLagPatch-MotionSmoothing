@@ -167,10 +167,12 @@ std::vector<std::vector<const char*>> game_hashes{
 	// Touhou 19: Unfinished Dream of All Living Ghost v1.10c
 	{
 		"8918fb39d511c9906ef769c6dd2761e7cb44ded5b7c4c1cd99c8992d12c078e9", // v1.10c original
+		"fe8b1584420d3c2cca08d66f3ab54d0b7a0b383f18a2eae5b3c9607f67405b72", // v1.10c Steam release
 	},
 	// Touhou 20: Fossilized Wonders v1.00c
 	{
 		"e6c4371e214c95dd4dbcaaf6818c79c5e89881270f65b62b8c3c965b65851e2d", // v1.00c original
+		"b0b5847b5f6dc43d51535ed9903a85485547b27dc053587544aac0f148ea4eaf", // v1.00c Steam release
 	},
 };
 
