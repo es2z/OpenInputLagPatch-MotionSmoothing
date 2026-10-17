@@ -3,6 +3,7 @@
 # OpenInputLagPatch
 
 A **heavily work-in-progress** replacement for [vpatch](https://ux.getuploader.com/swmplv75e/), which fixes frame limiter and input lag issues in Touhou games.
+**Note: Many of the new features in this fork rely heavily on Vibe Coding, so the fork may contain more bad and terrible code and bugs than usual. But we really need feedback and suggestions for improvement, please upload them via GitHub Issues!**
 
 # Usage
 1. Compile as x86/Release

@@ -3,6 +3,7 @@
 # OpenInputLagPatch
 
 一个用于替代[Vpatch](https://ux.getuploader.com/swmplv75e/) 的补丁，目前仍处于**高度开发中**，用于修复东方系列作品的限帧与输入延迟问题。
+**注意：该fork的新增功能大量依赖于Vibe Coding，因此可能有更多代码史山和BUG，欢迎在issue提出改进意见和反馈BUG**
 
 # 使用
 
