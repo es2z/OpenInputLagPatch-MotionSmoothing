@@ -31,7 +31,8 @@ TouhouGame detect_game(wchar_t* game_path) {
 const wchar_t* game_to_steam_appid(TouhouGame game) {
 	switch (game) {
 	case TouhouGame::Th18: return L"1566410";
-	case TouhouGame::Th19: return L"2400340";
+	case TouhouGame::Th19:
+	case TouhouGame::Th19v100a: return L"2400340";
 	case TouhouGame::Th20: return L"3671710";
 	default: return nullptr;
 	}
