@@ -312,6 +312,24 @@ HRESULT __stdcall CreateDevice_hook(IDirect3D9* self, UINT Adapter, D3DDEVTYPE D
 	return 0;
 }
 
+// The game's folder can have a d3d9.dll of its own that doesn't export everything (Ju.N.Owen's on th19 only exports
+// Direct3DCreate9), and importing from it would make the patch fail to load. So these are looked up at runtime instead:
+// from the d3d9.dll the game uses if it has them, otherwise from the system's d3d9.dll
+static FARPROC get_d3d9_function(const char* name) {
+	auto loaded = GetModuleHandleW(L"d3d9.dll");
+	if (loaded) {
+		auto func = GetProcAddress(loaded, name);
+		if (func)
+			return func;
+	}
+
+	wchar_t path[MAX_PATH] = {};
+	GetSystemDirectoryW(path, MAX_PATH);
+	wcscat_s(path, L"\\d3d9.dll");
+	auto system_d3d9 = LoadLibraryW(path);
+	return system_d3d9 ? GetProcAddress(system_d3d9, name) : nullptr;
+}
+
 // Upgrades IDirect3D9 to IDirect3D9Ex
 IDirect3D9* WINAPI Direct3DCreate9_hook(UINT SDKVersion) {
 	printf("Direct3DCreate9 intercepted!\n");
@@ -321,11 +339,29 @@ IDirect3D9* WINAPI Direct3DCreate9_hook(UINT SDKVersion) {
 	WindowMode::AskIfNeeded();
 
 	if (Config::D3D9Ex) {
-		auto create_ret = Direct3DCreate9Ex(D3D_SDK_VERSION, (IDirect3D9Ex**)&d3d9);
+		// A d3d9.dll like that only gets to run its own code from its Direct3DCreate9 (Ju.N.Owen loads its modules
+		// from there), so it's still called to let it set itself up. The object it returns is deliberately not
+		// released, since it may hold on to it
+		auto loaded = GetModuleHandleW(L"d3d9.dll");
+		if (loaded && !GetProcAddress(loaded, "Direct3DCreate9Ex")) {
+			auto create = (decltype(&Direct3DCreate9))GetProcAddress(loaded, "Direct3DCreate9");
+			if (create) {
+				printf("d3d9.dll without Direct3DCreate9Ex detected, calling its Direct3DCreate9 first\n");
+				create(SDKVersion);
+			}
+		}
+
+		auto create_ex = (decltype(&Direct3DCreate9Ex))get_d3d9_function("Direct3DCreate9Ex");
+		if (!create_ex)
+			panic_msgbox(L"Couldn't find Direct3DCreate9Ex!");
+		auto create_ret = create_ex(D3D_SDK_VERSION, (IDirect3D9Ex**)&d3d9);
 		if (FAILED(create_ret) || d3d9 == nullptr)
 			panic_msgbox(L"Direct3DCreate9Ex failed!\nCode: 0x%x", create_ret);
 	} else {
-		d3d9 = Direct3DCreate9(D3D_SDK_VERSION);
+		auto create = (decltype(&Direct3DCreate9))get_d3d9_function("Direct3DCreate9");
+		if (!create)
+			panic_msgbox(L"Couldn't find Direct3DCreate9!");
+		d3d9 = create(D3D_SDK_VERSION);
 		if (d3d9 == nullptr)
 			panic_msgbox(L"Direct3DCreate9 failed!");
 	}
