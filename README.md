@@ -211,6 +211,31 @@ DebugWait = 0
 ;
 ; 默认 / Default: 1
 FixInputGlitching = 1
+
+; 是否接管游戏自己测量的帧率（相当于 vpatch 的 CalcFPS，默认同为 1）。
+;
+; 红魔乡 / 妖妖梦 / 永夜抄 每一帧给一个计数器 +1，每半秒用这段时间除一次，得到自己的帧率；
+; 这个读数决定它把那一秒里多少算作"丢掉的帧率"（结果画面显示的处理落ち率，以及录像里记的
+; 那个值，都是从这里算出来的）。只要有一个半秒窗口落在读盘 / 切换场景的卡顿上，这一局的
+; 处理落ち率就会被那一次拖住（所以短关卡、过场待得久都会看到几个百分点）。
+;
+; 打开后本补丁不再让游戏自己算：改用限帧器实测的帧率交给它（和 vpatch 的 CalcFPS=1 同一个
+; 思路），处理落ち率因此保持 0.00%、帧率文字也不再忽高忽低。关掉则完全按原版行为。
+;
+; Whether the patch should replace the frame rate the game measures for itself (vpatch's CalcFPS,
+; which also defaults to 1).
+;
+; EoSD / PCB / IN add one to a counter every frame, divide it by the elapsed half second, and use
+; that reading to decide how much of the half second they lost: it is where the processing rate on
+; the results screen and the value a replay records come from. One window landing on a load or a
+; scene change is enough to drag a whole run's reading with it, which is why short stages and time
+; spent between stages show up as a few percent.
+;
+; On, the patch measures the frame rate itself and hands the game that instead (the same idea as
+; vpatch's CalcFPS=1), so the processing rate stays 0.00% and the frame rate text stops wandering.
+; Off leaves the game to measure for itself.
+;
+; 默认 / Default: 1
 CalcFPS = 1
 
 ; 游戏窗口失去焦点时继续渲染并呈现，切出去画面不会冻住（相当于 vpatch 的 AlwaysBlt）。
