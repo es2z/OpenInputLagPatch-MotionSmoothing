@@ -92,8 +92,8 @@ GameFPS = 60
 ; the game's frame rate the display can show (evenly spaced presentations),
 ; N: present N times per game frame, *R: present at R frames per second (e.g. *144)
 ;
-; 默认 / Default: 1
-Interpolation = 1
+; 默认 / Default: 0
+Interpolation = 0
 
 ; 是否允许控制 replay 回放速度（会覆盖游戏自带的回放速度控制，如果有的话）。
 ;

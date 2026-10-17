@@ -16,7 +16,7 @@ BOOL Config::DebugConsole = FALSE;
 BOOL Config::DebugWait = FALSE;
 BOOL Config::FixInputGlitching = TRUE;
 BOOL Config::CalcFPS = TRUE;
-int Config::Interpolation = 1;
+int Config::Interpolation = 0;
 UINT Config::InterpolationFPS = 0;
 BOOL Config::AlwaysBlt = TRUE;
 TouhouGame Config::GameOverride = TouhouGame::Unknown;
@@ -75,7 +75,7 @@ bool Config::Load() {
 	// Frame interpolation: "0", "1", "-1", a multiplier, or "*<frame rate>"
 	{
 		wchar_t value[64] = {};
-		GetPrivateProfileStringW(TEXT("Option"), TEXT("Interpolation"), TEXT("1"), value, 64, config_path);
+		GetPrivateProfileStringW(TEXT("Option"), TEXT("Interpolation"), TEXT("0"), value, 64, config_path);
 		if (value[0] == L'*')
 			Config::InterpolationFPS = (UINT)_wtoi(value + 1);
 		else
