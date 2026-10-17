@@ -1,9 +1,21 @@
-简体中文 | [English](README.en.md)
+简体中文 | [English](README.en.md) | [日本語](README.ja.md)
 
 # OpenInputLagPatch
 
 一个用于替代[Vpatch](https://ux.getuploader.com/swmplv75e/) 的补丁，目前仍处于**高度开发中**，用于修复东方系列作品的限帧与输入延迟问题。
 **注意：该fork的新增功能大量依赖于Vibe Coding，因此可能有更多代码史山和BUG，欢迎在issue提出改进意见和反馈BUG**
+
+## 本 fork 的改动（v1.10.1）
+
+本仓库（[es2z/OpenInputLagPatch-MotionSmoothing](https://github.com/es2z/OpenInputLagPatch-MotionSmoothing)）基于
+[rmzmcx/OpenInputLagPatch-MotionSmoothing](https://github.com/rmzmcx/OpenInputLagPatch-MotionSmoothing) 的 v1.10，主要改动：
+
+- Steam 版的 th18、th19、th20 可以通过 `oilp_loader.exe` 使用（Steam 版 exe 带有 SteamStub 加密）。Steam 版请在 Steam 运行时使用。
+- 支持 th19 v1.00a（Steam 版）。v1.00a 不支持补帧。
+- th19 可以与 Ju.N.Owen（非官方联机工具，v1.0.1 / v1.1.0-beta.1 / v1.2.0）一起使用。装有 Ju.N.Owen 时补帧会被强制关闭；联机时请保持 `GameFPS = 60`。
+- 补帧（`Interpolation`）默认关闭。
+
+下载：[Releases](https://github.com/es2z/OpenInputLagPatch-MotionSmoothing/releases)
 
 # 使用
 

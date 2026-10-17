@@ -1,9 +1,21 @@
-[简体中文](README.md) | English
+[简体中文](README.md) | English | [日本語](README.ja.md)
 
 # OpenInputLagPatch
 
 A **heavily work-in-progress** replacement for [vpatch](https://ux.getuploader.com/swmplv75e/), which fixes frame limiter and input lag issues in Touhou games.
 **Note: Many of the new features in this fork rely heavily on Vibe Coding, so the fork may contain more bad and terrible code and bugs than usual. But we really need feedback and suggestions for improvement, please upload them via GitHub Issues!**
+
+## Changes in this fork (v1.10.1)
+
+This repository ([es2z/OpenInputLagPatch-MotionSmoothing](https://github.com/es2z/OpenInputLagPatch-MotionSmoothing)) is based on
+v1.10 of [rmzmcx/OpenInputLagPatch-MotionSmoothing](https://github.com/rmzmcx/OpenInputLagPatch-MotionSmoothing). The main changes:
+
+- The Steam releases of th18, th19 and th20 work through `oilp_loader.exe` (their executables are wrapped with SteamStub). Keep Steam running.
+- th19 v1.00a (Steam release) is supported. The frame interpolation isn't available on v1.00a.
+- th19 works together with Ju.N.Owen (the unofficial netplay tool, v1.0.1 / v1.1.0-beta.1 / v1.2.0). With Ju.N.Owen installed the frame interpolation is always off; keep `GameFPS = 60` for netplay.
+- The frame interpolation (`Interpolation`) is off by default.
+
+Downloads: [Releases](https://github.com/es2z/OpenInputLagPatch-MotionSmoothing/releases)
 
 # Usage
 1. Compile as x86/Release
