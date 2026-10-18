@@ -708,6 +708,14 @@ static void th15_text_records_restore() {
 
 // Remembers the viewport the scene is about to be drawn with, then lets the game's own render run
 // exactly as it always did (see th15_extra_presentation for what it's for)
+//
+// The screen shake: the game keeps the offset it shakes the picture by in the Float2 at 0x4E7E90 and
+// zeroes it inside its own draw pass, once it has been applied (the diagnostics showed it going from
+// the shake offset to 0 while the frame was drawn, and the picture an extra pass drew came out that
+// many pixels away from the one the game's own pass drew - the same pattern as th08's and th20's
+// shake). The value the game's pass started with is therefore put back around every extra pass.
+static float th15_shake_saved[2];
+
 static void th15_render_hook() {
 	IDirect3DDevice9* device = d3d9_hooked_device();
 	if (device != nullptr) {
@@ -723,6 +731,9 @@ static void th15_render_hook() {
 	// What the game's own run of the walk finds the text list at, for the extra presentations to put
 	// back (see th15_text_record_count)
 	th15_text_records_save();
+
+	th15_shake_saved[0] = *(float*)0x004E7E90;
+	th15_shake_saved[1] = *(float*)0x004E7E94;
 
 	th15_render_objects();
 }
@@ -844,7 +855,13 @@ static void th15_extra_presentation(float t) {
 	// The text list goes back to how the game's own run of the walk found it, so this presentation
 	// draws the same text that one drew (see th15_text_record_count above)
 	th15_text_records_restore();
+	// Put the shake back for this pass, and leave the value the game's own pass left afterwards
+	float shake_before[2] = { *(float*)0x004E7E90, *(float*)0x004E7E94 };
+	*(float*)0x004E7E90 = th15_shake_saved[0];
+	*(float*)0x004E7E94 = th15_shake_saved[1];
 	th15_render_objects();
+	*(float*)0x004E7E90 = shake_before[0];
+	*(float*)0x004E7E94 = shake_before[1];
 	th15_lasers_undo();
 	th15_player_undo();
 	th15_bullets_undo();

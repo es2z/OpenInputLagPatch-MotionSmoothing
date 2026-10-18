@@ -718,6 +718,14 @@ static void th14_text_records_restore() {
 
 // Remembers the viewport the scene is about to be drawn with, then lets the game's own render run
 // exactly as it always did (see th14_extra_presentation for what it's for)
+// The screen shake: the game keeps the offsets it shakes the picture by in two Float2s, at 0x4D93B8
+// (the background layers) and 0x4D9610, and zeroes them inside its own draw pass once they have been
+// applied (the diagnostics showed both going from their shake values to 0 while the frame was drawn,
+// and the picture an extra pass drew came out that many pixels away from the one the game's own pass
+// drew - the same pattern as th08's and th20's shake). The values the game's pass started with are
+// therefore put back around every extra pass.
+static float th14_shake_saved[4];
+
 static void th14_render_hook() {
 	IDirect3DDevice9* device = d3d9_hooked_device();
 	if (device != nullptr) {
@@ -733,6 +741,11 @@ static void th14_render_hook() {
 	// What the game's own run of the walk finds the text list at, for the extra presentations to put
 	// back (see th14_text_record_count)
 	th14_text_records_save();
+
+	th14_shake_saved[0] = *(float*)0x004D93B8;
+	th14_shake_saved[1] = *(float*)0x004D93BC;
+	th14_shake_saved[2] = *(float*)0x004D9610;
+	th14_shake_saved[3] = *(float*)0x004D9614;
 
 	th14_render_objects();
 }
@@ -853,7 +866,18 @@ static void th14_extra_presentation(float t) {
 	// The text list goes back to how the game's own run of the walk found it, so this presentation
 	// draws the same text that one drew (see th14_text_record_count above)
 	th14_text_records_restore();
+	// Put the shake back for this pass, and leave the values the game's own pass left afterwards
+	float shake_before[4] = { *(float*)0x004D93B8, *(float*)0x004D93BC,
+	                          *(float*)0x004D9610, *(float*)0x004D9614 };
+	*(float*)0x004D93B8 = th14_shake_saved[0];
+	*(float*)0x004D93BC = th14_shake_saved[1];
+	*(float*)0x004D9610 = th14_shake_saved[2];
+	*(float*)0x004D9614 = th14_shake_saved[3];
 	th14_render_objects();
+	*(float*)0x004D93B8 = shake_before[0];
+	*(float*)0x004D93BC = shake_before[1];
+	*(float*)0x004D9610 = shake_before[2];
+	*(float*)0x004D9614 = shake_before[3];
 	th14_lasers_undo();
 	th14_player_undo();
 	th14_bullets_undo();

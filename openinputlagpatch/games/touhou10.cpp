@@ -979,6 +979,12 @@ static void th10_reset_sprite_queue() {
 
 // Remembers what the scene is drawn with, then lets the game's own render run exactly as it always
 // did (see th10_extra_presentation for what it's for)
+// The camera state the stage draws with: 0x491EE0..0x491F58 holds the position the background camera
+// is built from and the scales that go with it, and 0x491DA0..0x491F60 covers the whole block the
+// draw pass touches around it (see the comment in the hook).
+static unsigned char th10_shake_block[0x1C0];
+static const unsigned int th10_shake_block_address = 0x00491DA0;
+
 static int __stdcall th10_render_hook(void* scene) {
 	IDirect3DDevice9* device = th10_device();
 	if (device != nullptr) {
@@ -999,6 +1005,13 @@ static int __stdcall th10_render_hook(void* scene) {
 	// What the game's own run of the walk finds the text lists at, for the extra presentations to
 	// put back (see th10_text_records)
 	th10_text_records_save();
+
+	// The screen shake in this game moves the stage's own camera: the values that make it up (the
+	// -320/240/1515.3 position and the 4.735/6.314 scales the diagnostics saw) are reset to 0 inside
+	// the draw pass once it is done with them, and an extra pass that starts from the reset block
+	// draws the background through another camera. The block is taken where the game's own pass
+	// starts and put back around every extra pass, the same rule the viewport and the matrices follow.
+	memcpy(th10_shake_block, (const void*)th10_shake_block_address, sizeof(th10_shake_block));
 
 	return th10_render_objects(scene);
 }
@@ -1140,8 +1153,14 @@ static void th10_extra_presentation(IDirect3DDevice9* device, float t) {
 	th10_lasers_advance(t);
 	// Nothing to render into an empty scene, and the walk itself would read the object it is handed
 	void* scene = *th10_scene;
-	if (scene != nullptr)
+	if (scene != nullptr) {
+		// Put the camera block back for this pass, and leave what the game's own pass left afterwards
+		unsigned char shake_before[sizeof(th10_shake_block)];
+		memcpy(shake_before, (const void*)th10_shake_block_address, sizeof(th10_shake_block));
+		memcpy((void*)th10_shake_block_address, th10_shake_block, sizeof(th10_shake_block));
 		th10_render_objects(scene);
+		memcpy((void*)th10_shake_block_address, shake_before, sizeof(shake_before));
+	}
 	th10_lasers_undo();
 	th10_undo_shifts();
 	th10_bullets_undo();
