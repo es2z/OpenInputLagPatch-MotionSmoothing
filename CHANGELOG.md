@@ -7,6 +7,39 @@ Changes made on top of upstream [OpenInputLagPatch](https://github.com/khang06/O
 Only changes that have been tested in-game and confirmed working are listed here, so this file
 is also the record of what has actually been verified rather than just what was attempted.
 
+## 2026-10-18
+
+### Fixed
+
+- **The screen shake stays in the extra presentations** (`9786d72`, `13eaa9c`, `8f150b0`)
+
+  Eleven games set a screen shake in their calculation chain, read it while drawing and clear it
+  *inside* their own draw pass. That is correct for a game that draws once per frame, but an extra
+  presentation starts from the cleared value, so a frame presented three times showed one shaken
+  picture and two still ones and the shake read as a fraction of its amplitude (clearest in th11,
+  th13 and th15 to th18). The value the game's own pass started with is now put back around every
+  extra pass, and the value that pass left is restored afterwards: th08's
+  AnmManager::screenShakeOffset at 0x1C, th10's 0x491E64, th11's 0x4C379C, th12's 0x4CEE04, th13's
+  0x4DCBE8, th14's 0x4D93B8 and 0x4D9610, th15's 0x4E7E90, th16's 0x4C1788, th17's 0x4B6198,
+  th18's 0x4CD574 and th20's two background-layer pairs. Each one was found by comparing the
+  vertices the game's own pass and an extra pass hand to the device and diffing the writable data,
+  then checked against the game's own code (the function that writes it, the drawing paths that read
+  it and the place that clears it). th06 needs nothing (its shake moves the play field rectangle,
+  which the draw pass never clears) and th19 needs nothing either (its shake is set in the update
+  and only cleared when a scene is set up).
+
+- **Touhou 7's stage transition pictures are no longer black** (`9786d72`)
+
+  The picture that shrinks into the corner at the end of a stage and the quads that scatter on the
+  results screen are both drawn from a screenshot the game takes itself - and it takes it after its
+  own present, out of the back buffer. That works because it draws *before* running the calculation
+  chain, so the buffer still holds the last frame the player saw; this patch has to run the
+  calculation chain first, so the same request was spent after the stage-clear background had filled
+  the screen and the screenshot came back black. The pending screenshot is now taken right after the
+  calculation chain and before the frame's draw, which is the same image the game would have taken.
+  The extra passes also put back both copies of the view and projection matrices, so they start from
+  the state the game's own pass started from.
+
 ## 2026-10-17
 
 ### Added

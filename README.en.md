@@ -340,6 +340,10 @@ Frame interpolation (`Interpolation`) presents every game frame more than once: 
 
 Finally, the in-game frame limiter is disabled and a heavily simplified version of vpatch's frame limiter is used.
 
+# Known issues
+
+- During stage transitions the background fade in/out animation can look faster than it should; the game itself still runs at its own speed.
+
 # TODO
 - Support more games
 - fix bugs and add more features
