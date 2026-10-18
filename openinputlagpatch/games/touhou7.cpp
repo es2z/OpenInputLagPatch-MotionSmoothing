@@ -29,6 +29,7 @@ static unsigned int th7_last_update_count;
 static unsigned int th7_max_update_count;
 static void th7_begin_game_draw();
 static void th7_draw_pass();
+static void th7_take_pending_screenshot();
 static void th7_player_measure();
 static void th7_shots_measure();
 static void th7_lasers_measure();
@@ -38,6 +39,12 @@ int __fastcall th7_update_calc_chain_hook() {
 	Limiter::Tick();
 
     auto ret = CChainManager__UpdateCalcChain(CChainManager::Instance);
+
+    // A screenshot the calculation chain just asked for is of the frame that is on screen now, which
+    // is the one drawn last (see the comment on th7_take_pending_screenshot below): take it before
+    // this frame's draw replaces it, the way the game's own draw-then-calculate order did
+    th7_take_pending_screenshot();
+
     if (th7_interpolating) {
         // TEMPORARY PROBE (how many elements the chain walk ran, and the most it ever ran)
         if ((unsigned int)ret < 0x1000) {
@@ -406,10 +413,26 @@ static void th7_draw_pass() {
 // The view and projection matrices are put back as well, off the device like the viewport (the
 // device's own viewport is the full screen one the game sets at 0x434799..0x4347D4 before the
 // calculation chain)).
+//
+// The matrices exist twice, and both have to be put back. g_Supervisor.viewMatrix /
+// projectionMatrix (0x575998 / 0x5759D8) are what the *drawing* projects with:
+// AnmManager::CalcProjectedTransform (0x4501A0) hands them to D3DXVec3Project for every
+// DrawProjected quad (AnmManager.cpp:1349..1366) - which is how the picture that shrinks into the
+// corner at the end of a stage is drawn - and Stage::RenderObjects culls and places the stage with
+// them (0x407CDE..0x407DA4 push all three globals). They are rewritten during a pass: by
+// GameManager::SetupCamera from the calculation chain, and by
+// GameManager::SetupCameraStageBackground from Stage_OnDrawLowPrio. A pass that only restores the
+// device's copies therefore project with the camera the last pass *ended* with, which is not the one
+// the pass it repeats started with whenever the calculation chain changes the camera between frames
+// (a stage transition does). Restoring both copies is the same rule the viewport and the offset
+// follow: an extra presentation starts from the state the game's own pass started from. (th06 needs
+// the same and has it; th08 sets both globals once in main.cpp:729 and never again, so it does not.)
 static D3DVIEWPORT8 th7_scene_device_viewport = {};
 static D3DVIEWPORT8 th7_scene_game_viewport = {};
 static D3DMATRIX th7_scene_view = {};
 static D3DMATRIX th7_scene_projection = {};
+static D3DMATRIX th7_scene_game_view = {};
+static D3DMATRIX th7_scene_game_projection = {};
 static bool th7_scene_captured = false;
 static bool th7_scene_transforms = false;
 static float th7_scene_offset[2] = {};
@@ -417,6 +440,8 @@ static unsigned char th7_scene_camera_mode = 0;
 
 // g_Supervisor.viewport, and the AnmManager fields above
 static D3DVIEWPORT8* th7_game_viewport = (D3DVIEWPORT8*)0x00575A18;
+static D3DMATRIX* th7_game_view_matrix = (D3DMATRIX*)0x00575998;
+static D3DMATRIX* th7_game_projection_matrix = (D3DMATRIX*)0x005759D8;
 static const unsigned int th7_anm_offset = 0x18;
 static const unsigned int th7_anm_camera_mode = 0x2E4D4;
 
@@ -442,6 +467,8 @@ static void th7_begin_game_draw() {
 
     // The state that is not on the device (see above)
     th7_scene_game_viewport = *th7_game_viewport;
+    th7_scene_game_view = *th7_game_view_matrix;
+    th7_scene_game_projection = *th7_game_projection_matrix;
 
     void* manager = *CTextureManager::InstancePtr;
     if (manager != nullptr) {
@@ -1020,6 +1047,9 @@ static void th7_extra_presentation(float t) {
     // the game's own drawing reads as well as the one the device has, and the manager's own state
     if (th7_scene_captured) {
         *th7_game_viewport = th7_scene_game_viewport;
+        // Both copies of the camera: the game's own, which the drawing projects with, and the device's
+        *th7_game_view_matrix = th7_scene_game_view;
+        *th7_game_projection_matrix = th7_scene_game_projection;
         device->SetViewport(&th7_scene_device_viewport);
         if (th7_scene_transforms) {
             device->SetTransform(D3DTS_VIEW, &th7_scene_view);
@@ -1073,6 +1103,7 @@ static void th7_extra_presentation(float t) {
 // Diagnostics: press U to write the presentation timing of the last frames to oilp_diag.txt (the
 // same file name and ring buffer shape the th08 to th20 diagnostics use)
 static const unsigned int th7_diag_frames_max = 300;
+
 static const unsigned int th7_diag_presents_max = 8;
 struct Th7DiagFrame {
     LARGE_INTEGER base;                                 // the game's own present of the frame
@@ -1217,6 +1248,51 @@ static void th7_diag_dump() {
     printf("Wrote oilp_diag.txt\n");
 }
 
+// Where the game asks for a screenshot, and where it has to be taken now.
+//
+// Gui::UpdateStageElements (the calculation chain) only *requests* one: CreateScreenshotTexture
+// (AnmManager.hpp:491) sets screenshotTextureId = 4 and the destination rectangle. The copy happens
+// in AnmManager::TakeScreenshotIfRequested (0x433F90), which GameWindow::Present calls *after* the
+// device's Present (0x4345DF presents, 0x43461C takes the screenshot) and which reads the play
+// field's rectangle back out of the back buffer (AnmManager::TakeScreenshot, 0x454E10).
+//
+// That is the right moment for the game as it was written, because of the order it draws in: a
+// frame's draw pass comes first, using the state the calculation chain left the frame before, and
+// the calculation chain that can change what is on screen runs after it (GameWindow::Render,
+// 0x434700..0x4347E6: RunDrawChain then RunCalcChain). A transition is switched on inside that
+// calculation chain, so at the end of the frame the back buffer still holds the frame drawn *before*
+// the switch - the last frame the player saw - and that is what the screenshot is supposed to be.
+//
+// This patch has to run the calculation chain before the draw (that is where the input lag it takes
+// out comes from), so the same request is now spent at the end of a frame whose draw already shows
+// the new state. For a stage transition that state is the stage clear background filling the screen,
+// so the capture came back black: texture 4 is what both the picture that shrinks into the corner at
+// the end of a stage and the quads that scatter on the results screen are drawn from, and both were
+// black. Nothing was wrong with the camera or with how the extras draw - the dgVoodoo2 read-back
+// (D3D8.dll, PresentationModel = flip_discard) had been an easy suspect but the back buffer read
+// black *before* Present too.
+//
+// The frame that was on screen when the request was made is the one still in the back buffer at the
+// point right after the calculation chain and before this frame's draw - the same image the game
+// would have captured, one pass earlier. So that is where the game's own
+// TakeScreenshotIfRequested is called from now; the call inside Present then finds the request
+// already spent and does nothing. The copy, the source rectangle, the destination rectangle and the
+// "request spent" flag all stay the game's own.
+static auto th7_game_take_screenshot = (void(__fastcall*)(void*, void*))0x00433F90; // thiscall(ecx)
+static const unsigned int th7_screenshot_texture_id_offset = 0x17E53C;
+
+static bool th7_screenshot_pending() {
+    void* manager = *CTextureManager::InstancePtr;
+    return manager != nullptr &&
+           *(int*)((char*)manager + th7_screenshot_texture_id_offset) >= 0;
+}
+
+static void th7_take_pending_screenshot() {
+    if (!th7_screenshot_pending())
+        return;
+    th7_game_take_screenshot(*CTextureManager::InstancePtr, nullptr);
+}
+
 // Presents the frame the game just drew, and then the extra presentations the config asked for.
 // The game calls this from the two exits of GameWindow::Render (0x434A0E and 0x434A18); both are
 // plain calls to the static GameWindow::Present (0x4345C0), which takes no arguments.
@@ -1227,9 +1303,8 @@ static void th7_present_hook() {
     LARGE_INTEGER base;
     QueryPerformanceCounter(&base);
 
-    // The game's own presentation of this frame, exactly as it always ran it. The back buffer
-    // read-back its snapshot key does happens inside it, before any of the extras below draw over
-    // it.
+    // The game's own presentation of this frame, exactly as it always ran it. A screenshot it asked
+    // for was already taken, before this frame's draw (see th7_take_pending_screenshot).
     th7_game_present();
 
     // The game's own work of this frame ends here as far as the overlay is concerned: everything

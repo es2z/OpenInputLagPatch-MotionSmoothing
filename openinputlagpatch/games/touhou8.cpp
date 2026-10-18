@@ -230,6 +230,22 @@ static D3DMATRIX th8_scene_view = {};
 static D3DMATRIX th8_scene_projection = {};
 static bool th8_scene_transforms = false;
 
+// The screen shake, AnmManager::screenShakeOffset (a Float2 at AnmManager+0x1C, written by
+// ScreenEffect::CalcShake 0x45BDC0 and read by every 2D draw, AnmManager.cpp:995..1002), taken the
+// same way and for the same reason.
+//
+// It is set in the calculation chain and cleared *inside* the draw pass: the HUD's ascii pass zeroes
+// it once the game has drawn everything it is meant to shake (AsciiManager.cpp:1773). So by the time
+// the game's own pass ends the value is gone, and an extra pass that does not put it back draws the
+// play field, the bullets, the enemies and the player without any shake at all. With three
+// presentations per frame that is one shaken picture and two still ones, which reads as the shake
+// having a third of its amplitude - exactly how the th08 screen shake was reported as weakened.
+//
+// th06 needs nothing like this: its ScreenEffect_ShakeScreen moves the play field's own rectangle
+// (GameManager::gameRegionScreenPos), which the draw pass never clears. th07 has the same pattern as
+// this game and already puts its AnmManager offset back (games/touhou7.cpp, th7_scene_offset).
+static float th8_scene_shake[2] = {};
+
 // Whether the game drew this frame (see the frame skip note above)
 static bool th8_drew_frame = false;
 
@@ -947,6 +963,12 @@ static void __fastcall th8_render_hook(void* chain) {
                                SUCCEEDED(device->GetTransform(D3DTS_PROJECTION, &th8_scene_projection));
     }
 
+    // The screen shake this pass is about to draw with (see th8_scene_shake)
+    if (*th8_anm_manager != nullptr) {
+        th8_scene_shake[0] = *(float*)((char*)*th8_anm_manager + 0x1C);
+        th8_scene_shake[1] = *(float*)((char*)*th8_anm_manager + 0x20);
+    }
+
     ToolState::WatchFrameReady(th8_tool_frame_address, th8_tool_draw_address);
 
     // The frame's own pass (the extras run this hook as well, and their positions are the same ones
@@ -982,6 +1004,13 @@ static void th8_extra_presentation(float t) {
     }
     if (th8_scene_viewport.Width != 0)
         device->SetViewport(&th8_scene_viewport);
+
+    // The shake the frame's own pass drew with (the HUD pass zeroed it before that pass ended - see
+    // th8_scene_shake)
+    if (*th8_anm_manager != nullptr) {
+        *(float*)((char*)*th8_anm_manager + 0x1C) = th8_scene_shake[0];
+        *(float*)((char*)*th8_anm_manager + 0x20) = th8_scene_shake[1];
+    }
 
     // The block itself, in the order the game runs it (0x441FC8..0x442022)
     th8_clear_vertex_buffer(*th8_anm_manager);

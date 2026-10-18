@@ -1,6 +1,7 @@
 // Touhou 20: Fossilized Wonders v1.00c
 
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include "patch_util.h"
 #include "limiter.h"
@@ -303,6 +304,46 @@ static unsigned int th20_text_records_end;    // ...and what the whole frame lef
 static unsigned int th20_text_count();
 static void th20_text_records_save();
 
+// ---------------------------------------------------------------------------
+// The screen shake
+// ---------------------------------------------------------------------------
+// The game shakes the screen by adding a pair of offsets to what the stage's background layers draw
+// with: two Float2s, one per layer, at 0xE950E4 and 0xE95250. They were found by diffing the
+// process's writable data around a shaking spell - each pair goes from (+-6,+-6) to (0,0) inside the
+// game's own draw pass, and the first vertex of the sprite queue moves by exactly that much in the
+// pass that loses it.
+//
+// The clear is deliberate on the game's part: a pass applies the offset and then zeroes it, so the
+// next pass does not apply it twice. That is fine for a game that draws once per frame, but an extra
+// presentation starts from the cleared value and draws the frame without any shake - one shaken
+// picture and two still ones per frame, which is what made the shake read as weaker.
+//
+// The values are therefore taken where the game's own pass starts and put back around every extra
+// pass, the same way th08's AnmManager::screenShakeOffset is handled (games/touhou8.cpp,
+// th8_scene_shake). They are plain struct fields in the object heap, so there is no vtable in front
+// of them to walk from; the addresses are checked before use (committed, writable, small finite
+// values) and nothing is written when they do not look right, so a build where the layout moved
+// loses the shake instead of corrupting something.
+static float* const th20_shake_fields[4] = {
+	(float*)0x00E950E4, (float*)0x00E950E8, (float*)0x00E95250, (float*)0x00E95254,
+};
+static float th20_scene_shake_fields[4];
+static bool th20_shake_fields_ok;
+
+static bool th20_shake_fields_readable() {
+	for (int i = 0; i < 4; ++i) {
+		MEMORY_BASIC_INFORMATION info = {};
+		if (VirtualQuery(th20_shake_fields[i], &info, sizeof(info)) != sizeof(info))
+			return false;
+		if (info.State != MEM_COMMIT || (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) == 0)
+			return false;
+		const float value = *th20_shake_fields[i];
+		if (!(value > -100.0f && value < 100.0f))
+			return false;
+	}
+	return true;
+}
+
 // Remembers what the scene is about to be drawn with, then lets the game's own render run exactly
 // as it always did
 static void __fastcall th20_render_hook(void* scene) {
@@ -321,6 +362,11 @@ static void __fastcall th20_render_hook(void* scene) {
 	// what it holds once that pass has run - the extra presentations put the first back and have to
 	// come out at the second (see the menus' text above)
 	th20_text_records_save();
+	// The shake the game's own pass is about to apply and clear (see the screen shake comment above)
+	th20_shake_fields_ok = th20_shake_fields_readable();
+	if (th20_shake_fields_ok)
+		for (int i = 0; i < 4; ++i)
+			th20_scene_shake_fields[i] = *th20_shake_fields[i];
 	th20_render_objects(scene);
 	th20_text_records_after = th20_text_count();
 }
@@ -1316,7 +1362,19 @@ static void th20_extra_presentation(float t) {
 	// The text list goes back to how the game's own pass of the walk found it, so this
 	// presentation appends its records where that pass put its own and draws the same text it drew
 	th20_text_records_restore();
+	// Put the shake back around this pass, so it draws the same offset the game's own pass did, and
+	// leave the value that pass left behind afterwards (see the screen shake comment above)
+	float shake_before[4];
+	if (th20_shake_fields_ok) {
+		for (int i = 0; i < 4; ++i) {
+			shake_before[i] = *th20_shake_fields[i];
+			*th20_shake_fields[i] = th20_scene_shake_fields[i];
+		}
+	}
 	th20_render_objects(*th20_scene);
+	if (th20_shake_fields_ok)
+		for (int i = 0; i < 4; ++i)
+			*th20_shake_fields[i] = shake_before[i];
 	th20_lasers_undo();
 	th20_shots_undo();
 	th20_player_undo();
