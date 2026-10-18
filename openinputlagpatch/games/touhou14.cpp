@@ -4,6 +4,7 @@
 #include "patch_util.h"
 #include "limiter.h"
 #include "d3d9_hook.h"
+#include "extra_state.h"
 #include "config.h"
 #include "overlay.h"
 #include "tool_state.h"
@@ -724,7 +725,8 @@ static void th14_text_records_restore() {
 // and the picture an extra pass drew came out that many pixels away from the one the game's own pass
 // drew - the same pattern as th08's and th20's shake). The values the game's pass started with are
 // therefore put back around every extra pass.
-static float th14_shake_saved[4];
+static ExtraFloatState th14_shake_back = { (float*)0x004D93B8, 2 };
+static ExtraFloatState th14_shake_front = { (float*)0x004D9610, 2 };
 
 static void th14_render_hook() {
 	IDirect3DDevice9* device = d3d9_hooked_device();
@@ -742,10 +744,8 @@ static void th14_render_hook() {
 	// back (see th14_text_record_count)
 	th14_text_records_save();
 
-	th14_shake_saved[0] = *(float*)0x004D93B8;
-	th14_shake_saved[1] = *(float*)0x004D93BC;
-	th14_shake_saved[2] = *(float*)0x004D9610;
-	th14_shake_saved[3] = *(float*)0x004D9614;
+	extra_float_state_save(&th14_shake_back);
+	extra_float_state_save(&th14_shake_front);
 
 	th14_render_objects();
 }
@@ -866,18 +866,12 @@ static void th14_extra_presentation(float t) {
 	// The text list goes back to how the game's own run of the walk found it, so this presentation
 	// draws the same text that one drew (see th14_text_record_count above)
 	th14_text_records_restore();
-	// Put the shake back for this pass, and leave the values the game's own pass left afterwards
-	float shake_before[4] = { *(float*)0x004D93B8, *(float*)0x004D93BC,
-	                          *(float*)0x004D9610, *(float*)0x004D9614 };
-	*(float*)0x004D93B8 = th14_shake_saved[0];
-	*(float*)0x004D93BC = th14_shake_saved[1];
-	*(float*)0x004D9610 = th14_shake_saved[2];
-	*(float*)0x004D9614 = th14_shake_saved[3];
+	// Put the shake back for this pass (see the comment above)
+	extra_float_state_begin(&th14_shake_back);
+	extra_float_state_begin(&th14_shake_front);
 	th14_render_objects();
-	*(float*)0x004D93B8 = shake_before[0];
-	*(float*)0x004D93BC = shake_before[1];
-	*(float*)0x004D9610 = shake_before[2];
-	*(float*)0x004D9614 = shake_before[3];
+	extra_float_state_end(&th14_shake_front);
+	extra_float_state_end(&th14_shake_back);
 	th14_lasers_undo();
 	th14_player_undo();
 	th14_bullets_undo();

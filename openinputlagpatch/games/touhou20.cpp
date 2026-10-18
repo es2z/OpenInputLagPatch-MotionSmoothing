@@ -6,6 +6,7 @@
 #include "patch_util.h"
 #include "limiter.h"
 #include "d3d9_hook.h"
+#include "extra_state.h"
 #include "config.h"
 #include "overlay.h"
 #include "tool_state.h"
@@ -324,22 +325,23 @@ static void th20_text_records_save();
 // of them to walk from; the addresses are checked before use (committed, writable, small finite
 // values) and nothing is written when they do not look right, so a build where the layout moved
 // loses the shake instead of corrupting something.
-static float* const th20_shake_fields[4] = {
-	(float*)0x00E950E4, (float*)0x00E950E8, (float*)0x00E95250, (float*)0x00E95254,
-};
-static float th20_scene_shake_fields[4];
+static ExtraFloatState th20_shake_back = { (float*)0x00E950E4, 2 };
+static ExtraFloatState th20_shake_front = { (float*)0x00E95250, 2 };
 static bool th20_shake_fields_ok;
 
 static bool th20_shake_fields_readable() {
-	for (int i = 0; i < 4; ++i) {
-		MEMORY_BASIC_INFORMATION info = {};
-		if (VirtualQuery(th20_shake_fields[i], &info, sizeof(info)) != sizeof(info))
-			return false;
-		if (info.State != MEM_COMMIT || (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) == 0)
-			return false;
-		const float value = *th20_shake_fields[i];
-		if (!(value > -100.0f && value < 100.0f))
-			return false;
+	ExtraFloatState* const states[2] = { &th20_shake_back, &th20_shake_front };
+	for (int s = 0; s < 2; ++s) {
+		for (int i = 0; i < states[s]->count; ++i) {
+			MEMORY_BASIC_INFORMATION info = {};
+			if (VirtualQuery(states[s]->address + i, &info, sizeof(info)) != sizeof(info))
+				return false;
+			if (info.State != MEM_COMMIT || (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) == 0)
+				return false;
+			const float value = states[s]->address[i];
+			if (!(value > -100.0f && value < 100.0f))
+				return false;
+		}
 	}
 	return true;
 }
@@ -364,9 +366,10 @@ static void __fastcall th20_render_hook(void* scene) {
 	th20_text_records_save();
 	// The shake the game's own pass is about to apply and clear (see the screen shake comment above)
 	th20_shake_fields_ok = th20_shake_fields_readable();
-	if (th20_shake_fields_ok)
-		for (int i = 0; i < 4; ++i)
-			th20_scene_shake_fields[i] = *th20_shake_fields[i];
+	if (th20_shake_fields_ok) {
+		extra_float_state_save(&th20_shake_back);
+		extra_float_state_save(&th20_shake_front);
+	}
 	th20_render_objects(scene);
 	th20_text_records_after = th20_text_count();
 }
@@ -1362,19 +1365,17 @@ static void th20_extra_presentation(float t) {
 	// The text list goes back to how the game's own pass of the walk found it, so this
 	// presentation appends its records where that pass put its own and draws the same text it drew
 	th20_text_records_restore();
-	// Put the shake back around this pass, so it draws the same offset the game's own pass did, and
-	// leave the value that pass left behind afterwards (see the screen shake comment above)
-	float shake_before[4];
+	// Put the shake back around this pass, so it draws the same offset the game's own pass did (see
+	// the screen shake comment above)
 	if (th20_shake_fields_ok) {
-		for (int i = 0; i < 4; ++i) {
-			shake_before[i] = *th20_shake_fields[i];
-			*th20_shake_fields[i] = th20_scene_shake_fields[i];
-		}
+		extra_float_state_begin(&th20_shake_back);
+		extra_float_state_begin(&th20_shake_front);
 	}
 	th20_render_objects(*th20_scene);
-	if (th20_shake_fields_ok)
-		for (int i = 0; i < 4; ++i)
-			*th20_shake_fields[i] = shake_before[i];
+	if (th20_shake_fields_ok) {
+		extra_float_state_end(&th20_shake_front);
+		extra_float_state_end(&th20_shake_back);
+	}
 	th20_lasers_undo();
 	th20_shots_undo();
 	th20_player_undo();

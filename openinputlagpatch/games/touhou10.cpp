@@ -4,6 +4,7 @@
 #include "patch_util.h"
 #include "limiter.h"
 #include "d3d9_hook.h"
+#include "extra_state.h"
 #include "config.h"
 #include "overlay.h"
 #include "tool_state.h"
@@ -984,7 +985,7 @@ static void th10_reset_sprite_queue() {
 // 0x491E68 (y); the drawing paths read it at 0x40288D and 0x402CD9, and the pass clears it at
 // 0x4200DC and 0x448747. An extra pass that starts after that clear draws the frame unshaken, so the
 // value the game's own pass started with is put back around every extra pass.
-static float th10_shake_saved[2];
+static ExtraFloatState th10_shake = { (float*)0x00491E64, 2 };
 
 static int __stdcall th10_render_hook(void* scene) {
 	IDirect3DDevice9* device = th10_device();
@@ -1007,9 +1008,7 @@ static int __stdcall th10_render_hook(void* scene) {
 	// put back (see th10_text_records)
 	th10_text_records_save();
 
-	// The shake the game's own pass is about to apply and clear (see the comment above)
-	th10_shake_saved[0] = *(float*)0x00491E64;
-	th10_shake_saved[1] = *(float*)0x00491E68;
+	extra_float_state_save(&th10_shake);
 
 	return th10_render_objects(scene);
 }
@@ -1152,13 +1151,10 @@ static void th10_extra_presentation(IDirect3DDevice9* device, float t) {
 	// Nothing to render into an empty scene, and the walk itself would read the object it is handed
 	void* scene = *th10_scene;
 	if (scene != nullptr) {
-		// Put the shake back for this pass, and leave the value the game's own pass left afterwards
-		float shake_before[2] = { *(float*)0x00491E64, *(float*)0x00491E68 };
-		*(float*)0x00491E64 = th10_shake_saved[0];
-		*(float*)0x00491E68 = th10_shake_saved[1];
+		// Put the shake back for this pass (see the comment above)
+		extra_float_state_begin(&th10_shake);
 		th10_render_objects(scene);
-		*(float*)0x00491E64 = shake_before[0];
-		*(float*)0x00491E68 = shake_before[1];
+		extra_float_state_end(&th10_shake);
 	}
 	th10_lasers_undo();
 	th10_undo_shifts();

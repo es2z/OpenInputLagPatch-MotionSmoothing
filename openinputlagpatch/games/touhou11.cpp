@@ -4,6 +4,7 @@
 #include "patch_util.h"
 #include "limiter.h"
 #include "d3d9_hook.h"
+#include "extra_state.h"
 #include "config.h"
 #include "overlay.h"
 #include "tool_state.h"
@@ -784,7 +785,7 @@ static void th11_text_records_restore() {
 // the drawing paths read them at 0x403173 and 0x4035D4. An extra pass that starts after that clear
 // draws the frame unshaken, so the values the game's own pass started with are put back around every
 // extra pass (0x4C37A4 is the third float of the same vector).
-static float th11_shake_offset_saved[3];
+static ExtraFloatState th11_shake = { (float*)0x004C379C, 3 };
 
 static void th11_render_hook() {
 	IDirect3DDevice9* device = th11_device();
@@ -806,9 +807,7 @@ static void th11_render_hook() {
 	// back (see th11_text_record_count)
 	th11_text_records_save();
 
-	th11_shake_offset_saved[0] = *(float*)0x004C379C;
-	th11_shake_offset_saved[1] = *(float*)0x004C37A0;
-	th11_shake_offset_saved[2] = *(float*)0x004C37A4;
+	extra_float_state_save(&th11_shake);
 
 	th11_render_objects();
 }
@@ -914,16 +913,10 @@ static void th11_extra_presentation(IDirect3DDevice9* device, float t) {
 	th11_bullets_advance(t);
 	th11_player_advance(t);
 	th11_lasers_advance(t);
-	// Put the shake back for this pass, and leave the value the game's own pass left afterwards
-	float shake_offset_before[3] = { *(float*)0x004C379C, *(float*)0x004C37A0,
-	                                 *(float*)0x004C37A4 };
-	*(float*)0x004C379C = th11_shake_offset_saved[0];
-	*(float*)0x004C37A0 = th11_shake_offset_saved[1];
-	*(float*)0x004C37A4 = th11_shake_offset_saved[2];
+	// Put the shake back for this pass (see the comment above)
+	extra_float_state_begin(&th11_shake);
 	th11_render_objects();
-	*(float*)0x004C379C = shake_offset_before[0];
-	*(float*)0x004C37A0 = shake_offset_before[1];
-	*(float*)0x004C37A4 = shake_offset_before[2];
+	extra_float_state_end(&th11_shake);
 	th11_lasers_undo();
 	th11_bullets_undo();
 	th11_undo_shifts();

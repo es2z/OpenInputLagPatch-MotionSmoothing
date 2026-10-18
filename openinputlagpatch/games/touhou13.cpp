@@ -4,6 +4,7 @@
 #include "patch_util.h"
 #include "limiter.h"
 #include "d3d9_hook.h"
+#include "extra_state.h"
 #include "config.h"
 #include "overlay.h"
 #include "tool_state.h"
@@ -164,7 +165,7 @@ static void th13_text_pool_restore() {
 // the shake offset to 0 while the frame was drawn, and the picture an extra pass drew came out that
 // many pixels away from the one the game's own pass drew - the same pattern as th08's and th20's
 // shake). The value the game's pass started with is therefore put back around every extra pass.
-static float th13_shake_saved[2];
+static ExtraFloatState th13_shake = { (float*)0x004DCBE8, 2 };
 
 static void th13_render_hook() {
 	IDirect3DDevice9* device = th13_device();
@@ -179,9 +180,7 @@ static void th13_render_hook() {
 	// What the game's own run of the walk finds the text pool at, for the extra presentations to put
 	// back (see Th13TextPool)
 	th13_text_pool_save();
-
-	th13_shake_saved[0] = *(float*)0x004DCBE8;
-	th13_shake_saved[1] = *(float*)0x004DCBEC;
+	extra_float_state_save(&th13_shake);
 
 	th13_render_objects();
 }
@@ -861,13 +860,10 @@ static void th13_extra_presentation(IDirect3DDevice9* device, float t) {
 	// The pool the text is laid out in goes back to what the game's own run of the walk started with,
 	// so this presentation draws the same line the way that one did (see Th13TextPool)
 	th13_text_pool_restore();
-	// Put the shake back for this pass, and leave the value the game's own pass left afterwards
-	float shake_before[2] = { *(float*)0x004DCBE8, *(float*)0x004DCBEC };
-	*(float*)0x004DCBE8 = th13_shake_saved[0];
-	*(float*)0x004DCBEC = th13_shake_saved[1];
+	// Put the shake back for this pass (see the comment above)
+	extra_float_state_begin(&th13_shake);
 	th13_render_objects();
-	*(float*)0x004DCBE8 = shake_before[0];
-	*(float*)0x004DCBEC = shake_before[1];
+	extra_float_state_end(&th13_shake);
 	th13_player_undo();
 	th13_bullets_undo();
 	th13_lasers_undo();
