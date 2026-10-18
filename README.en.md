@@ -5,6 +5,10 @@
 A **heavily work-in-progress** replacement for [vpatch](https://ux.getuploader.com/swmplv75e/), which fixes frame limiter and input lag issues in Touhou games.
 **Note: Many of the new features in this fork rely heavily on Vibe Coding, so the fork may contain more bad and terrible code and bugs than usual. But we really need feedback and suggestions for improvement, please upload them via GitHub Issues!**
 
+Contact Us
+[![Discord][discord-badge]][discord] Click to join zmcx's Discord server.
+
+QQ Group Number:1128317778
 # Usage
 1. Compile as x86/Release
 2. Copy openinputlagpatch.dll and oilp_loader.exe to your game directory
@@ -350,3 +354,6 @@ Finally, the in-game frame limiter is disabled and a heavily simplified version 
 - extend the frame interpolation to more games; the enemies and the curve lasers are out of scope for now, as the requirements say
 - Take a look at vpatch's `AutoBltPrepareTime` algorithm(Not sure)
 - Probably more stuff I forgot
+
+[discord]: https://discord.gg/baE2vffeMj
+[discord-badge]: https://img.shields.io/discord/1174662479385735188?color=%237289DA&logo=discord&logoColor=%23FFFFFF

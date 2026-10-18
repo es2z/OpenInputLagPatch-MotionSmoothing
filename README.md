@@ -5,6 +5,11 @@
 一个用于替代[Vpatch](https://ux.getuploader.com/swmplv75e/) 的补丁，目前仍处于**高度开发中**，用于修复东方系列作品的限帧与输入延迟问题。
 **注意：该fork的新增功能大量依赖于Vibe Coding，因此可能有更多代码史山和BUG，欢迎在issue提出改进意见和反馈BUG**
 
+联系我们
+[![Discord][discord-badge]][discord] 点击加入zmcx的Discord群组
+
+QQ群群号：1128317778
+
 # 使用
 
 1. 以 x86/Release 编译
@@ -356,3 +361,6 @@ CoverTaskbar = 0
 - 把补帧扩展到其它作品；敌人本体与曲线激光目前按需求不做
 - 看看 vpatch 的 `AutoBltPrepareTime` 算法（不确定）
 - 可能还有我忘了的
+
+[discord]: https://discord.gg/baE2vffeMj
+[discord-badge]: https://img.shields.io/discord/1174662479385735188?color=%237289DA&logo=discord&logoColor=%23FFFFFF
