@@ -979,11 +979,12 @@ static void th10_reset_sprite_queue() {
 
 // Remembers what the scene is drawn with, then lets the game's own render run exactly as it always
 // did (see th10_extra_presentation for what it's for)
-// The camera state the stage draws with: 0x491EE0..0x491F58 holds the position the background camera
-// is built from and the scales that go with it, and 0x491DA0..0x491F60 covers the whole block the
-// draw pass touches around it (see the comment in the hook).
-static unsigned char th10_shake_block[0x1C0];
-static const unsigned int th10_shake_block_address = 0x00491DA0;
+// The screen shake: GameManager's shake update (0x43C5CA) rolls the game's own random number
+// generator, takes it modulo 3 and writes 0, +offset or -offset into the Float2 at 0x491E64 (x) and
+// 0x491E68 (y); the drawing paths read it at 0x40288D and 0x402CD9, and the pass clears it at
+// 0x4200DC and 0x448747. An extra pass that starts after that clear draws the frame unshaken, so the
+// value the game's own pass started with is put back around every extra pass.
+static float th10_shake_saved[2];
 
 static int __stdcall th10_render_hook(void* scene) {
 	IDirect3DDevice9* device = th10_device();
@@ -1006,12 +1007,9 @@ static int __stdcall th10_render_hook(void* scene) {
 	// put back (see th10_text_records)
 	th10_text_records_save();
 
-	// The screen shake in this game moves the stage's own camera: the values that make it up (the
-	// -320/240/1515.3 position and the 4.735/6.314 scales the diagnostics saw) are reset to 0 inside
-	// the draw pass once it is done with them, and an extra pass that starts from the reset block
-	// draws the background through another camera. The block is taken where the game's own pass
-	// starts and put back around every extra pass, the same rule the viewport and the matrices follow.
-	memcpy(th10_shake_block, (const void*)th10_shake_block_address, sizeof(th10_shake_block));
+	// The shake the game's own pass is about to apply and clear (see the comment above)
+	th10_shake_saved[0] = *(float*)0x00491E64;
+	th10_shake_saved[1] = *(float*)0x00491E68;
 
 	return th10_render_objects(scene);
 }
@@ -1154,12 +1152,13 @@ static void th10_extra_presentation(IDirect3DDevice9* device, float t) {
 	// Nothing to render into an empty scene, and the walk itself would read the object it is handed
 	void* scene = *th10_scene;
 	if (scene != nullptr) {
-		// Put the camera block back for this pass, and leave what the game's own pass left afterwards
-		unsigned char shake_before[sizeof(th10_shake_block)];
-		memcpy(shake_before, (const void*)th10_shake_block_address, sizeof(th10_shake_block));
-		memcpy((void*)th10_shake_block_address, th10_shake_block, sizeof(th10_shake_block));
+		// Put the shake back for this pass, and leave the value the game's own pass left afterwards
+		float shake_before[2] = { *(float*)0x00491E64, *(float*)0x00491E68 };
+		*(float*)0x00491E64 = th10_shake_saved[0];
+		*(float*)0x00491E68 = th10_shake_saved[1];
 		th10_render_objects(scene);
-		memcpy((void*)th10_shake_block_address, shake_before, sizeof(shake_before));
+		*(float*)0x00491E64 = shake_before[0];
+		*(float*)0x00491E68 = shake_before[1];
 	}
 	th10_lasers_undo();
 	th10_undo_shifts();

@@ -778,15 +778,12 @@ static void th11_text_records_restore() {
 // Remembers the viewport the scene is about to be drawn with, then lets the game's own render run
 // exactly as it always did (see th11_extra_presentation for what it's for)
 //
-// The screen shake in this game moves the stage's own camera: the values that make it up (the
-// -320/240/1515.3 position and the 4.735/6.314 scales the diagnostics saw) are reset to 0 inside the
-// draw pass once it is done with them, and an extra pass that starts from the reset block draws the
-// background through another camera. The block is taken where the game's own pass starts and put
-// back around every extra pass, the same rule the viewport and the matrices follow.
-static unsigned char th11_shake_block[0x100];
-static const unsigned int th11_shake_block_address = 0x004C35D0;
-// A second offset the pass clears, outside the camera block: the diagnostics showed 0x4C379C going
-// from -3.0 to 0 and 0x4C37A0 from 2.0 to 0 while the frame was drawn
+// The screen shake: the game writes the offset it shakes the picture by into the Float2 at 0x4C379C
+// (x) and 0x4C37A0 (y) while the stage is drawn (0x4487B4 and 0x455327) and clears it inside the
+// same pass - the diagnostics caught 0x4C379C going from -3.0 to 0 and 0x4C37A0 from 2.0 to 0, and
+// the drawing paths read them at 0x403173 and 0x4035D4. An extra pass that starts after that clear
+// draws the frame unshaken, so the values the game's own pass started with are put back around every
+// extra pass (0x4C37A4 is the third float of the same vector).
 static float th11_shake_offset_saved[3];
 
 static void th11_render_hook() {
@@ -809,7 +806,6 @@ static void th11_render_hook() {
 	// back (see th11_text_record_count)
 	th11_text_records_save();
 
-	memcpy(th11_shake_block, (const void*)th11_shake_block_address, sizeof(th11_shake_block));
 	th11_shake_offset_saved[0] = *(float*)0x004C379C;
 	th11_shake_offset_saved[1] = *(float*)0x004C37A0;
 	th11_shake_offset_saved[2] = *(float*)0x004C37A4;
@@ -918,10 +914,7 @@ static void th11_extra_presentation(IDirect3DDevice9* device, float t) {
 	th11_bullets_advance(t);
 	th11_player_advance(t);
 	th11_lasers_advance(t);
-	// Put the camera block back for this pass, and leave what the game's own pass left afterwards
-	unsigned char shake_before[sizeof(th11_shake_block)];
-	memcpy(shake_before, (const void*)th11_shake_block_address, sizeof(th11_shake_block));
-	memcpy((void*)th11_shake_block_address, th11_shake_block, sizeof(th11_shake_block));
+	// Put the shake back for this pass, and leave the value the game's own pass left afterwards
 	float shake_offset_before[3] = { *(float*)0x004C379C, *(float*)0x004C37A0,
 	                                 *(float*)0x004C37A4 };
 	*(float*)0x004C379C = th11_shake_offset_saved[0];
@@ -931,7 +924,6 @@ static void th11_extra_presentation(IDirect3DDevice9* device, float t) {
 	*(float*)0x004C379C = shake_offset_before[0];
 	*(float*)0x004C37A0 = shake_offset_before[1];
 	*(float*)0x004C37A4 = shake_offset_before[2];
-	memcpy((void*)th11_shake_block_address, shake_before, sizeof(shake_before));
 	th11_lasers_undo();
 	th11_bullets_undo();
 	th11_undo_shifts();
